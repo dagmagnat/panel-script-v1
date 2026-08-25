@@ -11,7 +11,7 @@ IFS=$'\n\t'
 # This installer deliberately keeps each CDN preset separate. Do not mix fields
 # between providers: path/padding/uplink settings are provider-specific.
 
-INSTALLER_VERSION="1.0.2"
+INSTALLER_VERSION="1.1.0"
 STATE_SCHEMA_CURRENT="1"
 PRESET="${INSTALLER_PRESET:-}"
 
@@ -143,6 +143,523 @@ method_client_path(){
 }
 method_nginx_style(){ case "$METHOD" in beeline|turboflare) echo rewrite ;; *) echo prefix ;; esac; }
 
+
+# -----------------------------------------------------------------------------
+# Remnawave panel manager
+# -----------------------------------------------------------------------------
+# This mode runs on the CENTRAL PANEL server. It never reinstalls Remnawave and
+# never deletes existing profiles/hosts/nodes. It can add a CDN profile to an
+# already-created node through the local Remnawave API. If the API contract of
+# the installed panel differs, it stops at that operation and leaves ready JSON
+# files plus manual steps instead of overwriting anything.
+RM_MANAGER_TOKEN_FILE="$STATE_DIR/remna-manager.token"
+RM_MANAGER_DIR="$OUT_DIR/remna-methods"
+mkdir -p "$RM_MANAGER_DIR"
+
+rm_panel_detected(){
+  [[ -f /opt/remnawave/docker-compose.yml ]] || docker ps --format '{{.Names}}' 2>/dev/null | grep -qx remnawave || return 1
+  # Любой HTTP-код означает, что процесс панели отвечает; 000/ошибка соединения — нет.
+  curl -sS -o /dev/null --max-time 4 http://127.0.0.1:3000/api/auth/status >/dev/null 2>&1 || \
+    curl -sS -o /dev/null --max-time 4 http://127.0.0.1:3000/ >/dev/null 2>&1
+}
+
+rm_panel_version(){
+  if [[ -f /opt/remnawave/docker-compose.yml ]]; then
+    grep -Eo 'remnawave/backend:[A-Za-z0-9._-]+' /opt/remnawave/docker-compose.yml | head -1 | cut -d: -f2 || true
+  fi
+}
+
+rm_api(){
+  local method="$1" path="$2" token="${3:-}" data="${4:-}" url="http://127.0.0.1:3000${path}"
+  local args=(-sS --max-time 20 -X "$method" "$url" -H 'Content-Type: application/json' -H 'X-Remnawave-Client-Type: browser')
+  [[ -n "$token" ]] && args+=(-H "Authorization: Bearer $token")
+  [[ -n "$data" ]] && args+=(-d "$data")
+  curl "${args[@]}"
+}
+
+rm_token_valid(){
+  local token="$1" r
+  r=$(rm_api GET /api/config-profiles "$token" 2>/dev/null || true)
+  jq -e '.response.configProfiles' >/dev/null 2>&1 <<<"$r"
+}
+
+rm_get_token(){
+  local token="" choice user pass body resp
+  if [[ -s "$RM_MANAGER_TOKEN_FILE" ]]; then
+    token=$(cat "$RM_MANAGER_TOKEN_FILE")
+    if rm_token_valid "$token"; then
+      ok "Сохранённый токен панели работает." >&2
+      printf '%s' "$token"
+      return 0
+    fi
+    warn "Сохранённый токен панели истёк/не подходит — запрошу вход снова." >&2
+    rm -f "$RM_MANAGER_TOKEN_FILE"
+  fi
+  echo >&2
+  echo "Как войти в локальную Remnawave API?" >&2
+  echo "  1 — логин и пароль администратора панели (проще)" >&2
+  echo "  2 — вставить API token" >&2
+  echo "  3 — без API: только подготовить JSON и пошаговую инструкцию" >&2
+  read -r -p "Выбор [1]: " choice; choice="${choice:-1}"
+  case "$choice" in
+    3) return 2 ;;
+    2)
+      read -r -s -p "API token: " token; echo >&2
+      ;;
+    *)
+      read -r -p "Логин администратора: " user
+      read -r -s -p "Пароль администратора: " pass; echo >&2
+      body=$(jq -nc --arg u "$user" --arg p "$pass" '{username:$u,password:$p}')
+      resp=$(rm_api POST /api/auth/login "" "$body" 2>/dev/null || true)
+      token=$(jq -r '.response.accessToken // .accessToken // empty' <<<"$resp" 2>/dev/null || true)
+      if [[ -z "$token" ]]; then
+        warn "Не удалось получить токен по логину/паролю. Ответ панели: $(jq -r '.message // .error // "неизвестная ошибка"' <<<"$resp" 2>/dev/null || echo error)" >&2
+        return 1
+      fi
+      ;;
+  esac
+  if ! rm_token_valid "$token"; then
+    warn "Панель не приняла токен для /api/config-profiles. Перехожу в безопасный ручной режим." >&2
+    return 2
+  fi
+  umask 077; printf '%s\n' "$token" > "$RM_MANAGER_TOKEN_FILE"; chmod 600 "$RM_MANAGER_TOKEN_FILE"; umask 022
+  printf '%s' "$token"
+}
+
+rm_nodes_json(){
+  local token="$1" r
+  r=$(rm_api GET /api/nodes "$token" 2>/dev/null || true)
+  jq -c 'if (.response|type)=="array" then .response elif (.response.nodes?|type)=="array" then .response.nodes else [] end' <<<"$r" 2>/dev/null || echo '[]'
+}
+
+rm_choose_node(){
+  local token="$1" nodes n count i choice
+  nodes=$(rm_nodes_json "$token")
+  count=$(jq 'length' <<<"$nodes")
+  if (( count == 0 )); then
+    return 2
+  fi
+  echo >&2
+  echo "Ноды, которые уже есть в панели:" >&2
+  i=1
+  while (( i <= count )); do
+    n=$(jq -c ".[${i}-1]" <<<"$nodes")
+    printf '  %d — %s | %s:%s | connected=%s\n' "$i" \
+      "$(jq -r '.name // "без имени"' <<<"$n")" \
+      "$(jq -r '.address // "?"' <<<"$n")" \
+      "$(jq -r '.port // 2222' <<<"$n")" \
+      "$(jq -r '.isConnected // .is_connected // false' <<<"$n")" >&2
+    ((i++))
+  done
+  while true; do
+    read -r -p "Выбери ноду [1]: " choice; choice="${choice:-1}"
+    [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= count )) && break
+    warn "Выбери число от 1 до $count." >&2
+  done
+  jq -c ".[${choice}-1]" <<<"$nodes"
+}
+
+rm_method_inbound_json(){
+  local method="$1" tag="$2" base
+  # Эти шесть пресетов повторяют соответствующие Remnawave-мануалы буквально.
+  # VK/Yandex держат параметры прямо в xhttpSettings; остальные четыре — в extra.
+  case "$method" in
+    vk) base='{"tag":"cdn-stream","port":10085,"listen":"127.0.0.1","protocol":"vless","settings":{"clients":[],"decryption":"none"},"sniffing":{"enabled":true,"destOverride":["http","tls"]},"streamSettings":{"network":"xhttp","security":"none","xhttpSettings":{"host":"","mode":"packet-up","path":"/content/media/stream/","noSSEHeader":false,"xPaddingKey":"_token","xPaddingBytes":"16-64","xPaddingHeader":"X-Signature","xPaddingMethod":"tokenish","xPaddingObfsMode":true,"xPaddingPlacement":"query","uplinkHTTPMethod":"GET","uplinkDataPlacement":"body","scMaxBufferedPosts":50,"scMaxEachPostBytes":"500000-1000000","scMinPostsIntervalMs":"50-150","scStreamUpServerSecs":"60-180","serverMaxHeaderBytes":0,"xmux":{"cMaxReuseTimes":"0","maxConnections":"1","hKeepAlivePeriod":0,"hMaxRequestTimes":"300-600","hMaxReusableSecs":"900-1800"}}}}' ;;
+    yandex) base='{"tag":"yasha","port":4443,"listen":"127.0.0.1","protocol":"vless","settings":{"clients":[],"decryption":"none"},"sniffing":{"enabled":true,"routeOnly":false,"destOverride":["http","tls","quic"]},"streamSettings":{"network":"xhttp","security":"none","xhttpSettings":{"mode":"packet-up","path":"/uploadfiles/","xPaddingKey":"_dc","xPaddingHeader":"X-Cache","xPaddingMethod":"tokenish","xPaddingObfsMode":true,"xPaddingPlacement":"queryInHeader","uplinkHTTPMethod":"get"}}}' ;;
+    beeline) base='{"tag":"cdn-beeline","port":10086,"listen":"127.0.0.1","protocol":"vless","settings":{"clients":[],"decryption":"none"},"sniffing":{"enabled":true,"destOverride":["http","tls","quic"]},"streamSettings":{"network":"xhttp","security":"none","xhttpSettings":{"mode":"packet-up","path":"/static/getFile/video/segment.ts","extra":{"xmux":{"maxConcurrency":"1"},"seqKey":"chunk_id","sessionKey":"auth","noSSEHeader":true,"noGRPCHeader":true,"seqPlacement":"query","sessionIDKey":"auth","sessionIDLength":"16-32","sessionPlacement":"query","sessionIDPlacement":"query","xPaddingBytes":"50-150","xPaddingMethod":"tokenish","xPaddingObfsMode":true,"xPaddingPlacement":"header","uplinkHTTPMethod":"GET","uplinkDataPlacement":"body","scMaxBufferedPosts":100,"scMaxEachPostBytes":3000000,"scMinPostsIntervalMs":"5-10","serverMaxHeaderBytes":32768}}}}' ;;
+    timeweb) base='{"tag":"cdn-timeweb","port":10087,"listen":"127.0.0.1","protocol":"vless","settings":{"clients":[],"decryption":"none"},"sniffing":{"enabled":true,"destOverride":["http","tls","quic"]},"streamSettings":{"network":"xhttp","security":"none","xhttpSettings":{"mode":"packet-up","path":"/content/media/","extra":{"sessionIDPlacement":"query","sessionIDKey":"sid","seqPlacement":"query","seqKey":"offset","noSSEHeader":false,"uplinkHTTPMethod":"GET","uplinkDataPlacement":"header","uplinkDataKey":"X-Playback-Token","xPaddingKey":"q","xPaddingBytes":"48-256","xPaddingMethod":"tokenish","xPaddingObfsMode":true,"xPaddingPlacement":"query","scMaxEachPostBytes":"4096-16384","scMinPostsIntervalMs":"1-8","serverMaxHeaderBytes":32768}}}}' ;;
+    selectel) base='{"tag":"cdn-selectel","port":10088,"listen":"127.0.0.1","protocol":"vless","settings":{"clients":[],"decryption":"none"},"sniffing":{"enabled":true,"destOverride":["http","tls","quic"]},"streamSettings":{"network":"xhttp","security":"none","xhttpSettings":{"mode":"packet-up","path":"/api/uploadFile/","extra":{"seqKey":"page","seqPlacement":"query","noSSEHeader":false,"sessionIDKey":"X-Request-Id","sessionIDPlacement":"header","uplinkHTTPMethod":"POST","uplinkDataKey":"X-Payload","uplinkDataPlacement":"body","xPaddingKey":"q","xPaddingBytes":"80-240","xPaddingMethod":"tokenish","xPaddingObfsMode":true,"xPaddingPlacement":"query","scMaxEachPostBytes":"65536-262144","scMinPostsIntervalMs":"20-50","serverMaxHeaderBytes":32768}}}}' ;;
+    turboflare) base='{"tag":"cdn-turboflare","port":10089,"listen":"127.0.0.1","protocol":"vless","settings":{"clients":[],"decryption":"none"},"sniffing":{"enabled":true,"destOverride":["http","tls","quic"]},"streamSettings":{"network":"xhttp","security":"none","xhttpSettings":{"mode":"packet-up","path":"/static/getFile/video/segment.ts","extra":{"xmux":{"maxConcurrency":"1"},"seqKey":"chunk_id","sessionKey":"auth","noSSEHeader":true,"noGRPCHeader":true,"seqPlacement":"query","sessionIDKey":"auth","sessionPlacement":"query","sessionIDPlacement":"query","xPaddingBytes":"50-150","xPaddingMethod":"tokenish","xPaddingObfsMode":true,"xPaddingPlacement":"header","uplinkHTTPMethod":"GET","uplinkDataPlacement":"body","scMaxBufferedPosts":100,"scMaxEachPostBytes":3000000,"scMinPostsIntervalMs":"5-10","serverMaxHeaderBytes":32768}}}}' ;;
+    *) return 1 ;;
+  esac
+  jq -c --arg tag "$tag" '.tag=$tag' <<<"$base"
+}
+
+rm_method_host_extra_json(){
+  local method="$1" inbound="$2"
+  case "$method" in
+    vk)
+      jq -nc --argjson x "$(jq -c '.streamSettings.xhttpSettings' <<<"$inbound")" '$x | {xmux,noSSEHeader,xPaddingKey,xPaddingBytes,xPaddingHeader,xPaddingMethod,xPaddingObfsMode,xPaddingPlacement,uplinkHTTPMethod,uplinkDataPlacement,scMaxEachPostBytes,scMinPostsIntervalMs,scStreamUpServerSecs}'
+      ;;
+    yandex)
+      # В Yandex-мануале xhttpExtraParams — 7 полей, включая mode.
+      jq -nc --argjson x "$(jq -c '.streamSettings.xhttpSettings' <<<"$inbound")" '$x | {mode,xPaddingKey,xPaddingHeader,xPaddingMethod,xPaddingObfsMode,xPaddingPlacement,uplinkHTTPMethod}'
+      ;;
+    *) jq -c '.streamSettings.xhttpSettings.extra' <<<"$inbound" ;;
+  esac
+}
+
+rm_method_meta(){
+  local method="$1" key="$2"
+  case "$method:$key" in
+    vk:path) echo '/content/media/stream/' ;; vk:alpn) echo 'h2' ;; vk:fp) echo 'firefox' ;;
+    yandex:path) echo '/uploadfiles/' ;; yandex:alpn) echo 'h3,h2,http/1.1' ;; yandex:fp) echo 'random' ;;
+    beeline:path) echo '/static/getFile/video/segment.ts' ;; beeline:alpn) echo 'h2' ;; beeline:fp) echo 'firefox' ;;
+    timeweb:path) echo '/content/media/stream.m3u8' ;; timeweb:alpn) echo 'h2,http/1.1' ;; timeweb:fp) echo 'random' ;;
+    selectel:path) echo '/api/uploadFile/' ;; selectel:alpn) echo 'h2' ;; selectel:fp) echo 'random' ;;
+    turboflare:path) echo '/static/getFile/video/segment.ts' ;; turboflare:alpn) echo 'h2,http/1.1' ;; turboflare:fp) echo 'firefox' ;;
+  esac
+}
+
+rm_manager_choose_method(){
+  local a
+  echo >&2
+  echo "Какой CDN добавить в существующую панель?" >&2
+  echo "  1 — VK Cloud" >&2
+  echo "  2 — Yandex Cloud" >&2
+  echo "  3 — Beeline / CDNvideo" >&2
+  echo "  4 — Timeweb" >&2
+  echo "  5 — Selectel" >&2
+  echo "  6 — TurboFlare" >&2
+  echo "  0 — Назад" >&2
+  while true; do
+    read -r -p "Выбор [6]: " a; a="${a:-6}"
+    case "$a" in 1) echo vk; return ;; 2) echo yandex; return ;; 3) echo beeline; return ;; 4) echo timeweb; return ;; 5) echo selectel; return ;; 6) echo turboflare; return ;; 0) return 1 ;; esac
+  done
+}
+
+rm_manager_collect_domains(){
+  local method="$1"
+  ORIGIN_DOMAIN=""; CDN_DOMAIN=""
+  case "$method" in
+    turboflare)
+      ask_domain CDN_DOMAIN "Домен TurboFlare, который будет в клиентском ключе" "" "media-example.org"
+      ask_optional_domain ORIGIN_DOMAIN "Отдельный origin-домен (можно оставить пустым и использовать IP ноды:443)" "" "origin.example.net"
+      ;;
+    vk)
+      ask_domain ORIGIN_DOMAIN "Origin-домен, A-записью указывающий на VPS-ноду" "" "origin.example.net"
+      ask_domain CDN_DOMAIN "Клиентский CDN-домен VK" "" "cdn.example.net"
+      ;;
+    yandex)
+      ask_domain ORIGIN_DOMAIN "Origin-домен ноды с HTTPS-сертификатом" "" "origin.example.net"
+      ask_domain CDN_DOMAIN "Клиентский CDN-домен Yandex" "" "cdn.example.net"
+      ;;
+    beeline)
+      ask_domain ORIGIN_DOMAIN "Origin-домен ноды" "" "origin.example.net"
+      ask_optional_domain CDN_DOMAIN "Технический домен xxx.a.trbcdn.net (если ресурс ещё не создан — Enter)" "" "abc123.a.trbcdn.net"
+      ;;
+    timeweb)
+      ask_domain CDN_DOMAIN "Клиентский домен Timeweb" "" "cdn.example.net"
+      ;;
+    selectel)
+      ask_optional_domain ORIGIN_DOMAIN "Origin-домен (Enter = IP ноды)" "" "origin.example.net"
+      ask_optional_domain CDN_DOMAIN "Технический домен xxxx.selcdn.net (если ещё нет — Enter)" "" "abcd.selcdn.net"
+      ;;
+  esac
+}
+
+rm_profile_config_json(){
+  local inbound="$1" method="$2" dns
+  if [[ "$method" == yandex ]]; then
+    dns='{"queryStrategy":"UseIPv4","servers":[{"address":"8.8.8.8","skipFallback":false}]}'
+  else
+    dns='{"queryStrategy":"UseIPv4","servers":[{"address":"1.1.1.1","skipFallback":false},{"address":"1.0.0.1","skipFallback":false}]}'
+  fi
+  jq -nc --argjson inbound "$inbound" --argjson dns "$dns" '{log:{loglevel:"warning"},dns:$dns,inbounds:[$inbound],outbounds:[{tag:"DIRECT",protocol:"freedom",settings:{domainStrategy:"UseIPv4"}},{tag:"BLOCK",protocol:"blackhole"}],routing:{domainStrategy:"IPIfNonMatch",rules:[{type:"field",ip:["geoip:private"],outboundTag:"BLOCK"},{type:"field",protocol:["bittorrent"],outboundTag:"BLOCK"}]}}'
+}
+
+rm_api_create_profile(){
+  local token="$1" name="$2" config="$3" body resp
+  body=$(jq -nc --arg name "$name" --argjson config "$config" '{name:$name,config:$config}')
+  resp=$(rm_api POST /api/config-profiles "$token" "$body" 2>/dev/null || true)
+  if jq -e '.response.uuid and .response.inbounds[0].uuid' >/dev/null 2>&1 <<<"$resp"; then
+    jq -c '{profileUuid:.response.uuid,inboundUuid:.response.inbounds[0].uuid}' <<<"$resp"
+    return 0
+  fi
+  printf '%s\n' "$resp" > "$RM_MANAGER_DIR/last-api-error-create-profile.json"
+  return 1
+}
+
+rm_api_existing_profile(){
+  local token="$1" name="$2" r uuid inb
+  r=$(rm_api GET /api/config-profiles "$token" 2>/dev/null || true)
+  uuid=$(jq -r --arg n "$name" '.response.configProfiles[]? | select(.name==$n) | .uuid' <<<"$r" | head -1)
+  [[ -n "$uuid" ]] || return 1
+  r=$(rm_api GET "/api/config-profiles/${uuid}/inbounds" "$token" 2>/dev/null || true)
+  inb=$(jq -r '.response.inbounds[0].uuid // .response[0].uuid // empty' <<<"$r" 2>/dev/null || true)
+  if [[ -z "$inb" ]]; then
+    r=$(rm_api GET "/api/config-profiles/${uuid}" "$token" 2>/dev/null || true)
+    inb=$(jq -r '.response.inbounds[0].uuid // empty' <<<"$r" 2>/dev/null || true)
+  fi
+  [[ -n "$inb" ]] || return 1
+  jq -nc --arg p "$uuid" --arg i "$inb" '{profileUuid:$p,inboundUuid:$i}'
+}
+
+rm_api_assign_node(){
+  local token="$1" node_uuid="$2" profile_uuid="$3" inbound_uuid="$4" body resp body_path
+  # Remnawave 3.x встречается в двух формах API: PATCH /api/nodes с uuid в body
+  # и PATCH /api/nodes/{uuid}. Пробуем обе, ничего не удаляя.
+  body=$(jq -nc --arg uuid "$node_uuid" --arg p "$profile_uuid" --arg i "$inbound_uuid" '{uuid:$uuid,configProfile:{activeConfigProfileUuid:$p,activeInbounds:[$i]}}')
+  resp=$(rm_api PATCH /api/nodes "$token" "$body" 2>/dev/null || true)
+  if jq -e '.response.uuid' >/dev/null 2>&1 <<<"$resp"; then return 0; fi
+
+  body_path=$(jq -nc --arg p "$profile_uuid" --arg i "$inbound_uuid" '{configProfile:{activeConfigProfileUuid:$p,activeInbounds:[$i]}}')
+  resp=$(rm_api PATCH "/api/nodes/${node_uuid}" "$token" "$body_path" 2>/dev/null || true)
+  if jq -e '.response.uuid' >/dev/null 2>&1 <<<"$resp"; then return 0; fi
+  printf '%s\n' "$resp" > "$RM_MANAGER_DIR/last-api-error-assign-node.json"
+  return 1
+}
+
+rm_api_existing_host(){
+  local token="$1" profile_uuid="$2" inbound_uuid="$3" address="$4" r
+  r=$(rm_api GET /api/hosts "$token" 2>/dev/null || true)
+  jq -r --arg p "$profile_uuid" --arg i "$inbound_uuid" --arg a "$address" '
+    (if (.response|type)=="array" then .response else (.response.hosts // []) end)[]?
+    | select(.address==$a)
+    | select((.inbound.configProfileUuid // "")==$p)
+    | select((.inbound.configProfileInboundUuid // "")==$i)
+    | .uuid' <<<"$r" 2>/dev/null | head -1
+}
+
+rm_api_create_host(){
+  local token="$1" profile_uuid="$2" inbound_uuid="$3" method="$4" address="$5" remark="$6" extra="$7"
+  local path alpn fp body resp
+  path=$(rm_method_meta "$method" path); alpn=$(rm_method_meta "$method" alpn); fp=$(rm_method_meta "$method" fp)
+  body=$(jq -nc --arg p "$profile_uuid" --arg i "$inbound_uuid" --arg remark "$remark" --arg addr "$address" --arg path "$path" --arg alpn "$alpn" --arg fp "$fp" --argjson extra "$extra" '{inbound:{configProfileUuid:$p,configProfileInboundUuid:$i},remark:$remark,address:$addr,port:443,path:$path,sni:$addr,host:$addr,alpn:$alpn,fingerprint:$fp,allowInsecure:false,isDisabled:false,securityLayer:"TLS",overrideSniFromAddress:false,xHttpExtraParams:$extra}')
+  printf '%s\n' "$body" | jq . > "$RM_MANAGER_DIR/last-host-request.json"
+  resp=$(rm_api POST /api/hosts "$token" "$body" 2>/dev/null || true)
+  if jq -e '.response.uuid' >/dev/null 2>&1 <<<"$resp"; then jq -r '.response.uuid' <<<"$resp"; return 0; fi
+  printf '%s\n' "$resp" > "$RM_MANAGER_DIR/last-api-error-create-host.json"
+  return 1
+}
+
+rm_api_add_to_squad(){
+  local token="$1" inbound_uuid="$2" squads count choice sq uuid existing arr body resp
+  squads=$(rm_api GET /api/internal-squads "$token" 2>/dev/null || true)
+  squads=$(jq -c '.response.internalSquads // []' <<<"$squads" 2>/dev/null || echo '[]')
+  count=$(jq 'length' <<<"$squads")
+  if (( count == 0 )); then
+    warn "В панели пока нет Internal Squad."
+    ask_yes_no RM_CREATE_SQUAD "Создать отдельный Internal Squad 'PSV1-CDN' и добавить туда новый inbound?" "yes"
+    [[ "$RM_CREATE_SQUAD" == yes ]] || return 2
+    body=$(jq -nc --arg n "PSV1-CDN" --arg i "$inbound_uuid" '{name:$n,inbounds:[$i]}')
+    resp=$(rm_api POST /api/internal-squads "$token" "$body" 2>/dev/null || true)
+    if jq -e '.response.uuid' >/dev/null 2>&1 <<<"$resp"; then
+      ok "Создан Internal Squad PSV1-CDN. Пользователей в него скрипт сам не добавляет — это отдельное право доступа."
+      return 0
+    fi
+    printf '%s\n' "$resp" > "$RM_MANAGER_DIR/last-api-error-create-squad.json"
+    return 1
+  fi
+  echo
+  echo "В какой Internal Squad добавить новый inbound?"
+  for ((choice=1; choice<=count; choice++)); do
+    sq=$(jq -c ".[${choice}-1]" <<<"$squads")
+    printf '  %d — %s\n' "$choice" "$(jq -r '.name // .uuid' <<<"$sq")"
+  done
+  read -r -p "Выбор [1]: " choice; choice="${choice:-1}"
+  [[ "$choice" =~ ^[0-9]+$ ]] && (( choice>=1 && choice<=count )) || choice=1
+  sq=$(jq -c ".[${choice}-1]" <<<"$squads")
+  uuid=$(jq -r '.uuid' <<<"$sq")
+  existing=$(jq -c '[.inbounds[]?.uuid]' <<<"$sq")
+  arr=$(jq -nc --argjson old "$existing" --arg n "$inbound_uuid" '$old + [$n] | unique')
+  body=$(jq -nc --arg uuid "$uuid" --argjson inbounds "$arr" '{uuid:$uuid,inbounds:$inbounds}')
+  resp=$(rm_api PATCH /api/internal-squads "$token" "$body" 2>/dev/null || true)
+  jq -e '.response.uuid' >/dev/null 2>&1 <<<"$resp" && return 0
+  # Более новые контракты используют UUID в URL.
+  body=$(jq -nc --argjson inbounds "$arr" '{inbounds:$inbounds}')
+  resp=$(rm_api PATCH "/api/internal-squads/${uuid}" "$token" "$body" 2>/dev/null || true)
+  jq -e '.response.uuid' >/dev/null 2>&1 <<<"$resp" && return 0
+  printf '%s\n' "$resp" > "$RM_MANAGER_DIR/last-api-error-squad.json"
+  return 1
+}
+
+rm_manager_provider_steps(){
+  local method="$1" node_ip="$2" f="$3"
+  {
+    echo "$(method_title "$method") — что осталось сделать у CDN-провайдера"
+    echo "=============================================================="
+    case "$method" in
+      turboflare)
+        echo "TurboFlare → Сайты → ${CDN_DOMAIN} → Редактирование:"
+        echo "  Адрес: ${node_ip}:443"
+        echo "  HTTPS к источнику: ВКЛ"
+        echo "  Устаревший кэш при недоступности источника: ВЫКЛ"
+        echo "  Кэш XHTTP: ВЫКЛ; query-параметры учитывать."
+        echo "  NS у регистратора: ns1-c.trbcdn.net / ns2-c.trbcdn.net / ns3-c.trbcdn.net"
+        echo "Важно: ${CDN_DOMAIN} после делегирования должен вести на edge CDN, а не на ${node_ip}."
+        ;;
+      vk)
+        echo "Источник: ${ORIGIN_DOMAIN}:80 по HTTP. CDN-домен: ${CDN_DOMAIN}. Host пересылать."
+        echo "Кэш выключить, query учитывать, gzip выключить; затем CNAME CDN-домена на адрес VK."
+        ;;
+      yandex)
+        echo "Источник: ${ORIGIN_DOMAIN} по HTTPS; ручной SNI/Host=${ORIGIN_DOMAIN}; CDN-домен=${CDN_DOMAIN}."
+        echo "Кэш CDN/браузера выключить, query не игнорировать, compression выключить, verify origin выключить."
+        ;;
+      beeline)
+        echo "Источник: ${ORIGIN_DOMAIN}:443, HTTPS ВКЛ, SNI=${ORIGIN_DOMAIN}, cache OFF, query учитывать."
+        echo "Rewrite на CDN: /static/getFile/video/segment.ts/ -> /static/getFile/video/segment.ts; HTTP2 ВКЛ."
+        echo "После активации получишь xxx.a.trbcdn.net; если сейчас домен был пустой — снова запусти менеджер и создай host."
+        ;;
+      timeweb)
+        echo "Источник строго ${node_ip}:80; HTTPS к источнику ВЫКЛ; query не игнорировать; cache OFF."
+        echo "Клиентский домен: ${CDN_DOMAIN}."
+        ;;
+      selectel)
+        echo "Источник: ${ORIGIN_DOMAIN:-$node_ip}; cache/gzip OFF; query не игнорировать; verify origin OFF; разрешить POST."
+        echo "Таймауты: connect=30, send=9999, receive=9999. После активации получишь xxxx.selcdn.net."
+        ;;
+    esac
+    echo
+    echo "После активации CDN: curl -sk https://${CDN_DOMAIN:-'<техдомен>'}$(rm_method_meta "$method" path) -o /dev/null -w '%{http_code}\\n'"
+    echo "Ожидаемый код после активного inbound: 400."
+  } > "$f"
+  chmod 600 "$f"
+}
+
+run_remna_panel_manager(){
+  local token="" token_mode=api nodes node node_uuid node_name node_ip connected method safe suffix tag inbound config extra profile_name ids profile_uuid inbound_uuid active_profile assign_ok=no host_uuid="" squad_ok=no run_dir summary
+  echo
+  echo "=== Remnawave: добавить CDN-метод в существующую панель ==="
+  echo "Этот режим НЕ переустанавливает панель и НЕ удаляет существующие профили/хосты."
+  if ! rm_panel_detected; then
+    die "На этом сервере не найдена работающая Remnawave на 127.0.0.1:3000. Для удалённой ноды выбери обычный режим 'только нода'."
+  fi
+  ok "Панель найдена. Версия образа: $(rm_panel_version || echo unknown)"
+  command -v jq >/dev/null 2>&1 || { apt-get update && apt-get install -y jq; }
+
+  set +e
+  token=$(rm_get_token); rc=$?
+  set -e
+  if [[ $rc -eq 2 ]]; then token_mode=manual; token=""; elif [[ $rc -ne 0 ]]; then warn "API-вход не получился; продолжу в ручном режиме."; token_mode=manual; token=""; fi
+
+  if [[ "$token_mode" == api ]]; then
+    set +e; node=$(rm_choose_node "$token"); rc=$?; set -e
+    if [[ $rc -eq 2 ]]; then
+      echo
+      warn "В панели пока нет ни одной ноды. Сначала создай её."
+      echo "1. Панель → Nodes → Create node."
+      echo "2. Address = IP европейского VPS, Port = 2222."
+      echo "3. Скопируй SECRET_KEY."
+      echo "4. На европейском VPS запусти этот же install.sh → Remnawave → Только нода."
+      echo "5. Введи IP этой панели и SECRET_KEY; выбери нужный CDN."
+      echo "6. Когда нода появится/подключится, снова запусти здесь: $INSTALL_PATH --manage-remna"
+      exit 0
+    elif [[ $rc -ne 0 ]]; then
+      die "Не удалось выбрать ноду."
+    fi
+    node_uuid=$(jq -r '.uuid' <<<"$node"); node_name=$(jq -r '.name // .uuid' <<<"$node"); node_ip=$(jq -r '.address // empty' <<<"$node")
+    connected=$(jq -r '.isConnected // .is_connected // false' <<<"$node")
+    [[ "$connected" == true ]] || warn "Нода сейчас не отмечена Connected. Настройку создать можно, но тест 400 появится только после подключения ноды."
+  else
+    echo
+    warn "Ручной режим: API панель не изменяет. Я подготовлю готовые JSON/параметры."
+    read -r -p "Имя ноды в панели: " node_name
+    read -r -p "Публичный IPv4 европейской ноды: " node_ip
+    valid_ipv4 "$node_ip" || die "Нужен IPv4 ноды."
+    node_uuid="manual"
+  fi
+
+  method=$(rm_manager_choose_method) || exit 0
+  rm_manager_collect_domains "$method"
+  safe=$(tr '[:upper:]' '[:lower:]' <<<"$node_name" | tr -cd 'a-z0-9_-' | cut -c1-24); [[ -n "$safe" ]] || safe="node"
+  suffix=$(printf '%s' "$node_uuid" | sha256sum | cut -c1-6)
+  tag="psv1-${method}-${suffix}"
+  profile_name="psv1-${method}-${safe}-${suffix}"
+  inbound=$(rm_method_inbound_json "$method" "$tag")
+  config=$(rm_profile_config_json "$inbound" "$method")
+  extra=$(rm_method_host_extra_json "$method" "$inbound")
+  run_dir="$RM_MANAGER_DIR/${profile_name}"
+  mkdir -p "$run_dir"; chmod 700 "$run_dir"
+  printf '%s\n' "$config" | jq . > "$run_dir/profile.json"
+  printf '%s\n' "$extra" | jq . > "$run_dir/xhttpExtraParams.json"
+  cat > "$run_dir/host.txt" <<EOF
+Address: ${CDN_DOMAIN:-<введи технический CDN-домен после активации ресурса>}
+SNI/Host: ${CDN_DOMAIN:-<тот же домен>}
+Port: 443
+Path: $(rm_method_meta "$method" path)
+ALPN: $(rm_method_meta "$method" alpn)
+Fingerprint: $(rm_method_meta "$method" fp)
+Security: TLS
+Inbound tag: $tag
+EOF
+  rm_manager_provider_steps "$method" "$node_ip" "$run_dir/provider-steps.txt"
+
+  if [[ "$token_mode" == manual ]]; then
+    cat > "$run_dir/NEXT-STEPS.txt" <<EOF
+1. Config Profiles → Create profile → имя: $profile_name → вставить profile.json.
+2. Node '$node_name' → Change Profile → выбрать $profile_name → включить единственный inbound '$tag'.
+3. Internal Squads → нужный squad → добавить inbound '$tag'.
+4. Hosts → Create host → значения из host.txt; xhttpExtraParams = xhttpExtraParams.json.
+5. Выполнить provider-steps.txt.
+Ничего существующего удалять не нужно.
+EOF
+    ok "Готов комплект ручной настройки: $run_dir"
+    cat "$run_dir/NEXT-STEPS.txt"
+    return 0
+  fi
+
+  # Reuse the profile created by a previous run, otherwise create a new one.
+  if ids=$(rm_api_existing_profile "$token" "$profile_name" 2>/dev/null); then
+    profile_uuid=$(jq -r '.profileUuid' <<<"$ids"); inbound_uuid=$(jq -r '.inboundUuid' <<<"$ids")
+    ok "Профиль $profile_name уже существует — использую его, не перезаписываю."
+  else
+    if ids=$(rm_api_create_profile "$token" "$profile_name" "$config"); then
+      profile_uuid=$(jq -r '.profileUuid' <<<"$ids"); inbound_uuid=$(jq -r '.inboundUuid' <<<"$ids")
+      ok "Создан новый Config Profile: $profile_name"
+    else
+      warn "API не создал профиль. Ничего существующего не изменено. Используй $run_dir/profile.json вручную."
+      return 0
+    fi
+  fi
+
+  active_profile=$(jq -r '.configProfile.activeConfigProfileUuid // empty' <<<"$node")
+  if [[ -n "$active_profile" && "$active_profile" != "$profile_uuid" ]]; then
+    warn "У выбранной ноды уже есть другой активный профиль ($active_profile)."
+    warn "Чтобы не выключить действующий метод на ЭТОЙ же ноде, автоматическую замену не делаю без подтверждения."
+    ask_yes_no RM_REPLACE_PROFILE "Заменить профиль именно у этой ноды на $profile_name?" "no"
+  else RM_REPLACE_PROFILE=yes; fi
+  if [[ "$RM_REPLACE_PROFILE" == yes ]]; then
+    if rm_api_assign_node "$token" "$node_uuid" "$profile_uuid" "$inbound_uuid"; then
+      assign_ok=yes; ok "Профиль назначен ноде; inbound активирован."
+    else
+      warn "Автопривязка ноды через API не прошла. Профиль создан, но ноду не трогал дальше."
+      warn "В панели: Nodes → $node_name → Change Profile → $profile_name → включить inbound $tag."
+    fi
+  else
+    warn "Профиль ноды не менялся. Назначь $profile_name вручную, когда будешь готов."
+  fi
+
+  if rm_api_add_to_squad "$token" "$inbound_uuid"; then squad_ok=yes; ok "Inbound добавлен в выбранный Internal Squad без удаления старых inbound'ов."; else warn "Squad автоматически не изменён. Добавь inbound '$tag' в нужный Internal Squad вручную."; fi
+
+  if [[ -n "$CDN_DOMAIN" ]]; then
+    host_uuid=$(rm_api_existing_host "$token" "$profile_uuid" "$inbound_uuid" "$CDN_DOMAIN" || true)
+    if [[ -n "$host_uuid" ]]; then
+      ok "Host для $CDN_DOMAIN уже существует — дубликат не создаю."
+    elif host_uuid=$(rm_api_create_host "$token" "$profile_uuid" "$inbound_uuid" "$method" "$CDN_DOMAIN" "PSV1 $(method_title "$method") - $node_name" "$extra"); then
+      ok "Host создан в панели: $CDN_DOMAIN"
+    else
+      warn "Host через API не создался. Профиль/нода не удалены; создай Host по файлам $run_dir/host.txt и xhttpExtraParams.json."
+    fi
+  else
+    warn "Технический CDN-домен ещё неизвестен — Host пока не создаю. После выдачи домена снова запусти менеджер; существующий профиль будет использован повторно."
+  fi
+
+  summary="$run_dir/result.txt"
+  cat > "$summary" <<EOF
+Remnawave panel manager $INSTALLER_VERSION
+Node: $node_name ($node_ip) UUID=$node_uuid
+Method: $(method_title "$method")
+Profile: $profile_name UUID=$profile_uuid
+Inbound tag/UUID: $tag / $inbound_uuid
+Node assigned automatically: $assign_ok
+Squad updated automatically: $squad_ok
+Host UUID: ${host_uuid:-not-created-yet}
+CDN domain: ${CDN_DOMAIN:-not-known-yet}
+Provider instructions: $run_dir/provider-steps.txt
+EOF
+  printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$(date -Is)" "$node_uuid" "$method" "$profile_uuid" "$inbound_uuid" "${host_uuid:-}" >> "$RM_MANAGER_DIR/registry.tsv"
+  chmod 600 "$run_dir"/* "$RM_MANAGER_DIR/registry.tsv" 2>/dev/null || true
+  echo
+  ok "Настройка панели завершена настолько, насколько позволяет текущий API. Существующие методы не удалялись."
+  cat "$summary"
+  echo
+  echo "Важно: пользователь должен состоять в том Internal Squad, куда добавлен этот inbound. Существующих пользователей скрипт автоматически не переносит."
+  echo
+  cat "$run_dir/provider-steps.txt"
+}
+
 show_config(){
   echo
   echo "================ Сохранённая конфигурация ================"
@@ -171,11 +688,24 @@ choose_panel(){
 }
 choose_remna_role(){
   echo
-  echo "Что установить на ЭТОМ сервере?"
-  echo "  1 — панель Remnawave"
-  echo "  2 — только ноду Remnawave"
-  echo "  3 — панель + ноду на одном сервере"
-  while true; do read -r -p "Выбор [3]: " a; a="${a:-3}"; case "$a" in 1) REMNA_ROLE=panel; break ;; 2) REMNA_ROLE=node; break ;; 3) REMNA_ROLE=both; break ;; esac; done
+  echo "Что сделать с Remnawave?"
+  echo "  1 — установить новую центральную панель"
+  echo "  2 — панель УЖЕ установлена: добавить/настроить CDN-метод для ноды"
+  echo "  3 — установить только ноду на этом VPS"
+  echo "  4 — установить панель + ноду на одном VPS"
+  echo "  5 — проверить существующую панель"
+  echo "  0 — выйти"
+  while true; do
+    read -r -p "Выбор [2]: " a; a="${a:-2}"
+    case "$a" in
+      1) REMNA_ROLE=panel; break ;;
+      2) exec "$0" --manage-remna ;;
+      3) REMNA_ROLE=node; break ;;
+      4) REMNA_ROLE=both; break ;;
+      5) exec "$0" --check-remna ;;
+      0) exit 0 ;;
+    esac
+  done
 }
 choose_method(){
   if [[ -n "$PRESET" ]]; then
@@ -301,6 +831,20 @@ collect_config(){
 }
 
 case "${1:-}" in
+  --manage-remna)
+    run_remna_panel_manager
+    exit 0
+    ;;
+  --check-remna)
+    if rm_panel_detected; then
+      ok "Remnawave обнаружена и отвечает локально. Версия образа: $(rm_panel_version || echo unknown)"
+      docker ps --format 'table {{.Names}}\t{{.Status}}' | grep -E 'NAMES|remnawave' || true
+      curl -sS -o /dev/null -w 'API http://127.0.0.1:3000 -> HTTP %{http_code}\n' http://127.0.0.1:3000/api/auth/status || true
+    else
+      die "Работающая Remnawave на этом сервере не найдена."
+    fi
+    exit 0
+    ;;
   --update)
     info "Обновляю ${PROJECT_NAME} из публичного GitHub..."
     install -d -m 0700 "$(dirname "$INSTALL_PATH")"
@@ -311,12 +855,19 @@ case "${1:-}" in
     rm -f "$tmp_update"
     exec "$INSTALL_PATH"
     ;;
+  --version)
+    echo "${PROJECT_NAME} ${INSTALLER_VERSION}"
+    exit 0
+    ;;
   --help|-h)
     cat <<EOF
 ${PROJECT_NAME} ${INSTALLER_VERSION}
 
 Запуск: $INSTALL_PATH
+Версия: $INSTALL_PATH --version
 Статус: $INSTALL_PATH --status
+Управление существующей Remnawave: $INSTALL_PATH --manage-remna
+Проверка Remnawave: $INSTALL_PATH --check-remna
 Сброс ответов: $INSTALL_PATH --reset
 Обновление из GitHub: $INSTALL_PATH --update
 EOF
@@ -336,6 +887,23 @@ EOF
 esac
 
 if load_state; then
+  if marked complete && [[ "${PANEL_KIND:-}" == remna ]] && [[ "${REMNA_ROLE:-}" == panel || "${REMNA_ROLE:-}" == both ]]; then
+    echo
+    echo "Remnawave на этом сервере уже была установлена этим скриптом."
+    echo "  1 — добавить/настроить новый CDN-метод для существующей ноды"
+    echo "  2 — проверить текущую установку этого сервера"
+    echo "  3 — показать сохранённый результат"
+    echo "  4 — начать новую задачу (сбросить только ответы установщика)"
+    echo "  0 — выйти"
+    read -r -p "Выбор [1]: " _done_action; _done_action="${_done_action:-1}"
+    case "$_done_action" in
+      1) exec "$0" --manage-remna ;;
+      3) [[ -f "$RESULT_FILE" ]] && cat "$RESULT_FILE"; exit 0 ;;
+      4) rm -f "$STATE_FILE"; rm -rf "$MARK_DIR"; mkdir -p "$MARK_DIR"; collect_config ;;
+      0) exit 0 ;;
+      *) : ;;
+    esac
+  fi
   show_config
   echo
   echo "Enter — продолжить/проверить с сохранёнными значениями."
@@ -815,50 +1383,25 @@ xui_create_inbound(){
   mark xui_inbound
 }
 
-remna_inbound_json(){
+remna_default_tag(){
   case "$METHOD" in
-    vk) cat <<'JSON'
-{"tag":"cdn-stream","port":10085,"listen":"127.0.0.1","protocol":"vless","settings":{"clients":[],"decryption":"none"},"sniffing":{"enabled":true,"destOverride":["http","tls"]},"streamSettings":{"network":"xhttp","security":"none","xhttpSettings":{"host":"","mode":"packet-up","path":"/content/media/stream/","noSSEHeader":false,"xPaddingKey":"_token","xPaddingBytes":"16-64","xPaddingHeader":"X-Signature","xPaddingMethod":"tokenish","xPaddingObfsMode":true,"xPaddingPlacement":"query","uplinkHTTPMethod":"GET","uplinkDataPlacement":"body","scMaxBufferedPosts":50,"scMaxEachPostBytes":"500000-1000000","scMinPostsIntervalMs":"50-150","scStreamUpServerSecs":"60-180","serverMaxHeaderBytes":0,"xmux":{"cMaxReuseTimes":"0","maxConnections":"1","hKeepAlivePeriod":0,"hMaxRequestTimes":"300-600","hMaxReusableSecs":"900-1800"}}}}
-JSON
-      ;;
-    yandex) cat <<'JSON'
-{"tag":"yasha","port":4443,"listen":"127.0.0.1","protocol":"vless","settings":{"clients":[],"decryption":"none"},"sniffing":{"enabled":true,"routeOnly":false,"destOverride":["http","tls","quic"]},"streamSettings":{"network":"xhttp","security":"none","xhttpSettings":{"mode":"packet-up","path":"/uploadfiles/","xPaddingKey":"_dc","xPaddingHeader":"X-Cache","xPaddingMethod":"tokenish","xPaddingObfsMode":true,"xPaddingPlacement":"queryInHeader","uplinkHTTPMethod":"get"}}}
-JSON
-      ;;
-    beeline) cat <<'JSON'
-{"tag":"cdn-beeline","port":10086,"listen":"127.0.0.1","protocol":"vless","settings":{"clients":[],"decryption":"none"},"sniffing":{"enabled":true,"destOverride":["http","tls","quic"]},"streamSettings":{"network":"xhttp","security":"none","xhttpSettings":{"mode":"packet-up","path":"/static/getFile/video/segment.ts","extra":{"xmux":{"maxConcurrency":"1"},"seqKey":"chunk_id","sessionKey":"auth","noSSEHeader":true,"noGRPCHeader":true,"seqPlacement":"query","sessionIDKey":"auth","sessionIDLength":"16-32","sessionPlacement":"query","sessionIDPlacement":"query","xPaddingBytes":"50-150","xPaddingMethod":"tokenish","xPaddingObfsMode":true,"xPaddingPlacement":"header","uplinkHTTPMethod":"GET","uplinkDataPlacement":"body","scMaxBufferedPosts":100,"scMaxEachPostBytes":3000000,"scMinPostsIntervalMs":"5-10","serverMaxHeaderBytes":32768}}}}
-JSON
-      ;;
-    timeweb) cat <<'JSON'
-{"tag":"cdn-timeweb","port":10087,"listen":"127.0.0.1","protocol":"vless","settings":{"clients":[],"decryption":"none"},"sniffing":{"enabled":true,"destOverride":["http","tls","quic"]},"streamSettings":{"network":"xhttp","security":"none","xhttpSettings":{"mode":"packet-up","path":"/content/media/","extra":{"sessionIDPlacement":"query","sessionIDKey":"sid","seqPlacement":"query","seqKey":"offset","noSSEHeader":false,"uplinkHTTPMethod":"GET","uplinkDataPlacement":"header","uplinkDataKey":"X-Playback-Token","xPaddingKey":"q","xPaddingBytes":"48-256","xPaddingMethod":"tokenish","xPaddingObfsMode":true,"xPaddingPlacement":"query","scMaxEachPostBytes":"4096-16384","scMinPostsIntervalMs":"1-8","serverMaxHeaderBytes":32768}}}}
-JSON
-      ;;
-    selectel) cat <<'JSON'
-{"tag":"cdn-selectel","port":10088,"listen":"127.0.0.1","protocol":"vless","settings":{"clients":[],"decryption":"none"},"sniffing":{"enabled":true,"destOverride":["http","tls","quic"]},"streamSettings":{"network":"xhttp","security":"none","xhttpSettings":{"mode":"packet-up","path":"/api/uploadFile/","extra":{"seqKey":"page","seqPlacement":"query","noSSEHeader":false,"sessionIDKey":"X-Request-Id","sessionIDPlacement":"header","uplinkHTTPMethod":"POST","uplinkDataKey":"X-Payload","uplinkDataPlacement":"body","xPaddingKey":"q","xPaddingBytes":"80-240","xPaddingMethod":"tokenish","xPaddingObfsMode":true,"xPaddingPlacement":"query","scMaxEachPostBytes":"65536-262144","scMinPostsIntervalMs":"20-50","serverMaxHeaderBytes":32768}}}}
-JSON
-      ;;
-    turboflare) cat <<'JSON'
-{"tag":"cdn-turboflare","port":10089,"listen":"127.0.0.1","protocol":"vless","settings":{"clients":[],"decryption":"none"},"sniffing":{"enabled":true,"destOverride":["http","tls","quic"]},"streamSettings":{"network":"xhttp","security":"none","xhttpSettings":{"mode":"packet-up","path":"/static/getFile/video/segment.ts","extra":{"xmux":{"maxConcurrency":"1"},"seqKey":"chunk_id","sessionKey":"auth","noSSEHeader":true,"noGRPCHeader":true,"seqPlacement":"query","sessionIDKey":"auth","sessionPlacement":"query","sessionIDPlacement":"query","xPaddingBytes":"50-150","xPaddingMethod":"tokenish","xPaddingObfsMode":true,"xPaddingPlacement":"header","uplinkHTTPMethod":"GET","uplinkDataPlacement":"body","scMaxBufferedPosts":100,"scMaxEachPostBytes":3000000,"scMinPostsIntervalMs":"5-10","serverMaxHeaderBytes":32768}}}}
-JSON
-      ;;
+    vk) echo "cdn-stream" ;;
+    yandex) echo "yasha" ;;
+    beeline) echo "cdn-beeline" ;;
+    timeweb) echo "cdn-timeweb" ;;
+    selectel) echo "cdn-selectel" ;;
+    turboflare) echo "cdn-turboflare" ;;
   esac
 }
 
+remna_inbound_json(){
+  rm_method_inbound_json "$METHOD" "$(remna_default_tag)"
+}
+
 remna_host_extra_json(){
-  case "$METHOD" in
-    vk) cat <<'JSON'
-{"xmux":{"cMaxReuseTimes":"0","maxConnections":"1","hKeepAlivePeriod":0,"hMaxRequestTimes":"300-600","hMaxReusableSecs":"900-1800"},"noSSEHeader":false,"xPaddingKey":"_token","xPaddingBytes":"16-64","xPaddingHeader":"X-Signature","xPaddingMethod":"tokenish","xPaddingObfsMode":true,"xPaddingPlacement":"query","uplinkHTTPMethod":"GET","uplinkDataPlacement":"body","scMaxEachPostBytes":"500000-1000000","scMinPostsIntervalMs":"50-150","scStreamUpServerSecs":"60-180"}
-JSON
-      ;;
-    yandex) cat <<'JSON'
-{"mode":"packet-up","xPaddingKey":"_dc","xPaddingHeader":"X-Cache","xPaddingMethod":"tokenish","xPaddingObfsMode":true,"xPaddingPlacement":"queryInHeader","uplinkHTTPMethod":"get"}
-JSON
-      ;;
-    beeline) jq '.streamSettings.xhttpSettings.extra' <<<"$(remna_inbound_json)" ;;
-    timeweb) jq '.streamSettings.xhttpSettings.extra' <<<"$(remna_inbound_json)" ;;
-    selectel) jq '.streamSettings.xhttpSettings.extra' <<<"$(remna_inbound_json)" ;;
-    turboflare) jq '.streamSettings.xhttpSettings.extra' <<<"$(remna_inbound_json)" ;;
-  esac
+  local inbound
+  inbound=$(remna_inbound_json)
+  rm_method_host_extra_json "$METHOD" "$inbound"
 }
 
 remna_host_values(){
@@ -1201,12 +1744,20 @@ fi
 if [[ "$PANEL_KIND" == remna ]]; then
   echo
   if [[ "$REMNA_ROLE" == panel ]]; then
-    ok "Центральная Remnawave-панель установлена. CDN и XHTTP для panel-only режима не настраиваются."
-    echo "Открой: https://${PANEL_DOMAIN}/"
-    echo "Создай первого администратора, затем для каждой новой ноды используй этот же install.sh → Remnawave → Только нода."
+    ok "Центральная Remnawave-панель установлена. На сервере панели XHTTP-нода не нужна."
+    echo "Открой: https://${PANEL_DOMAIN}/ и создай первого администратора."
+    echo "Дальше рабочий порядок:"
+    echo "  1) В панели создай Node для европейского VPS и скопируй SECRET_KEY."
+    echo "  2) На европейском VPS: этот же install.sh → Remnawave → Только нода → выбери CDN."
+    echo "  3) После запуска ноды вернись на этот сервер и выполни: $INSTALL_PATH --manage-remna"
+    echo "     Менеджер выберет эту ноду, спросит CDN/домены и попробует сам создать Profile, Active inbound, Squad и Host через API."
   else
-    warn "Remnawave: нода установлена, но профиль/host нужно добавить в центральной панели."
-    echo "Готовые файлы:"
+    warn "Remnawave: нода установлена. Теперь метод нужно привязать в центральной панели."
+    echo "На СЕРВЕРЕ ПАНЕЛИ запусти: /root/panel-script-v1.sh --manage-remna"
+    echo "Менеджер выберет эту ноду и попробует сам создать Profile, включить inbound, добавить его в Squad и создать Host."
+    echo "Если API установленной версии отличается, он ничего не удалит и оставит готовые файлы для ручного ввода."
+    echo
+    echo "Готовые файлы на этой ноде:"
     echo "  $OUT_DIR/remnawave-profile-${METHOD}.json"
     echo "  $OUT_DIR/remnawave-host-extra-${METHOD}.json"
     echo "  $OUT_DIR/remnawave-host-${METHOD}.txt"

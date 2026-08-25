@@ -1,24 +1,43 @@
-panel-script-v1 — БЫСТРЫЙ СТАРТ
-================================
+panel-script-v1 v1.1.0 — БЫСТРЫЙ СТАРТ
+======================================
 
-1. Создай PUBLIC репозиторий:
-   dagmagnat/panel-script-v1
+ПУБЛИЧНЫЙ GITHUB:
+https://github.com/dagmagnat/panel-script-v1
 
-2. Загрузи в корень ветки main:
-   install.sh
-   README.md
-
-3. На новом VPS Ubuntu вставь ОДНУ команду:
+Команда на новом VPS:
 
 curl -fsSL https://raw.githubusercontent.com/dagmagnat/panel-script-v1/main/install.sh -o /root/panel-script-v1.sh && chmod 700 /root/panel-script-v1.sh && /root/panel-script-v1.sh
 
-4. Повторный запуск:
-/root/panel-script-v1.sh
+ЕСЛИ ПАНЕЛЬ REMNAWAVE УЖЕ СТОИТ:
+/root/panel-script-v1.sh --manage-remna
 
-5. Обновление с GitHub:
+ЕСЛИ НОД ЕЩЁ НЕТ:
+1) В панели: Nodes -> Create node
+2) Address = IP европейского VPS
+3) Port = 2222
+4) Скопировать SECRET_KEY
+5) На европейском VPS запустить install.sh
+6) Remnawave -> Только нода -> выбрать CDN
+7) Ввести IP панели + SECRET_KEY
+8) Вернуться на сервер панели
+9) /root/panel-script-v1.sh --manage-remna
+10) Выбрать эту ноду + тот же CDN
+
+Можно иметь одновременно:
+NODE-1 -> TurboFlare
+NODE-2 -> Selectel
+NODE-3 -> VK
+и управлять ими из одной панели.
+
+Рекомендуется: 1 VPS-нода = 1 CDN-метод.
+
+TurboFlare:
+Сайты -> домен -> Редактирование -> Адрес = IP НОДЫ:443
+HTTPS к источнику = ВКЛ
+Устаревший кэш = ВЫКЛ
+
+Обновить скрипт:
 /root/panel-script-v1.sh --update
 
-6. Только новая Remnawave-нода:
-Remnawave -> Только нода -> версия центральной панели -> CDN -> IP панели -> SECRET_KEY
-
-НЕ ЗАГРУЖАЙ В PUBLIC GITHUB ПАРОЛИ, SECRET_KEY, API TOKENS И .env.
+Версия:
+/root/panel-script-v1.sh --version
