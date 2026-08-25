@@ -11,7 +11,7 @@ IFS=$'\n\t'
 # This installer deliberately keeps each CDN preset separate. Do not mix fields
 # between providers: path/padding/uplink settings are provider-specific.
 
-INSTALLER_VERSION="1.0.0"
+INSTALLER_VERSION="1.0.1"
 STATE_SCHEMA_CURRENT="1"
 PRESET="${INSTALLER_PRESET:-}"
 
@@ -373,7 +373,19 @@ if ! marked packages; then
   export DEBIAN_FRONTEND=noninteractive
   apt-get update
   apt-get upgrade -y
-  apt-get install -y nginx certbot curl jq sqlite3 ca-certificates openssl ufw dnsutils uuid-runtime net-tools unzip iptables-persistent
+  # Do not install ufw together with iptables-persistent. On Ubuntu 24.04
+  # (including some provider mirrors) those packages conflict, and
+  # netfilter-persistent may be unavailable. We only need plain iptables;
+  # persistence for the Remnawave management-port rule is handled by systemd.
+  apt-get install -y nginx certbot curl jq sqlite3 ca-certificates openssl dnsutils uuid-runtime net-tools unzip iptables
+  if [[ "${ENABLE_UFW:-yes}" == yes ]]; then
+    # If an image already contains iptables-persistent, remove it before UFW.
+    if dpkg-query -W -f='${Status}' iptables-persistent 2>/dev/null | grep -q 'ok installed'; then
+      warn "Удаляю iptables-persistent: он конфликтует с UFW на этой Ubuntu."
+      apt-get remove -y iptables-persistent netfilter-persistent || true
+    fi
+    apt-get install -y ufw
+  fi
   mark packages
 fi
 
@@ -642,11 +654,39 @@ EOF
   docker logs remnanode --tail=30 || true
 
   # Restrict management port. Docker host-network listener must not be public.
-  iptables -C INPUT -p tcp --dport 2222 -s "${PANEL_IP}" -j ACCEPT 2>/dev/null || iptables -I INPUT -p tcp --dport 2222 -s "${PANEL_IP}" -j ACCEPT
-  iptables -C INPUT -p tcp --dport 2222 -s 127.0.0.1 -j ACCEPT 2>/dev/null || iptables -I INPUT -p tcp --dport 2222 -s 127.0.0.1 -j ACCEPT
-  iptables -C INPUT -p tcp --dport 2222 -s 172.16.0.0/12 -j ACCEPT 2>/dev/null || iptables -I INPUT -p tcp --dport 2222 -s 172.16.0.0/12 -j ACCEPT
-  iptables -C INPUT -p tcp --dport 2222 -j DROP 2>/dev/null || iptables -A INPUT -p tcp --dport 2222 -j DROP
-  netfilter-persistent save >/dev/null 2>&1 || true
+  # Do not depend on iptables-persistent/netfilter-persistent: they conflict
+  # with UFW on some Ubuntu 24.04 images. A small idempotent systemd service
+  # restores only our dedicated chain after every reboot.
+  cat > /usr/local/sbin/panel-script-v1-remna-firewall <<EOF
+#!/usr/bin/env bash
+set -e
+CHAIN=PSV1_REMNA_NODE
+iptables -N "\$CHAIN" 2>/dev/null || true
+iptables -F "\$CHAIN"
+iptables -A "\$CHAIN" -s ${PANEL_IP} -j ACCEPT
+iptables -A "\$CHAIN" -s 127.0.0.1 -j ACCEPT
+iptables -A "\$CHAIN" -s 172.16.0.0/12 -j ACCEPT
+iptables -A "\$CHAIN" -j DROP
+iptables -C INPUT -p tcp --dport 2222 -j "\$CHAIN" 2>/dev/null || iptables -I INPUT 1 -p tcp --dport 2222 -j "\$CHAIN"
+EOF
+  chmod 0700 /usr/local/sbin/panel-script-v1-remna-firewall
+
+  cat > /etc/systemd/system/panel-script-v1-remna-firewall.service <<'EOF'
+[Unit]
+Description=panel-script-v1 Remnawave node firewall
+Wants=network-online.target
+After=network-online.target docker.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/panel-script-v1-remna-firewall
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  systemctl daemon-reload
+  systemctl enable --now panel-script-v1-remna-firewall.service
   mark remna_node
 }
 
