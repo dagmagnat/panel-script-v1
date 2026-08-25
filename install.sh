@@ -11,7 +11,7 @@ IFS=$'\n\t'
 # This installer deliberately keeps each CDN preset separate. Do not mix fields
 # between providers: path/padding/uplink settings are provider-specific.
 
-INSTALLER_VERSION="1.1.5"
+INSTALLER_VERSION="1.1.6"
 STATE_SCHEMA_CURRENT="1"
 PRESET="${INSTALLER_PRESET:-}"
 
@@ -275,6 +275,30 @@ rm_api(){
   curl "${args[@]}"
 }
 
+rm_api_fetch_to_file(){
+  local method="$1" path="$2" token="${3:-}" out="$4" data="${5:-}" url="${RM_API_BASE%/}${path}" code
+  local args=(-sS --max-time 30 -o "$out" -w '%{http_code}' -X "$method" "$url" -H 'Content-Type: application/json' -H 'X-Remnawave-Client-Type: browser')
+  [[ "${RM_API_INSECURE:-no}" == yes ]] && args+=(-k)
+  if [[ -n "$token" ]]; then
+    token=$(rm_normalize_token "$token")
+    args+=(-H "Authorization: Bearer $token")
+  fi
+  [[ -n "$data" ]] && args+=(-d "$data")
+  code=$(curl "${args[@]}" 2>/dev/null || printf '000')
+  printf '%s' "$code"
+}
+
+rm_admin_jwt_prompt(){
+  local user pass body resp token
+  read -r -p "Логин администратора: " user
+  read -r -s -p "Пароль администратора: " pass; echo >&2
+  body=$(jq -nc --arg u "$user" --arg p "$pass" '{username:$u,password:$p}')
+  resp=$(rm_api POST /api/auth/login "" "$body" 2>/dev/null || true)
+  token=$(jq -r '.response.accessToken // .accessToken // empty' <<<"$resp" 2>/dev/null || true)
+  [[ -n "$token" ]] || { warn "Не удалось получить admin JWT. Проверь логин/пароль." >&2; return 1; }
+  printf '%s' "$token"
+}
+
 rm_api_http_probe(){
   local token="$1" body_file code url="${RM_API_BASE%/}/api/config-profiles"
   local args=(-sS --max-time 20 -o)
@@ -383,27 +407,58 @@ rm_get_token(){
 
 rm_pick_entity_array(){
   # Usage: rm_pick_entity_array <kind>. Reads one API JSON response on stdin.
-  # Remnawave has changed list wrappers between releases. Instead of assuming
-  # one wrapper, recursively find an array whose elements look like the entity
-  # returned by the endpoint. The endpoint itself limits the search domain.
+  # Remnawave has changed list wrappers between releases.
   local kind="$1"
   jq -c --arg kind "$kind" '
+    def nodeish($o):
+      ($o|type)=="object" and ($o.uuid? != null) and ($o.name? != null) and
+      (($o.address? != null) or ($o.nodeAddress? != null) or ($o.host? != null) or ($o.ip? != null));
     def looks($k; $o):
       ($o|type)=="object" and
-      (if $k=="nodes" then (($o.uuid? != null) and ($o.name? != null) and ($o.address? != null))
+      (if $k=="nodes" then nodeish($o)
        elif $k=="profiles" then (($o.uuid? != null) and ($o.name? != null))
-       elif $k=="hosts" then (($o.uuid? != null) and ($o.address? != null) and (($o.remark? != null) or ($o.inbound? != null)))
+       elif $k=="hosts" then (($o.uuid? != null) and (($o.address? != null) or ($o.remark? != null) or ($o.inbound? != null)))
        elif $k=="squads" then (($o.uuid? != null) and ($o.name? != null))
        else false end);
-    ([.. | arrays | select(length>0 and looks($kind; .[0]))] | sort_by(length) | reverse | .[0]) // []
+    def normalize_node:
+      . + {
+        address: (.address // .nodeAddress // .host // .ip // ""),
+        port: (.port // .nodePort // 2222),
+        isConnected: (.isConnected // .is_connected // .connected // false)
+      };
+    (([.. | arrays | select(length>0 and looks($kind; .[0]))] | sort_by(length) | reverse | .[0]) // [])
+    | if $kind=="nodes" then map(normalize_node) else . end
   ' 2>/dev/null || echo '[]'
 }
 
 rm_nodes_json(){
-  local token="$1" r f="$RM_MANAGER_DIR/last-nodes-response.json"
-  r=$(rm_api GET /api/nodes "$token" 2>/dev/null || true)
-  printf '%s\n' "$r" > "$f"; chmod 600 "$f" 2>/dev/null || true
-  rm_pick_entity_array nodes <<<"$r"
+  local token="$1" f="$RM_MANAGER_DIR/last-nodes-response.json" meta="$RM_MANAGER_DIR/last-nodes-http.txt"
+  local tmp code path parsed saw_json=no
+  : > "$meta"
+  for path in '/api/nodes' '/api/nodes?start=0&size=100' '/api/nodes?start=0&size=1000'; do
+    tmp=$(mktemp)
+    code=$(rm_api_fetch_to_file GET "$path" "$token" "$tmp")
+    printf 'path=%s http=%s bytes=%s\n' "$path" "$code" "$(wc -c < "$tmp" 2>/dev/null || echo 0)" >> "$meta"
+    if [[ -s "$tmp" ]] && jq -e . "$tmp" >/dev/null 2>&1; then
+      saw_json=yes
+      cp "$tmp" "$f"
+      chmod 600 "$f" 2>/dev/null || true
+      parsed=$(rm_pick_entity_array nodes < "$tmp")
+      if jq -e 'length > 0' <<<"$parsed" >/dev/null 2>&1; then
+        rm -f "$tmp"
+        printf '%s\n' "$parsed"
+        return 0
+      fi
+    elif [[ -s "$tmp" ]]; then
+      cp "$tmp" "$f"
+      chmod 600 "$f" 2>/dev/null || true
+    fi
+    rm -f "$tmp"
+  done
+  [[ -e "$f" ]] || : > "$f"
+  chmod 600 "$f" 2>/dev/null || true
+  printf '[]\n'
+  [[ "$saw_json" == yes ]] && return 2 || return 3
 }
 
 rm_profiles_json(){
@@ -428,8 +483,9 @@ rm_internal_squads_json(){
 }
 
 rm_choose_node(){
-  local token="$1" nodes n count i choice
-  nodes=$(rm_nodes_json "$token")
+  local token="$1" nodes n count i choice nrc=0
+  if nodes=$(rm_nodes_json "$token"); then nrc=0; else nrc=$?; fi
+  [[ $nrc -eq 0 ]] || return "$nrc"
   count=$(jq 'length' <<<"$nodes")
   if (( count == 0 )); then
     return 2
@@ -755,31 +811,54 @@ run_remna_panel_manager(){
 
   if [[ "$token_mode" == api ]]; then
     if node=$(rm_choose_node "$token"); then rc=0; else rc=$?; fi
-    if [[ $rc -eq 2 ]]; then
+    if [[ $rc -eq 2 || $rc -eq 3 ]]; then
       echo
-      # Do not state that the panel is empty unless the API response really
-      # contains no node-like object. A changed response wrapper used to cause
-      # a false "no nodes" message even while Nodes UI showed a connected node.
-      if jq -e '.. | objects | select((.uuid? != null) and (.name? != null) and (.address? != null))' "$RM_MANAGER_DIR/last-nodes-response.json" >/dev/null 2>&1; then
-        warn "API вернул ноду, но формат ответа этой сборки Remnawave пока не разобран. Панель НЕ пустая."
-        warn "Сырой ответ сохранён: $RM_MANAGER_DIR/last-nodes-response.json"
-        echo "Скрипт не будет создавать/перезаписывать сущности вслепую. Обнови installer и запусти --manage-remna снова."
-        exit 0
+      if [[ $rc -eq 3 ]]; then
+        warn "Текущий токен принят панелью, но GET /api/nodes не вернул пригодного JSON-ответа."
+      else
+        warn "GET /api/nodes вернул JSON, но список нод через этот способ авторизации пуст/не распознан."
       fi
-      warn "API действительно не вернул ни одной ноды. Сначала создай её."
-      echo "1. Панель → Nodes → Create node."
-      echo "2. Address = IP европейского VPS; Node Port выбери свободный (например 2222/2233) и запомни."
-      echo "3. Скопируй SECRET_KEY."
-      echo "4. На европейском VPS запусти этот же install.sh → Remnawave → Только нода."
-      echo "5. Введи IP этой панели и SECRET_KEY; выбери нужный CDN."
-      echo "6. Когда нода появится/подключится, снова запусти здесь: $INSTALL_PATH --manage-remna"
-      exit 0
+      [[ -s "$RM_MANAGER_DIR/last-nodes-http.txt" ]] && { echo "Диагностика API:"; cat "$RM_MANAGER_DIR/last-nodes-http.txt"; }
+      echo "В веб-панели нода может при этом быть видна. Вторую ноду создавать НЕ нужно."
+      echo
+      echo "Попробовать получить список нод через обычный admin JWT (логин/пароль панели)?"
+      echo "  1 — да, войти администратором и продолжить автоматически"
+      echo "  2 — перейти в ручной режим с готовыми JSON"
+      echo "  0 — выйти"
+      read -r -p "Выбор [1]: " retry_choice; retry_choice="${retry_choice:-1}"
+      case "$retry_choice" in
+        1)
+          if token=$(rm_admin_jwt_prompt); then
+            if node=$(rm_choose_node "$token"); then rc=0; else rc=$?; fi
+            if [[ $rc -ne 0 ]]; then
+              warn "Даже admin JWT не дал список нод. Ничего в панели не изменяю."
+              [[ -s "$RM_MANAGER_DIR/last-nodes-http.txt" ]] && cat "$RM_MANAGER_DIR/last-nodes-http.txt"
+              token_mode=manual
+            fi
+          else
+            token_mode=manual
+          fi
+          ;;
+        2) token_mode=manual ;;
+        0) exit 0 ;;
+        *) token_mode=manual ;;
+      esac
+      if [[ "$token_mode" == manual ]]; then
+        echo
+        warn "Перехожу в ручной режим: подготовлю точные profile/host/xhttpExtraParams и инструкции, существующее не меняю."
+        read -r -p "Имя ноды в панели: " node_name
+        read -r -p "Публичный IPv4 европейской ноды: " node_ip
+        valid_ipv4 "$node_ip" || die "Нужен IPv4 ноды."
+        node_uuid="manual"
+      fi
     elif [[ $rc -ne 0 ]]; then
       die "Не удалось выбрать ноду."
     fi
-    node_uuid=$(jq -r '.uuid' <<<"$node"); node_name=$(jq -r '.name // .uuid' <<<"$node"); node_ip=$(jq -r '.address // empty' <<<"$node")
-    connected=$(jq -r '.isConnected // .is_connected // false' <<<"$node")
-    [[ "$connected" == true ]] || warn "Нода сейчас не отмечена Connected. Настройку создать можно, но тест 400 появится только после подключения ноды."
+    if [[ "$token_mode" == api ]]; then
+      node_uuid=$(jq -r '.uuid' <<<"$node"); node_name=$(jq -r '.name // .uuid' <<<"$node"); node_ip=$(jq -r '.address // empty' <<<"$node")
+      connected=$(jq -r '.isConnected // .is_connected // false' <<<"$node")
+      [[ "$connected" == true ]] || warn "Нода сейчас не отмечена Connected. Настройку создать можно, но тест 400 появится только после подключения ноды."
+    fi
   else
     echo
     warn "Ручной режим: API панель не изменяет. Я подготовлю готовые JSON/параметры."

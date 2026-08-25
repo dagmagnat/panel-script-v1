@@ -1,6 +1,6 @@
-# panel-script-v1 — v1.1.4
+# panel-script-v1 — v1.1.6
 
-## 1.1.4 API compatibility fix
+## 1.1.6 API/node fallback
 
 API token validation now accepts any successful 2xx JSON response instead of requiring one exact configProfiles wrapper. List parsers support array/items/data wrappers for profiles, nodes, hosts and internal squads. Host creation tries current `xhttpExtraParams` first and legacy `xHttpExtraParams` as fallback.
 
@@ -115,3 +115,8 @@ Node Port настраивается в карточке ноды Remnawave и �
 Начиная с v1.1.5 менеджер не предполагает один фиксированный JSON-wrapper для `GET /api/nodes`. Он ищет массив объектов нод рекурсивно и сохраняет сырой ответ API в `/root/panel-script-v1-output/remna-methods/last-nodes-response.json`. Это устраняет ложное сообщение «в панели нет нод», когда Node видна и Connected в интерфейсе.
 
 External Squads не входят в обязательную цепочку обычного CDN/XHTTP. Для базовой схемы нужны Config Profile/Xray inbound → Node/Active Inbounds → Internal Squad → User → Host. External Squad используется только при отдельной reseller/multi-tenant логике подписок и автоматически не создаётся.
+
+### Если Node видна в панели, а API token не возвращает `/api/nodes`
+
+В v1.1.6 это больше не считается «панель пустая». Скрипт показывает HTTP-диагностику и предлагает временно войти обычным логином/паролем администратора. Полученный admin JWT используется только для текущего мастера, чтобы прочитать Node и выполнить безопасное добавление Profile/Inbound/Internal Squad/Host.
+
