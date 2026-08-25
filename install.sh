@@ -11,7 +11,7 @@ IFS=$'\n\t'
 # This installer deliberately keeps each CDN preset separate. Do not mix fields
 # between providers: path/padding/uplink settings are provider-specific.
 
-INSTALLER_VERSION="1.1.0"
+INSTALLER_VERSION="1.1.1"
 STATE_SCHEMA_CURRENT="1"
 PRESET="${INSTALLER_PRESET:-}"
 
@@ -96,6 +96,26 @@ ask_optional_domain(){
     warn "Некорректный домен."
   done
 }
+valid_port(){ [[ "$1" =~ ^[0-9]+$ ]] && (( 10#$1 >= 1 && 10#$1 <= 65535 )); }
+ask_port(){
+  local __var="$1" label="$2" current="${3:-2222}" v=""
+  while true; do
+    read -r -p "$label [$current]: " v
+    v="${v:-$current}"
+    if valid_port "$v"; then printf -v "$__var" '%s' "$v"; return; fi
+    warn "Некорректный порт. Введи число от 1 до 65535."
+  done
+}
+ensure_remna_node_port(){
+  if [[ "${PANEL_KIND:-}" == remna && ( "${REMNA_ROLE:-}" == node || "${REMNA_ROLE:-}" == both ) && -z "${REMNA_NODE_PORT:-}" ]]; then
+    echo
+    warn "Node Port не сохранён (это нормально после обновления старой версии скрипта)."
+    echo "Введи ТОЧНО тот Node Port, который указан в карточке ноды Remnawave."
+    echo "Он должен совпадать в панели и в NODE_PORT контейнера ноды."
+    ask_port REMNA_NODE_PORT "Node Port из Remnawave" "2222"
+    save_state
+  fi
+}
 random_password(){ openssl rand -base64 24 | tr -d '\n' | tr '/+' 'Aa'; }
 random_path(){ openssl rand -hex 8; }
 
@@ -104,7 +124,7 @@ save_state(){
   umask 077
   {
     printf 'STATE_SCHEMA=%q\n' "$STATE_SCHEMA_CURRENT"
-    for k in PANEL_KIND REMNA_ROLE METHOD REMNA_VERSION XUI_VERSION UPGRADE_XUI_XRAY XUI_EXISTING PANEL_DOMAIN ORIGIN_DOMAIN CDN_DOMAIN ENABLE_UFW ENABLE_BBR CASCADE LE_EMAIL PANEL_IP REMNA_SECRET_KEY XUI_USER XUI_PASS XUI_PANEL_PORT XUI_PATH REMNA_ADMIN_USER REMNA_ADMIN_PASS; do
+    for k in PANEL_KIND REMNA_ROLE METHOD REMNA_VERSION REMNA_NODE_PORT XUI_VERSION UPGRADE_XUI_XRAY XUI_EXISTING PANEL_DOMAIN ORIGIN_DOMAIN CDN_DOMAIN ENABLE_UFW ENABLE_BBR CASCADE LE_EMAIL PANEL_IP REMNA_SECRET_KEY XUI_USER XUI_PASS XUI_PANEL_PORT XUI_PATH REMNA_ADMIN_USER REMNA_ADMIN_PASS; do
       printf '%s=%q\n' "$k" "${!k:-}"
     done
   } > "$t"
@@ -530,7 +550,7 @@ run_remna_panel_manager(){
       echo
       warn "В панели пока нет ни одной ноды. Сначала создай её."
       echo "1. Панель → Nodes → Create node."
-      echo "2. Address = IP европейского VPS, Port = 2222."
+      echo "2. Address = IP европейского VPS; Node Port выбери свободный (например 2222/2233) и запомни."
       echo "3. Скопируй SECRET_KEY."
       echo "4. На европейском VPS запусти этот же install.sh → Remnawave → Только нода."
       echo "5. Введи IP этой панели и SECRET_KEY; выбери нужный CDN."
@@ -665,6 +685,7 @@ show_config(){
   echo "================ Сохранённая конфигурация ================"
   echo "Панель          : $PANEL_KIND"
   [[ "$PANEL_KIND" == remna ]] && echo "Роль Remnawave  : ${REMNA_ROLE:-} / версия ${REMNA_VERSION:-}"
+  [[ "$PANEL_KIND" == remna && ( "${REMNA_ROLE:-}" == node || "${REMNA_ROLE:-}" == both ) ]] && echo "Node Port       : ${REMNA_NODE_PORT:-не задан}"
   [[ "$PANEL_KIND" == 3xui ]] && echo "Версия 3x-ui    : ${XUI_VERSION:-}"
   echo "Метод           : $(method_title "${METHOD:-none}")"
   if [[ "${METHOD:-none}" != none ]]; then
@@ -744,6 +765,10 @@ collect_config(){
     echo "  2 — $REMNA_NEWER_VERSION (новее; конфиги методов ещё надо перепроверить на практике)"
     read -r -p "Выбор [1]: " rv; rv="${rv:-1}"; [[ "$rv" == 2 ]] && REMNA_VERSION="$REMNA_NEWER_VERSION" || REMNA_VERSION="$REMNA_MANUAL_VERSION"
     XUI_VERSION=""
+    if [[ "$REMNA_ROLE" == both ]]; then
+      echo "Для panel+node выбери Node Port сейчас, а в окне создания ноды укажи ТО ЖЕ значение."
+      ask_port REMNA_NODE_PORT "Node Port" "${REMNA_NODE_PORT:-2222}"
+    fi
   else
     REMNA_ROLE=""; REMNA_VERSION=""
     XUI_VERSION="$XUI_COMPAT_VERSION"
@@ -822,6 +847,8 @@ collect_config(){
   if [[ "$PANEL_KIND" == remna && "$REMNA_ROLE" == node ]]; then
     read -r -p "IP сервера панели Remnawave: " PANEL_IP
     while ! valid_ipv4 "$PANEL_IP"; do read -r -p "Нужен IPv4 панели: " PANEL_IP; done
+    echo "Node Port — это поле 'Node Port' в окне создания ноды. Он НЕ обязан быть 2222."
+    ask_port REMNA_NODE_PORT "Node Port из панели Remnawave" "${REMNA_NODE_PORT:-2222}"
     read -r -p "SECRET_KEY ноды из панели Remnawave: " REMNA_SECRET_KEY
     [[ -n "$REMNA_SECRET_KEY" ]] || die "Для node-only нужен SECRET_KEY."
   fi
@@ -831,6 +858,17 @@ collect_config(){
 }
 
 case "${1:-}" in
+  --node-credentials)
+    load_state || die "Нет сохранённой конфигурации ноды: $STATE_FILE"
+    [[ "${PANEL_KIND:-}" == remna && ( "${REMNA_ROLE:-}" == node || "${REMNA_ROLE:-}" == both ) ]] || die "Сохранённая задача не является Remnawave-нodedой."
+    echo "Обновление параметров связи Remnawave Panel → Node."
+    ask_port REMNA_NODE_PORT "Node Port из карточки ноды" "${REMNA_NODE_PORT:-2222}"
+    read -r -s -p "SECRET_KEY ноды: " REMNA_SECRET_KEY; echo
+    [[ -n "$REMNA_SECRET_KEY" ]] || die "SECRET_KEY пустой."
+    save_state
+    ok "Node Port и SECRET_KEY обновлены в $STATE_FILE"
+    exit 0
+    ;;
   --manage-remna)
     run_remna_panel_manager
     exit 0
@@ -866,6 +904,7 @@ ${PROJECT_NAME} ${INSTALLER_VERSION}
 Запуск: $INSTALL_PATH
 Версия: $INSTALL_PATH --version
 Статус: $INSTALL_PATH --status
+Обновить Node Port/SECRET_KEY: $INSTALL_PATH --node-credentials
 Управление существующей Remnawave: $INSTALL_PATH --manage-remna
 Проверка Remnawave: $INSTALL_PATH --check-remna
 Сброс ответов: $INSTALL_PATH --reset
@@ -887,6 +926,7 @@ EOF
 esac
 
 if load_state; then
+  ensure_remna_node_port
   if marked complete && [[ "${PANEL_KIND:-}" == remna ]] && [[ "${REMNA_ROLE:-}" == panel || "${REMNA_ROLE:-}" == both ]]; then
     echo
     echo "Remnawave на этом сервере уже была установлена этим скриптом."
@@ -1221,11 +1261,14 @@ download_xray(){
     || curl -fL --retry 3 -o /tmp/xray.zip "https://gh-proxy.com/https://github.com/XTLS/Xray-core/releases/download/v${version}/${zip}"
   unzip -o /tmp/xray.zip xray -d /tmp/xray_dl >/dev/null
   install -m 0755 /tmp/xray_dl/xray "$dest"
-  "$dest" version | head -1
+  # Do not pipe to `head` under `set -o pipefail`: Xray writes several lines,
+  # `head` closes early and Xray exits with SIGPIPE (141), aborting the installer.
+  "$dest" version 2>&1 | sed -n '1p'
 }
 
 install_remna_node(){
   marked remna_node && return 0
+  ensure_remna_node_port
   install_docker
   mkdir -p /opt/remnanode
   download_xray /opt/remnanode/xray-custom "$XRAY_MANUAL_VERSION"
@@ -1237,7 +1280,7 @@ install_remna_node(){
     echo "Рекомендуемые доступы (сохраняются только root на сервере):"
     echo "  Логин:  $REMNA_ADMIN_USER"
     echo "  Пароль: $REMNA_ADMIN_PASS"
-    echo "Потом: Nodes → Create node → Address=$PUBLIC_IP → Port=2222 → скопируй SECRET_KEY."
+    echo "Потом: Nodes → Create node → Address=$PUBLIC_IP → Port=${REMNA_NODE_PORT} → скопируй SECRET_KEY."
     read -r -p "SECRET_KEY: " REMNA_SECRET_KEY
     [[ -n "$REMNA_SECRET_KEY" ]] || die "SECRET_KEY пустой."
     PANEL_IP="$PUBLIC_IP"
@@ -1262,7 +1305,7 @@ services:
     env_file: [.env]
 EOF
   cat > /opt/remnanode/.env <<EOF
-NODE_PORT=2222
+NODE_PORT=${REMNA_NODE_PORT}
 SECRET_KEY=${REMNA_SECRET_KEY}
 EOF
   chmod 600 /opt/remnanode/.env
@@ -1284,7 +1327,7 @@ iptables -A "\$CHAIN" -s ${PANEL_IP} -j ACCEPT
 iptables -A "\$CHAIN" -s 127.0.0.1 -j ACCEPT
 iptables -A "\$CHAIN" -s 172.16.0.0/12 -j ACCEPT
 iptables -A "\$CHAIN" -j DROP
-iptables -C INPUT -p tcp --dport 2222 -j "\$CHAIN" 2>/dev/null || iptables -I INPUT 1 -p tcp --dport 2222 -j "\$CHAIN"
+iptables -C INPUT -p tcp --dport ${REMNA_NODE_PORT} -j "\$CHAIN" 2>/dev/null || iptables -I INPUT 1 -p tcp --dport ${REMNA_NODE_PORT} -j "\$CHAIN"
 EOF
   chmod 0700 /usr/local/sbin/panel-script-v1-remna-firewall
 
@@ -1747,7 +1790,7 @@ if [[ "$PANEL_KIND" == remna ]]; then
     ok "Центральная Remnawave-панель установлена. На сервере панели XHTTP-нода не нужна."
     echo "Открой: https://${PANEL_DOMAIN}/ и создай первого администратора."
     echo "Дальше рабочий порядок:"
-    echo "  1) В панели создай Node для европейского VPS и скопируй SECRET_KEY."
+    echo "  1) В панели создай Node для европейского VPS, запомни Node Port и скопируй SECRET_KEY."
     echo "  2) На европейском VPS: этот же install.sh → Remnawave → Только нода → выбери CDN."
     echo "  3) После запуска ноды вернись на этот сервер и выполни: $INSTALL_PATH --manage-remna"
     echo "     Менеджер выберет эту ноду, спросит CDN/домены и попробует сам создать Profile, Active inbound, Squad и Host через API."
