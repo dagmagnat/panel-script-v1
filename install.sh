@@ -11,7 +11,7 @@ IFS=$'\n\t'
 # This installer deliberately keeps each CDN preset separate. Do not mix fields
 # between providers: path/padding/uplink settings are provider-specific.
 
-INSTALLER_VERSION="1.1.7"
+INSTALLER_VERSION="1.1.8"
 STATE_SCHEMA_CURRENT="1"
 PRESET="${INSTALLER_PRESET:-}"
 
@@ -263,7 +263,12 @@ rm_normalize_token(){
 }
 
 rm_api(){
-  local method="$1" path="$2" token="${3:-}" data="${4:-}" url="${RM_API_BASE%/}${path}" auth=""
+  local method="$1"
+  local path="$2"
+  local token="${3:-}"
+  local data="${4:-}"
+  local url="${RM_API_BASE%/}${path}"
+  local auth=""
   local args=(-sS --max-time 20 -X "$method" "$url" -H 'Content-Type: application/json' -H 'X-Remnawave-Client-Type: browser')
   [[ "${RM_API_INSECURE:-no}" == yes ]] && args+=(-k)
   if [[ -n "$token" ]]; then
@@ -276,7 +281,13 @@ rm_api(){
 }
 
 rm_api_fetch_to_file(){
-  local method="$1" path="$2" token="${3:-}" out="$4" data="${5:-}" url="${RM_API_BASE%/}${path}" code
+  local method="$1"
+  local path="$2"
+  local token="${3:-}"
+  local out="$4"
+  local data="${5:-}"
+  local url="${RM_API_BASE%/}${path}"
+  local code=""
   local args=(-sS --max-time 30 -o "$out" -w '%{http_code}' -X "$method" "$url" -H 'Content-Type: application/json' -H 'X-Remnawave-Client-Type: browser')
   [[ "${RM_API_INSECURE:-no}" == yes ]] && args+=(-k)
   if [[ -n "$token" ]]; then

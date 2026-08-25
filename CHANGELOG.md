@@ -1,3 +1,10 @@
+# Changelog
+
+## 1.1.8
+- Исправлен `unbound variable: path` в API helper при `set -u`.
+- `rm_api` и `rm_api_fetch_to_file` теперь инициализируют `path` до построения URL.
+- Создание Config Profile снова доходит до реального POST и сохраняет HTTP/JSON-диагностику при отказе API.
+
 ## 1.1.7
 
 - Исправлено создание Config Profile в Remnawave: имя профиля теперь всегда не длиннее 30 символов — это лимит API.
