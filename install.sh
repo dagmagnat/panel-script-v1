@@ -11,7 +11,7 @@ IFS=$'\n\t'
 # This installer deliberately keeps each CDN preset separate. Do not mix fields
 # between providers: path/padding/uplink settings are provider-specific.
 
-INSTALLER_VERSION="1.1.2"
+INSTALLER_VERSION="1.1.3"
 STATE_SCHEMA_CURRENT="1"
 PRESET="${INSTALLER_PRESET:-}"
 
@@ -248,19 +248,62 @@ rm_panel_version(){
   return 1
 }
 
+rm_normalize_token(){
+  local token="${1:-}"
+  token="${token//$'\r'/}"
+  token="${token//$'\n'/}"
+  token="${token#Authorization: Bearer }"
+  token="${token#authorization: bearer }"
+  token="${token#Bearer }"
+  token="${token#bearer }"
+  # Remove accidental surrounding quotes without touching token contents.
+  if [[ ${#token} -ge 2 && "$token" == \"*\" ]]; then token="${token:1:${#token}-2}"; fi
+  if [[ ${#token} -ge 2 && "$token" == \'*\' ]]; then token="${token:1:${#token}-2}"; fi
+  printf '%s' "$token"
+}
+
 rm_api(){
-  local method="$1" path="$2" token="${3:-}" data="${4:-}" url="${RM_API_BASE%/}${path}"
+  local method="$1" path="$2" token="${3:-}" data="${4:-}" url="${RM_API_BASE%/}${path}" auth=""
   local args=(-sS --max-time 20 -X "$method" "$url" -H 'Content-Type: application/json' -H 'X-Remnawave-Client-Type: browser')
   [[ "${RM_API_INSECURE:-no}" == yes ]] && args+=(-k)
-  [[ -n "$token" ]] && args+=(-H "Authorization: Bearer $token")
+  if [[ -n "$token" ]]; then
+    token=$(rm_normalize_token "$token")
+    auth="Bearer $token"
+    args+=(-H "Authorization: $auth")
+  fi
   [[ -n "$data" ]] && args+=(-d "$data")
   curl "${args[@]}"
 }
 
+rm_api_http_probe(){
+  local token="$1" body_file code url="${RM_API_BASE%/}/api/config-profiles"
+  local args=(-sS --max-time 20 -o)
+  body_file=$(mktemp)
+  token=$(rm_normalize_token "$token")
+  if [[ "${RM_API_INSECURE:-no}" == yes ]]; then
+    code=$(curl -k -sS --max-time 20 -o "$body_file" -w '%{http_code}' \
+      -H 'Content-Type: application/json' -H 'X-Remnawave-Client-Type: browser' \
+      -H "Authorization: Bearer $token" "$url" 2>/dev/null || printf '000')
+  else
+    code=$(curl -sS --max-time 20 -o "$body_file" -w '%{http_code}' \
+      -H 'Content-Type: application/json' -H 'X-Remnawave-Client-Type: browser' \
+      -H "Authorization: Bearer $token" "$url" 2>/dev/null || printf '000')
+  fi
+  printf '%s\n' "$code"
+  cat "$body_file"
+  rm -f "$body_file"
+}
+
 rm_token_valid(){
   local token="$1" r
+  token=$(rm_normalize_token "$token")
+  [[ -n "$token" ]] || return 1
+  # A UUID shown in token details is the token record UUID, not the API secret.
+  [[ "$token" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]] && return 3
   r=$(rm_api GET /api/config-profiles "$token" 2>/dev/null || true)
-  jq -e '.response.configProfiles' >/dev/null 2>&1 <<<"$r"
+  # Remnawave contracts have used more than one response wrapper. Accept a
+  # successful profile payload in any known form; downstream parsers handle it.
+  jq -e '(.response.configProfiles? | type)=="array" or (.response? | type)=="array" or (.configProfiles? | type)=="array"' >/dev/null 2>&1 <<<"$r"
 }
 
 rm_get_token(){
@@ -284,7 +327,13 @@ rm_get_token(){
   case "$choice" in
     3) return 2 ;;
     2)
-      read -r -s -p "API token: " token; echo >&2
+      read -r -s -p "API token (НЕ UUID записи токена): " token; echo >&2
+      token=$(rm_normalize_token "$token")
+      if [[ "$token" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]]; then
+        warn "Введён UUID записи API Token, а не сам секретный API token. UUID из окна сведений для Authorization не подходит." >&2
+        echo "Создай новый API Token в Settings → API Tokens и скопируй именно выданное значение token; либо выбери вход логином/паролем." >&2
+        return 4
+      fi
       ;;
     *)
       read -r -p "Логин администратора: " user
@@ -298,8 +347,21 @@ rm_get_token(){
       fi
       ;;
   esac
-  if ! rm_token_valid "$token"; then
-    warn "Панель не приняла токен для /api/config-profiles. Перехожу в безопасный ручной режим." >&2
+  if rm_token_valid "$token"; then
+    :
+  else
+    local vrc=$? probe code body msg
+    if [[ $vrc -eq 3 ]]; then
+      warn "Введён UUID записи API Token, а не секретный token." >&2
+      return 4
+    fi
+    probe=$(rm_api_http_probe "$token" 2>/dev/null || true)
+    code=$(sed -n '1p' <<<"$probe")
+    body=$(sed '1d' <<<"$probe")
+    msg=$(jq -r '.message // .error // .errorCode // empty' <<<"$body" 2>/dev/null || true)
+    warn "Проверка API token не прошла: /api/config-profiles → HTTP ${code:-unknown}${msg:+, $msg}." >&2
+    echo "Если ты вставлял строку из поля UUID (xxxxxxxx-xxxx-...), это НЕ API token." >&2
+    echo "Можно сразу выбрать вход логином/паролем — пароль отправляется только твоей панели по HTTPS." >&2
     return 2
   fi
   umask 077; printf '%s\n' "$token" > "$RM_MANAGER_TOKEN_FILE"; chmod 600 "$RM_MANAGER_TOKEN_FILE"; umask 022
@@ -611,14 +673,26 @@ run_remna_panel_manager(){
   fi
 
   if [[ "$token_mode" == api ]]; then
-    set +e
-    token=$(rm_get_token); rc=$?
-    set -e
-    if [[ $rc -eq 2 ]]; then token_mode=manual; token=""; elif [[ $rc -ne 0 ]]; then warn "API-вход не получился; продолжу в ручном режиме."; token_mode=manual; token=""; fi
+    # Keep non-zero returns inside an `if`: this suppresses the global ERR trap
+    # and lets the wizard offer a retry instead of aborting with code 2.
+    if token=$(rm_get_token); then
+      :
+    else
+      rc=$?
+      if [[ $rc -eq 4 ]]; then
+        warn "Похоже, был вставлен UUID токена. Запусти менеджер ещё раз и выбери логин/пароль либо вставь настоящий API token."
+        token_mode=manual; token=""
+      elif [[ $rc -eq 2 ]]; then
+        token_mode=manual; token=""
+      else
+        warn "API-вход не получился; продолжу в ручном режиме."
+        token_mode=manual; token=""
+      fi
+    fi
   fi
 
   if [[ "$token_mode" == api ]]; then
-    set +e; node=$(rm_choose_node "$token"); rc=$?; set -e
+    if node=$(rm_choose_node "$token"); then rc=0; else rc=$?; fi
     if [[ $rc -eq 2 ]]; then
       echo
       warn "В панели пока нет ни одной ноды. Сначала создай её."
