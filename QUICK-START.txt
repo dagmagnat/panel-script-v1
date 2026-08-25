@@ -1,0 +1,24 @@
+panel-script-v1 — БЫСТРЫЙ СТАРТ
+================================
+
+1. Создай PUBLIC репозиторий:
+   dagmagnat/panel-script-v1
+
+2. Загрузи в корень ветки main:
+   install.sh
+   README.md
+
+3. На новом VPS Ubuntu вставь ОДНУ команду:
+
+curl -fsSL https://raw.githubusercontent.com/dagmagnat/panel-script-v1/main/install.sh -o /root/panel-script-v1.sh && chmod 700 /root/panel-script-v1.sh && /root/panel-script-v1.sh
+
+4. Повторный запуск:
+/root/panel-script-v1.sh
+
+5. Обновление с GitHub:
+/root/panel-script-v1.sh --update
+
+6. Только новая Remnawave-нода:
+Remnawave -> Только нода -> версия центральной панели -> CDN -> IP панели -> SECRET_KEY
+
+НЕ ЗАГРУЖАЙ В PUBLIC GITHUB ПАРОЛИ, SECRET_KEY, API TOKENS И .env.
