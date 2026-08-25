@@ -11,7 +11,7 @@ IFS=$'\n\t'
 # This installer deliberately keeps each CDN preset separate. Do not mix fields
 # between providers: path/padding/uplink settings are provider-specific.
 
-INSTALLER_VERSION="1.1.3"
+INSTALLER_VERSION="1.1.4"
 STATE_SCHEMA_CURRENT="1"
 PRESET="${INSTALLER_PRESET:-}"
 
@@ -295,15 +295,24 @@ rm_api_http_probe(){
 }
 
 rm_token_valid(){
-  local token="$1" r
+  local token="$1" probe code body
   token=$(rm_normalize_token "$token")
   [[ -n "$token" ]] || return 1
   # A UUID shown in token details is the token record UUID, not the API secret.
   [[ "$token" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]] && return 3
-  r=$(rm_api GET /api/config-profiles "$token" 2>/dev/null || true)
-  # Remnawave contracts have used more than one response wrapper. Accept a
-  # successful profile payload in any known form; downstream parsers handle it.
-  jq -e '(.response.configProfiles? | type)=="array" or (.response? | type)=="array" or (.configProfiles? | type)=="array"' >/dev/null 2>&1 <<<"$r"
+
+  # Do not validate authorization by one particular response layout. Remnawave
+  # has changed list wrappers between releases. HTTP 2xx + valid JSON without
+  # an API error is enough to prove the token was accepted.
+  probe=$(rm_api_http_probe "$token" 2>/dev/null || true)
+  code=$(sed -n '1p' <<<"$probe")
+  body=$(sed '1d' <<<"$probe")
+  [[ "$code" =~ ^2[0-9][0-9]$ ]] || return 1
+  jq -e . >/dev/null 2>&1 <<<"$body" || return 5
+  if jq -e '((.statusCode? // 200) | tonumber? // 200) >= 400 or ((.errorCode? // null) != null) or (((.message? // "")|tostring) | test("unauthorized|forbidden";"i"))' >/dev/null 2>&1 <<<"$body"; then
+    return 1
+  fi
+  return 0
 }
 
 rm_get_token(){
@@ -355,6 +364,10 @@ rm_get_token(){
       warn "Введён UUID записи API Token, а не секретный token." >&2
       return 4
     fi
+    if [[ $vrc -eq 5 ]]; then
+      warn "Панель ответила HTTP 2xx, но тело ответа не JSON. Проверь reverse proxy/API route; токен здесь не доказан и не опровергнут." >&2
+      return 2
+    fi
     probe=$(rm_api_http_probe "$token" 2>/dev/null || true)
     code=$(sed -n '1p' <<<"$probe")
     body=$(sed '1d' <<<"$probe")
@@ -371,7 +384,62 @@ rm_get_token(){
 rm_nodes_json(){
   local token="$1" r
   r=$(rm_api GET /api/nodes "$token" 2>/dev/null || true)
-  jq -c 'if (.response|type)=="array" then .response elif (.response.nodes?|type)=="array" then .response.nodes else [] end' <<<"$r" 2>/dev/null || echo '[]'
+  jq -c '
+    def list(x):
+      if (x|type)=="array" then x
+      elif (x|type)=="object" and (x.items?|type)=="array" then x.items
+      elif (x|type)=="object" and (x.data?|type)=="array" then x.data
+      else [] end;
+    if (.response|type)=="array" then .response
+    else list(.response.nodes // .nodes // .response.items // .response.data // empty)
+    end
+  ' <<<"$r" 2>/dev/null || echo '[]'
+}
+
+rm_profiles_json(){
+  local token="$1" r
+  r=$(rm_api GET /api/config-profiles "$token" 2>/dev/null || true)
+  jq -c '
+    def list(x):
+      if (x|type)=="array" then x
+      elif (x|type)=="object" and (x.items?|type)=="array" then x.items
+      elif (x|type)=="object" and (x.data?|type)=="array" then x.data
+      elif (x|type)=="object" and (x.profiles?|type)=="array" then x.profiles
+      else [] end;
+    list(.response.configProfiles // .configProfiles // .response.profiles // .response.items // .response.data // empty)
+  ' <<<"$r" 2>/dev/null || echo '[]'
+}
+
+rm_hosts_json(){
+  local token="$1" r
+  r=$(rm_api GET /api/hosts "$token" 2>/dev/null || true)
+  jq -c '
+    def list(x):
+      if (x|type)=="array" then x
+      elif (x|type)=="object" and (x.items?|type)=="array" then x.items
+      elif (x|type)=="object" and (x.data?|type)=="array" then x.data
+      elif (x|type)=="object" and (x.hosts?|type)=="array" then x.hosts
+      else [] end;
+    if (.response|type)=="array" then .response
+    else list(.response.hosts // .hosts // .response.items // .response.data // empty)
+    end
+  ' <<<"$r" 2>/dev/null || echo '[]'
+}
+
+rm_internal_squads_json(){
+  local token="$1" r
+  r=$(rm_api GET /api/internal-squads "$token" 2>/dev/null || true)
+  jq -c '
+    def list(x):
+      if (x|type)=="array" then x
+      elif (x|type)=="object" and (x.items?|type)=="array" then x.items
+      elif (x|type)=="object" and (x.data?|type)=="array" then x.data
+      elif (x|type)=="object" and (x.internalSquads?|type)=="array" then x.internalSquads
+      else [] end;
+    if (.response|type)=="array" then .response
+    else list(.response.internalSquads // .internalSquads // .response.items // .response.data // empty)
+    end
+  ' <<<"$r" 2>/dev/null || echo '[]'
 }
 
 rm_choose_node(){
@@ -513,15 +581,15 @@ rm_api_create_profile(){
 }
 
 rm_api_existing_profile(){
-  local token="$1" name="$2" r uuid inb
-  r=$(rm_api GET /api/config-profiles "$token" 2>/dev/null || true)
-  uuid=$(jq -r --arg n "$name" '[.response.configProfiles[]? | select(.name==$n) | .uuid][0] // empty' <<<"$r")
+  local token="$1" name="$2" profiles uuid r inb
+  profiles=$(rm_profiles_json "$token")
+  uuid=$(jq -r --arg n "$name" '[.[]? | select(.name==$n) | .uuid][0] // empty' <<<"$profiles")
   [[ -n "$uuid" ]] || return 1
   r=$(rm_api GET "/api/config-profiles/${uuid}/inbounds" "$token" 2>/dev/null || true)
-  inb=$(jq -r '.response.inbounds[0].uuid // .response[0].uuid // empty' <<<"$r" 2>/dev/null || true)
+  inb=$(jq -r '.response.inbounds[0].uuid // .response[0].uuid // .response.items[0].uuid // empty' <<<"$r" 2>/dev/null || true)
   if [[ -z "$inb" ]]; then
     r=$(rm_api GET "/api/config-profiles/${uuid}" "$token" 2>/dev/null || true)
-    inb=$(jq -r '.response.inbounds[0].uuid // empty' <<<"$r" 2>/dev/null || true)
+    inb=$(jq -r '.response.inbounds[0].uuid // .response.configProfile.inbounds[0].uuid // empty' <<<"$r" 2>/dev/null || true)
   fi
   [[ -n "$inb" ]] || return 1
   jq -nc --arg p "$uuid" --arg i "$inb" '{profileUuid:$p,inboundUuid:$i}'
@@ -544,12 +612,12 @@ rm_api_assign_node(){
 
 rm_api_existing_host(){
   local token="$1" profile_uuid="$2" inbound_uuid="$3" address="$4" r
-  r=$(rm_api GET /api/hosts "$token" 2>/dev/null || true)
+  r=$(rm_hosts_json "$token")
   jq -r --arg p "$profile_uuid" --arg i "$inbound_uuid" --arg a "$address" '
-    (if (.response|type)=="array" then .response else (.response.hosts // []) end)[]?
+    .[]?
     | select(.address==$a)
-    | select((.inbound.configProfileUuid // "")==$p)
-    | select((.inbound.configProfileInboundUuid // "")==$i)
+    | select((.inbound.configProfileUuid // .configProfileUuid // "")==$p)
+    | select((.inbound.configProfileInboundUuid // .configProfileInboundUuid // "")==$i)
     | .uuid' <<<"$r" 2>/dev/null | sed -n '1p'
 }
 
@@ -557,18 +625,27 @@ rm_api_create_host(){
   local token="$1" profile_uuid="$2" inbound_uuid="$3" method="$4" address="$5" remark="$6" extra="$7"
   local path alpn fp body resp
   path=$(rm_method_meta "$method" path); alpn=$(rm_method_meta "$method" alpn); fp=$(rm_method_meta "$method" fp)
-  body=$(jq -nc --arg p "$profile_uuid" --arg i "$inbound_uuid" --arg remark "$remark" --arg addr "$address" --arg path "$path" --arg alpn "$alpn" --arg fp "$fp" --argjson extra "$extra" '{inbound:{configProfileUuid:$p,configProfileInboundUuid:$i},remark:$remark,address:$addr,port:443,path:$path,sni:$addr,host:$addr,alpn:$alpn,fingerprint:$fp,allowInsecure:false,isDisabled:false,securityLayer:"TLS",overrideSniFromAddress:false,xHttpExtraParams:$extra}')
-  printf '%s\n' "$body" | jq . > "$RM_MANAGER_DIR/last-host-request.json"
+
+  # Newer Remnawave uses xhttpExtraParams (lowercase h). Older builds used
+  # xHttpExtraParams. Try the current spelling first, then the legacy one.
+  body=$(jq -nc --arg p "$profile_uuid" --arg i "$inbound_uuid" --arg remark "$remark" --arg addr "$address" --arg path "$path" --arg alpn "$alpn" --arg fp "$fp" --argjson extra "$extra" '{inbound:{configProfileUuid:$p,configProfileInboundUuid:$i},remark:$remark,address:$addr,port:443,path:$path,sni:$addr,host:$addr,alpn:$alpn,fingerprint:$fp,allowInsecure:false,isDisabled:false,securityLayer:"TLS",overrideSniFromAddress:false,xhttpExtraParams:$extra}')
+  printf '%s
+' "$body" | jq . > "$RM_MANAGER_DIR/last-host-request.json"
   resp=$(rm_api POST /api/hosts "$token" "$body" 2>/dev/null || true)
   if jq -e '.response.uuid' >/dev/null 2>&1 <<<"$resp"; then jq -r '.response.uuid' <<<"$resp"; return 0; fi
-  printf '%s\n' "$resp" > "$RM_MANAGER_DIR/last-api-error-create-host.json"
+
+  body=$(jq -nc --arg p "$profile_uuid" --arg i "$inbound_uuid" --arg remark "$remark" --arg addr "$address" --arg path "$path" --arg alpn "$alpn" --arg fp "$fp" --argjson extra "$extra" '{inbound:{configProfileUuid:$p,configProfileInboundUuid:$i},remark:$remark,address:$addr,port:443,path:$path,sni:$addr,host:$addr,alpn:$alpn,fingerprint:$fp,allowInsecure:false,isDisabled:false,securityLayer:"TLS",overrideSniFromAddress:false,xHttpExtraParams:$extra}')
+  resp=$(rm_api POST /api/hosts "$token" "$body" 2>/dev/null || true)
+  if jq -e '.response.uuid' >/dev/null 2>&1 <<<"$resp"; then jq -r '.response.uuid' <<<"$resp"; return 0; fi
+
+  printf '%s
+' "$resp" > "$RM_MANAGER_DIR/last-api-error-create-host.json"
   return 1
 }
 
 rm_api_add_to_squad(){
   local token="$1" inbound_uuid="$2" squads count choice sq uuid existing arr body resp
-  squads=$(rm_api GET /api/internal-squads "$token" 2>/dev/null || true)
-  squads=$(jq -c '.response.internalSquads // []' <<<"$squads" 2>/dev/null || echo '[]')
+  squads=$(rm_internal_squads_json "$token")
   count=$(jq 'length' <<<"$squads")
   if (( count == 0 )); then
     warn "В панели пока нет Internal Squad."
