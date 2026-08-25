@@ -1,8 +1,14 @@
-# panel-script-v1 — v1.1.8
+# panel-script-v1 — v1.1.9
 
-## 1.1.8 API/node fallback
+## 1.1.9 — интерактивный мастер до рабочего результата
 
-API token validation now accepts any successful 2xx JSON response instead of requiring one exact configProfiles wrapper. List parsers support array/items/data wrappers for profiles, nodes, hosts and internal squads. Host creation tries current `xhttpExtraParams` first and legacy `xHttpExtraParams` as fallback.
+Теперь скрипт разделяет вывод цветом: **[ПОДГОТОВКА]** — действия пользователя до автоматизации, **[АВТО]** — что реально создалось через API/на VPS, **[ВРУЧНУЮ]** — что нужно открыть и изменить самому, **[ПРОВЕРКА]** — контрольные команды/ожидаемые ответы. В конце сохраняется короткий `MANUAL-ACTIONS.txt`.
+
+Cloudflare снова доступен как явный выбор `да/нет`. Для каждого CDN мастер показывает именно его порядок действий в кабинете провайдера до начала изменений и повторяет незавершённые provider-side пункты в конце.
+
+Для существующей Remnawave после успешного `Profile -> Node -> Active inbound -> Internal Squad -> Host` мастер дополнительно предлагает создать отдельный **Xray JSON** шаблон, назначить его созданному Host и создать **External Squad**. `Default` Xray JSON перемещается вниз; удалить его можно только отдельным подтверждением, по умолчанию удаление выключено. Массовое назначение External Squad всем пользователям тоже выключено по умолчанию.
+
+> Важно: основная цепочка Profile/Node/Internal Squad/Host уже проверена на живой Remnawave 3.3.0. Новый слой Xray JSON/External Squad добавлен по текущему API-контракту и требует живого прогона; если конкретный API-шаг не принимается, рабочие сущности не удаляются, а мастер выдаёт точный ручной пункт.
 
 Универсальный установщик для Remnawave и 3x-ui с CDN/XHTTP-пресетами.
 
@@ -11,7 +17,7 @@ API token validation now accepts any successful 2xx JSON response instead of req
 
 `--manage-remna` больше не требует, чтобы панель обязательно отвечала именно на `127.0.0.1:3000`. Менеджер пробует localhost, опубликованный Docker-порт, IP контейнера и сохранённый домен панели. Если API всё равно недоступен, мастер не завершается ошибкой: он просит URL панели или переходит в ручной режим и создаёт точные `profile.json`, `xhttpExtraParams.json`, `host.txt`, `provider-steps.txt` и `NEXT-STEPS.txt`.
 
-Для каждого CDN обязательная цепочка в панели: **Config Profile с Xray inbound → профиль назначен Node → Active inbounds → Internal Squad → пользователь в этом Internal Squad → Host**. External Squads для базового XHTTP не обязательны и скрипт их не меняет.
+Для каждого CDN обязательная серверная цепочка в панели: **Config Profile с Xray inbound → профиль назначен Node → Active inbounds → Internal Squad → пользователь в этом Internal Squad → Host**. В v1.1.9 поверх неё мастер дополнительно умеет оформить Xray JSON шаблон подписки и External Squad; это отдельный клиентский слой и он не заменяет основную цепочку.
 
 ## Главное изменение 1.1.0
 
@@ -114,7 +120,7 @@ Node Port настраивается в карточке ноды Remnawave и �
 
 Начиная с v1.1.5 менеджер не предполагает один фиксированный JSON-wrapper для `GET /api/nodes`. Он ищет массив объектов нод рекурсивно и сохраняет сырой ответ API в `/root/panel-script-v1-output/remna-methods/last-nodes-response.json`. Это устраняет ложное сообщение «в панели нет нод», когда Node видна и Connected в интерфейсе.
 
-External Squads не входят в обязательную цепочку обычного CDN/XHTTP. Для базовой схемы нужны Config Profile/Xray inbound → Node/Active Inbounds → Internal Squad → User → Host. External Squad используется только при отдельной reseller/multi-tenant логике подписок и автоматически не создаётся.
+Для самого XHTTP-туннеля обязательной остаётся цепочка Config Profile/Xray inbound → Node/Active Inbounds → Internal Squad → User → Host. Начиная с v1.1.9 мастер также может создать отдельный Xray JSON шаблон подписки и External Squad, чтобы конфигурация клиента была оформлена явно и не зависела только от Default. Пользователей в External Squad скрипт массово не переносит без отдельного подтверждения.
 
 ### Если Node видна в панели, а API token не возвращает `/api/nodes`
 

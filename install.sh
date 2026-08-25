@@ -11,7 +11,7 @@ IFS=$'\n\t'
 # This installer deliberately keeps each CDN preset separate. Do not mix fields
 # between providers: path/padding/uplink settings are provider-specific.
 
-INSTALLER_VERSION="1.1.8"
+INSTALLER_VERSION="1.1.9"
 STATE_SCHEMA_CURRENT="1"
 PRESET="${INSTALLER_PRESET:-}"
 
@@ -47,11 +47,17 @@ chmod 700 "$STATE_DIR" "$OUT_DIR"
 touch "$LOG_FILE"; chmod 600 "$LOG_FILE"
 exec > >(tee -a "$LOG_FILE") 2>&1
 
-C_RESET='\033[0m'; C_GREEN='\033[0;32m'; C_YELLOW='\033[1;33m'; C_RED='\033[0;31m'; C_CYAN='\033[0;36m'
+C_RESET='\033[0m'; C_BOLD='\033[1m'; C_GREEN='\033[0;32m'; C_YELLOW='\033[1;33m'; C_RED='\033[0;31m'; C_CYAN='\033[0;36m'; C_MAGENTA='\033[0;35m'
 info(){ echo -e "${C_CYAN}[*]${C_RESET} $*"; }
 ok(){ echo -e "${C_GREEN}[+]${C_RESET} $*"; }
 warn(){ echo -e "${C_YELLOW}[!]${C_RESET} $*"; }
 die(){ echo -e "${C_RED}[ERR]${C_RESET} $*" >&2; exit 1; }
+ui_title(){ echo; echo -e "${C_BOLD}${C_CYAN}===== $* =====${C_RESET}"; }
+auto_done(){ echo -e "${C_GREEN}[АВТО]${C_RESET} $*"; }
+manual_do(){ echo -e "${C_YELLOW}[ВРУЧНУЮ]${C_RESET} $*"; }
+user_prepare(){ echo -e "${C_MAGENTA}[ПОДГОТОВКА]${C_RESET} $*"; }
+check_do(){ echo -e "${C_CYAN}[ПРОВЕРКА]${C_RESET} $*"; }
+danger(){ echo -e "${C_RED}[ОСТОРОЖНО]${C_RESET} $*"; }
 mark(){ touch "$MARK_DIR/$1"; }
 marked(){ [[ -f "$MARK_DIR/$1" ]]; }
 
@@ -124,7 +130,7 @@ save_state(){
   umask 077
   {
     printf 'STATE_SCHEMA=%q\n' "$STATE_SCHEMA_CURRENT"
-    for k in PANEL_KIND REMNA_ROLE METHOD REMNA_VERSION REMNA_NODE_PORT XUI_VERSION UPGRADE_XUI_XRAY XUI_EXISTING PANEL_DOMAIN ORIGIN_DOMAIN CDN_DOMAIN ENABLE_UFW ENABLE_BBR CASCADE LE_EMAIL PANEL_IP REMNA_SECRET_KEY XUI_USER XUI_PASS XUI_PANEL_PORT XUI_PATH REMNA_ADMIN_USER REMNA_ADMIN_PASS; do
+    for k in PANEL_KIND REMNA_ROLE METHOD REMNA_VERSION REMNA_NODE_PORT XUI_VERSION UPGRADE_XUI_XRAY XUI_EXISTING PANEL_DOMAIN ORIGIN_DOMAIN CDN_DOMAIN USE_CLOUDFLARE ENABLE_UFW ENABLE_BBR CASCADE LE_EMAIL PANEL_IP REMNA_SECRET_KEY XUI_USER XUI_PASS XUI_PANEL_PORT XUI_PATH REMNA_ADMIN_USER REMNA_ADMIN_PASS; do
       printf '%s=%q\n' "$k" "${!k:-}"
     done
   } > "$t"
@@ -738,11 +744,94 @@ rm_api_add_to_squad(){
   return 1
 }
 
+
+provider_dns_hint(){
+  local record="$1"
+  if [[ "${USE_CLOUDFLARE:-yes}" == yes ]]; then
+    user_prepare "DNS: ${record} в Cloudflare с Proxy status = DNS only."
+  else
+    user_prepare "DNS: ${record} у текущего DNS-провайдера; проксирование/ускорение DNS-провайдера выключить."
+  fi
+}
+
+show_provider_preflight(){
+  local method="$1" node_ip="${2:-IP_НОДЫ}"
+  [[ "$method" == none || -z "$method" ]] && return 0
+  ui_title "ЧТО НУЖНО ПОДГОТОВИТЬ ПОЛЬЗОВАТЕЛЮ — $(method_title "$method")"
+  echo -e "${C_MAGENTA}Скрипт автоматизирует сервер и Remnawave. Кабинет CDN/регистратора без API-токена провайдера он не может нажимать за тебя.${C_RESET}"
+  echo
+  if [[ -n "${ORIGIN_DOMAIN:-}" ]]; then
+    provider_dns_hint "A ${ORIGIN_DOMAIN} -> ${node_ip}"
+  fi
+  case "$method" in
+    vk)
+      user_prepare "VK Cloud -> CDN -> создать ресурс: origin ${ORIGIN_DOMAIN}:80 по HTTP."
+      user_prepare "Персональный домен: ${CDN_DOMAIN}; Host пересылать; Let's Encrypt; cache OFF; gzip OFF; методы GET/HEAD/OPTIONS."
+      user_prepare "После создания VK выдаст CNAME. Создай CNAME для ${CDN_DOMAIN} -> выданный VK адрес (DNS only)."
+      ;;
+    yandex)
+      user_prepare "Yandex Certificate Manager: выпустить Let's Encrypt для ${CDN_DOMAIN} через DNS validation."
+      user_prepare "CNAME _acme-challenge, который даст Yandex, добавить в DNS и НЕ удалять после выпуска."
+      user_prepare "CDN resource: origin=${ORIGIN_DOMAIN}, HTTPS, ручной SNI=${ORIGIN_DOMAIN}, Host=${ORIGIN_DOMAIN}, домен раздачи=${CDN_DOMAIN}."
+      user_prepare "Cache CDN/browser OFF; query НЕ игнорировать; compression OFF; verify origin certificate OFF."
+      ;;
+    beeline)
+      user_prepare "CDNvideo/Beeline: создать ресурс 'Статика' с origin ${ORIGIN_DOMAIN}:443, HTTPS ON, verify certificate OFF, SNI=${ORIGIN_DOMAIN}."
+      user_prepare "Host пересылать; cache OFF; query учитывать; HTTP/2 ON; rewrite /static/getFile/video/segment.ts/ -> /static/getFile/video/segment.ts."
+      user_prepare "Скопируй технический домен вида xxx.a.trbcdn.net — скрипт попросит его перед созданием Host."
+      ;;
+    timeweb)
+      user_prepare "Timeweb Cloud -> CDN: источник строго ${node_ip}:80, вкладка IP-адрес; HTTPS к источнику OFF."
+      user_prepare "Cache OFF; 'Игнорировать параметры запроса' OFF; добавить домен ${CDN_DOMAIN}."
+      user_prepare "После выдачи xxx.cdn.twcstorage.ru создай CNAME ${CDN_DOMAIN} -> техдомен (DNS only). После статуса 'Активен' выпусти LE."
+      ;;
+    selectel)
+      user_prepare "Selectel -> CDN: создать ресурс, тип оптимизации 'Статика'; origin=${ORIGIN_DOMAIN:-$node_ip}."
+      user_prepare "Cache OFF; gzip OFF; query НЕ игнорировать; verify origin certificate OFF; разрешить POST."
+      user_prepare "Таймауты origin: connect=30, send=9999, receive=9999."
+      user_prepare "После ACTIVE скопируй технический домен xxxx.selcdn.net — скрипт попросит его перед созданием Host."
+      ;;
+    turboflare)
+      user_prepare "TurboFlare -> Сайты -> ${CDN_DOMAIN}: Address/Origin = ${node_ip}:443, HTTPS к источнику ON, stale cache OFF."
+      user_prepare "До переключения старого рабочего ресурса сначала проверь direct origin на новой ноде: ожидается HTTP 400."
+      user_prepare "Финальные NS домена ${CDN_DOMAIN}: ns1-c.trbcdn.net / ns2-c.trbcdn.net / ns3-c.trbcdn.net."
+      user_prepare "После делегирования ${CDN_DOMAIN} должен резолвиться в edge TurboFlare, НЕ в ${node_ip}."
+      ;;
+  esac
+  echo
+  echo -e "${C_CYAN}Дальше скрипт сам создаст/свяжет то, что доступно через API Remnawave. Незавершённые ручные пункты будут повторены в конце.${C_RESET}"
+}
+
+print_manual_file_colored(){
+  local f="$1" line
+  [[ -s "$f" ]] || return 0
+  ui_title "ОСТАЛОСЬ СДЕЛАТЬ ВРУЧНУЮ"
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    if [[ -z "$line" ]]; then
+      echo
+    elif [[ "$line" == *"===="* || "$line" == *"— что осталось"* || "$line" == *"— настройки"* ]]; then
+      echo -e "${C_BOLD}${C_CYAN}${line}${C_RESET}"
+    elif [[ "$line" == "Важно:"* || "$line" == "ВАЖНО:"* ]]; then
+      echo -e "${C_RED}${line}${C_RESET}"
+    elif [[ "$line" == "После"* || "$line" == "Ожидаемый"* ]]; then
+      check_do "$line"
+    else
+      manual_do "$line"
+    fi
+  done < "$f"
+}
+
 rm_manager_provider_steps(){
   local method="$1" node_ip="$2" f="$3"
   {
     echo "$(method_title "$method") — что осталось сделать у CDN-провайдера"
     echo "=============================================================="
+    if [[ "${USE_CLOUDFLARE:-yes}" == yes ]]; then
+      echo "DNS: используется Cloudflare. A/CNAME из этой инструкции создавай как DNS only."
+    else
+      echo "DNS: Cloudflare отключён. Те же A/CNAME создай у текущего DNS-провайдера без его proxy/CDN-ускорения."
+    fi
+    echo
     case "$method" in
       turboflare)
         echo "TurboFlare → Сайты → ${CDN_DOMAIN} → Редактирование:"
@@ -782,8 +871,277 @@ rm_manager_provider_steps(){
   chmod 600 "$f"
 }
 
+
+rm_subscription_templates_json(){
+  local token="$1" r
+  r=$(rm_api GET /api/subscription-templates "$token" 2>/dev/null || true)
+  jq -c '
+    (.response.templates // .response.items // .templates // .response // [])
+    | if type=="array" then . else [] end
+  ' <<<"$r" 2>/dev/null || echo '[]'
+}
+
+rm_external_squads_json(){
+  local token="$1" r
+  r=$(rm_api GET /api/external-squads "$token" 2>/dev/null || true)
+  jq -c '
+    (.response.externalSquads // .response.external_squads // .response.items // .externalSquads // .response // [])
+    | if type=="array" then . else [] end
+  ' <<<"$r" 2>/dev/null || echo '[]'
+}
+
+rm_default_xray_subscription_json(){
+  jq -nc '{
+    remnawave:{addVirtualHostAsOutbound:true},
+    dns:{servers:["1.1.1.1","1.0.0.1"]},
+    routing:{rules:[
+      {protocol:["bittorrent"],outboundTag:"direct"},
+      {ip:["geoip:private"],outboundTag:"direct"},
+      {domain:["geosite:private"],outboundTag:"direct"}
+    ],domainStrategy:"IPIfNonMatch"},
+    inbounds:[
+      {tag:"socks",port:10808,listen:"127.0.0.1",protocol:"socks",settings:{udp:true},sniffing:{enabled:true,destOverride:["http","tls","quic"]}},
+      {tag:"http",port:10809,listen:"127.0.0.1",protocol:"http",sniffing:{enabled:true,destOverride:["http","tls","quic"]}}
+    ],
+    outbounds:[
+      {tag:"direct",protocol:"freedom"},
+      {tag:"block",protocol:"blackhole"}
+    ]
+  }'
+}
+
+rm_api_get_template_json(){
+  local token="$1" uuid="$2" r
+  r=$(rm_api GET "/api/subscription-templates/${uuid}" "$token" 2>/dev/null || true)
+  jq -c '.response.templateJson // .response.template.templateJson // .templateJson // empty' <<<"$r" 2>/dev/null || true
+}
+
+rm_api_create_or_reuse_xray_template(){
+  local token="$1" name="$2" templates existing_uuid default_uuid source_json body resp uuid
+  templates=$(rm_subscription_templates_json "$token")
+  existing_uuid=$(jq -r --arg n "$name" '[.[]? | select((.name // "")==$n and ((.templateType // .template_type // "")=="XRAY_JSON")) | .uuid][0] // empty' <<<"$templates")
+
+  # Take current Default as a base when possible, but make the dedicated template
+  # actually use the Host that receives it: Remnawave >=2.6.3 understands
+  # remnawave.addVirtualHostAsOutbound and injects that Host as outbound "proxy".
+  default_uuid=$(jq -r '[.[]? | select(((.templateType // .template_type // "")=="XRAY_JSON") and ((.name // "")|test("^Default";"i"))) | .uuid][0] // empty' <<<"$templates")
+  source_json=""
+  [[ -n "$default_uuid" ]] && source_json=$(rm_api_get_template_json "$token" "$default_uuid")
+  [[ -n "$source_json" && "$source_json" != null ]] || source_json=$(rm_default_xray_subscription_json)
+  source_json=$(jq -c '.remnawave = ((.remnawave // {}) + {addVirtualHostAsOutbound:true})' <<<"$source_json" 2>/dev/null || rm_default_xray_subscription_json)
+
+  if [[ -n "$existing_uuid" ]]; then
+    uuid="$existing_uuid"
+  else
+    body=$(jq -nc --arg n "$name" '{name:$n,templateType:"XRAY_JSON"}')
+    resp=$(rm_api POST /api/subscription-templates "$token" "$body" 2>/dev/null || true)
+    uuid=$(jq -r '.response.uuid // .response.template.uuid // .uuid // empty' <<<"$resp" 2>/dev/null || true)
+    if [[ -z "$uuid" ]]; then
+      printf '%s\n' "$resp" > "$RM_MANAGER_DIR/last-api-error-create-xray-template.json"
+      return 1
+    fi
+  fi
+
+  body=$(jq -nc --arg u "$uuid" --arg n "$name" --argjson j "$source_json" '{uuid:$u,name:$n,templateJson:$j}')
+  resp=$(rm_api PATCH /api/subscription-templates "$token" "$body" 2>/dev/null || true)
+  if ! jq -e '.response.uuid // .response.template.uuid // .uuid' >/dev/null 2>&1 <<<"$resp"; then
+    printf '%s\n' "$resp" > "$RM_MANAGER_DIR/last-api-error-update-xray-template.json"
+    return 2
+  fi
+  printf '%s' "$uuid"
+}
+
+rm_api_bind_xray_template_to_host(){
+  local token="$1" host_uuid="$2" template_uuid="$3" body resp
+  body=$(jq -nc --arg u "$host_uuid" --arg t "$template_uuid" '{uuid:$u,xrayJsonTemplateUuid:$t}')
+  resp=$(rm_api PATCH /api/hosts "$token" "$body" 2>/dev/null || true)
+  if jq -e '.response.uuid // .uuid' >/dev/null 2>&1 <<<"$resp"; then
+    return 0
+  fi
+  printf '%s\n' "$resp" > "$RM_MANAGER_DIR/last-api-error-bind-host-xray-template.json"
+  return 1
+}
+
+rm_api_host_xray_template_uuid(){
+  local token="$1" host_uuid="$2" r
+  r=$(rm_api GET "/api/hosts/${host_uuid}" "$token" 2>/dev/null || true)
+  jq -r '.response.xrayJsonTemplateUuid // .xrayJsonTemplateUuid // empty' <<<"$r" 2>/dev/null || true
+}
+
+rm_api_reorder_xray_templates(){
+  local token="$1" preferred_uuid="$2" templates body resp
+  templates=$(rm_subscription_templates_json "$token")
+  [[ $(jq 'length' <<<"$templates") -gt 1 ]] || return 0
+  body=$(jq -nc --arg p "$preferred_uuid" --argjson t "$templates" '
+    def isdefault: (((.templateType // .template_type // "")=="XRAY_JSON") and ((.name // "")|test("^Default";"i")));
+    ($t
+      | sort_by(if .uuid==$p then 0 elif isdefault then 2 else 1 end)
+      | to_entries
+      | map({uuid:.value.uuid,viewPosition:(.key+1)})
+    ) as $items
+    | {items:$items}')
+  resp=$(rm_api POST /api/subscription-templates/actions/reorder "$token" "$body" 2>/dev/null || true)
+  jq -e '.response // .templates // .isSuccess // .success // .items' >/dev/null 2>&1 <<<"$resp"
+}
+
+rm_api_delete_default_xray_templates(){
+  local token="$1" keep_uuid="$2" templates uuids u resp okall=yes
+  templates=$(rm_subscription_templates_json "$token")
+  uuids=$(jq -r --arg keep "$keep_uuid" '.[]? | select(.uuid!=$keep) | select(((.templateType // .template_type // "")=="XRAY_JSON") and ((.name // "")|test("^Default";"i"))) | .uuid' <<<"$templates")
+  [[ -n "$uuids" ]] || return 0
+  while IFS= read -r u; do
+    [[ -n "$u" ]] || continue
+    resp=$(rm_api DELETE "/api/subscription-templates/${u}" "$token" 2>/dev/null || true)
+    jq -e '.response.isDeleted // .isDeleted // .response // false' >/dev/null 2>&1 <<<"$resp" || okall=no
+  done <<<"$uuids"
+  [[ "$okall" == yes ]]
+}
+
+rm_api_create_or_update_external_squad(){
+  local token="$1" name="$2" template_uuid="$3" squads squad uuid detail old merged body resp
+  squads=$(rm_external_squads_json "$token")
+  squad=$(jq -c --arg n "$name" '[.[]? | select((.name // "")==$n)][0] // empty' <<<"$squads")
+  uuid=$(jq -r '.uuid // empty' <<<"$squad" 2>/dev/null || true)
+  if [[ -z "$uuid" ]]; then
+    body=$(jq -nc --arg n "$name" '{name:$n}')
+    resp=$(rm_api POST /api/external-squads "$token" "$body" 2>/dev/null || true)
+    uuid=$(jq -r '.response.uuid // .uuid // empty' <<<"$resp" 2>/dev/null || true)
+    [[ -n "$uuid" ]] || { printf '%s\n' "$resp" > "$RM_MANAGER_DIR/last-api-error-create-external-squad.json"; return 1; }
+    squad=$(jq -c '.response // .' <<<"$resp")
+  fi
+
+  detail=$(rm_api GET "/api/external-squads/${uuid}" "$token" 2>/dev/null || true)
+  old=$(jq -c '.response.templates // .templates // []' <<<"$detail" 2>/dev/null || echo '[]')
+  [[ "$old" == "null" || -z "$old" ]] && old='[]'
+  merged=$(jq -nc --argjson old "$old" --arg t "$template_uuid" '
+    ($old | map(select((.templateType // .template_type // "")!="XRAY_JSON")))
+    + [{templateUuid:$t,templateType:"XRAY_JSON"}]')
+  body=$(jq -nc --arg u "$uuid" --arg n "$name" --argjson templates "$merged" '{uuid:$u,name:$n,templates:$templates}')
+  resp=$(rm_api PATCH /api/external-squads "$token" "$body" 2>/dev/null || true)
+  if ! jq -e '.response.uuid // .uuid' >/dev/null 2>&1 <<<"$resp"; then
+    printf '%s\n' "$resp" > "$RM_MANAGER_DIR/last-api-error-update-external-squad.json"
+    return 2
+  fi
+  printf '%s' "$uuid"
+}
+
+rm_api_add_external_squad_all_users(){
+  local token="$1" uuid="$2" resp
+  resp=$(rm_api POST "/api/external-squads/${uuid}/bulk-actions/add-users" "$token" '{}' 2>/dev/null || true)
+  jq -e '.response.eventSent // .eventSent // .response // false' >/dev/null 2>&1 <<<"$resp"
+}
+
+rm_manage_xray_subscription_layer(){
+  local token="$1" method="$2" node_name="$3" run_dir="$4" host_uuid="$5"
+  local template_name squad_name template_uuid="" squad_uuid="" trc=0 current_host_template="" bind_ok=yes
+  RM_XRAY_TEMPLATE_OK=no
+  RM_XRAY_TEMPLATE_UUID=""
+  RM_EXTERNAL_SQUAD_OK=no
+  RM_EXTERNAL_SQUAD_UUID=""
+  RM_DEFAULT_MOVED=no
+  RM_DEFAULT_DELETED=no
+  RM_EXTERNAL_USERS_ALL=no
+  RM_HOST_XRAY_TEMPLATE_OK=no
+
+  echo
+  ui_title "Xray JSON ПОДПИСКИ"
+  echo "Это клиентский шаблон из раздела Подписка -> Xray JSON, НЕ серверный Config Profile."
+  ask_yes_no RM_CREATE_XRAY_TEMPLATE "Создать отдельный Xray JSON шаблон для $(method_title "$method") и убрать Default вниз списка?" "yes"
+  [[ "$RM_CREATE_XRAY_TEMPLATE" == yes ]] || { manual_do "Xray JSON оставлен как есть; будет использоваться текущая логика Default/правил панели."; return 0; }
+
+  template_name="PSV1 $(method_title "$method")"
+  template_name=$(printf '%s' "$template_name" | sed 's/[^A-Za-z0-9 _-]/-/g')
+  rm_default_xray_subscription_json | jq . > "$run_dir/xray-subscription-template.json"
+  if template_uuid=$(rm_api_create_or_reuse_xray_template "$token" "$template_name"); then
+    trc=0
+    RM_XRAY_TEMPLATE_OK=yes
+    RM_XRAY_TEMPLATE_UUID="$template_uuid"
+    auto_done "Xray JSON шаблон '$template_name' создан/найден и готов."
+    # Save the exact effective template for the manual fallback/audit trail.
+    rm_api_get_template_json "$token" "$template_uuid" | jq . > "$run_dir/xray-subscription-template.json" 2>/dev/null || rm_default_xray_subscription_json | jq . > "$run_dir/xray-subscription-template.json"
+    current_host_template=$(rm_api_host_xray_template_uuid "$token" "$host_uuid")
+    bind_ok=yes
+    if [[ -n "$current_host_template" && "$current_host_template" != "$template_uuid" ]]; then
+      danger "У Host уже назначен другой Xray JSON template UUID=$current_host_template."
+      ask_yes_no RM_REPLACE_HOST_XRAY_TEMPLATE "Заменить Xray JSON template именно у этого Host на '$template_name'?" "no"
+      [[ "$RM_REPLACE_HOST_XRAY_TEMPLATE" == yes ]] || bind_ok=no
+    fi
+    if [[ "$bind_ok" == yes ]] && rm_api_bind_xray_template_to_host "$token" "$host_uuid" "$template_uuid"; then
+      RM_HOST_XRAY_TEMPLATE_OK=yes
+      auto_done "Xray JSON шаблон назначен Host UUID=$host_uuid."
+    elif [[ "$bind_ok" == no ]]; then
+      warn "Xray JSON template у Host не менялся по твоему выбору. В конце будет ручной пункт."
+    else
+      warn "Шаблон создан, но API не назначил его Host. В конце будет точный ручной пункт: Hosts -> нужный Host -> Xray JSON Template."
+    fi
+  else
+    trc=$?
+    if [[ $trc -eq 2 ]]; then
+      warn "Шаблон создан, но API не заполнил JSON-контент. В конце будет ручной пункт."
+    else
+      warn "Xray JSON шаблон через API не создан. Основной CDN Host от этого не удаляется."
+    fi
+    return 0
+  fi
+
+  if rm_api_reorder_xray_templates "$token" "$template_uuid"; then
+    RM_DEFAULT_MOVED=yes
+    auto_done "Новый Xray JSON поднят вверх, Default перемещён в конец списка."
+  else
+    warn "API reorder шаблонов не сработал. Это косметика: в конце будет ручной пункт перетащить Default вниз."
+  fi
+
+  ask_yes_no RM_CREATE_EXTERNAL_SQUAD "Создать отдельный External Squad и привязать к нему этот Xray JSON шаблон?" "yes"
+  if [[ "$RM_CREATE_EXTERNAL_SQUAD" == yes ]]; then
+    squad_name="PSV1 $(method_title "$method")"
+    squad_name=$(printf '%s' "$squad_name" | sed 's/[^A-Za-z0-9 _-]/-/g')
+    squad_name="${squad_name:0:30}"
+    if squad_uuid=$(rm_api_create_or_update_external_squad "$token" "$squad_name" "$template_uuid"); then
+      RM_EXTERNAL_SQUAD_OK=yes
+      RM_EXTERNAL_SQUAD_UUID="$squad_uuid"
+      auto_done "External Squad '$squad_name' создан/найден и привязан к Xray JSON шаблону."
+      ask_yes_no RM_EXTERNAL_ALL_USERS "Назначить этот External Squad ВСЕМ существующим пользователям? Это может заменить их текущую внешнюю группу" "no"
+      if [[ "$RM_EXTERNAL_ALL_USERS" == yes ]]; then
+        if rm_api_add_external_squad_all_users "$token" "$squad_uuid"; then
+          auto_done "External Squad назначен всем пользователям."
+          RM_EXTERNAL_USERS_ALL=yes
+        else
+          warn "Массовое назначение не прошло. Добавь нужных пользователей в External Squad вручную."
+        fi
+      fi
+    else
+      warn "External Squad автоматически не настроен. В конце будет точный ручной пункт."
+    fi
+  fi
+
+  echo
+  danger "Удаление Default Xray JSON может сломать пользователей, которые НЕ состоят в созданном External Squad и не попадают под отдельное Response Rule."
+  ask_yes_no RM_DELETE_DEFAULT_XRAY "Удалить Default Xray JSON сейчас? (обычно лучше оставить как запасной)" "no"
+  if [[ "$RM_DELETE_DEFAULT_XRAY" == yes ]]; then
+    if [[ "$RM_EXTERNAL_SQUAD_OK" == yes ]] && rm_api_delete_default_xray_templates "$token" "$template_uuid"; then
+      RM_DEFAULT_DELETED=yes
+      auto_done "Default Xray JSON удалён по явному подтверждению."
+    else
+      warn "Default НЕ удалён: сначала должен быть рабочий отдельный шаблон + External Squad."
+    fi
+  fi
+
+  {
+    echo "template_name=$template_name"
+    echo "template_uuid=${RM_XRAY_TEMPLATE_UUID}"
+    echo "template_ready=${RM_XRAY_TEMPLATE_OK}"
+    echo "host_template_bound=${RM_HOST_XRAY_TEMPLATE_OK}"
+    echo "default_moved=${RM_DEFAULT_MOVED}"
+    echo "default_deleted=${RM_DEFAULT_DELETED}"
+    echo "external_squad_uuid=${RM_EXTERNAL_SQUAD_UUID}"
+    echo "external_squad_ready=${RM_EXTERNAL_SQUAD_OK}"
+    echo "all_users_assigned=${RM_EXTERNAL_USERS_ALL}"
+  } > "$run_dir/subscription-layer.txt"
+}
+
+
 run_remna_panel_manager(){
-  local token="" token_mode=api nodes node node_uuid node_name node_ip connected method safe suffix tag inbound config extra profile_name ids profile_uuid inbound_uuid active_profile assign_ok=no host_uuid="" squad_ok=no run_dir summary
+  local token="" token_mode=api nodes node node_uuid node_name node_ip connected method safe suffix tag inbound config extra profile_name ids profile_uuid inbound_uuid active_profile assign_ok=no host_uuid="" squad_ok=no run_dir summary technew=""
   echo
   echo "=== Remnawave: добавить CDN-метод в существующую панель ==="
   echo "Этот режим НЕ переустанавливает панель и НЕ удаляет существующие профили/хосты."
@@ -884,6 +1242,11 @@ run_remna_panel_manager(){
 
   method=$(rm_manager_choose_method) || exit 0
   rm_manager_collect_domains "$method"
+  ask_yes_no USE_CLOUDFLARE "Использовать Cloudflare для DNS-записей там, где это применимо?" "${USE_CLOUDFLARE:-yes}"
+  save_state
+  show_provider_preflight "$method" "$node_ip"
+  ask_yes_no RM_CONTINUE_AFTER_PREP "Продолжить автоматическую настройку Remnawave?" "yes"
+  [[ "$RM_CONTINUE_AFTER_PREP" == yes ]] || { manual_do "Остановлено до изменений панели. Подготовь CDN/DNS и запусти --manage-remna снова."; return 0; }
   safe=$(tr '[:upper:]' '[:lower:]' <<<"$node_name" | tr -cd 'a-z0-9_-'); [[ -n "$safe" ]] || safe="node"
   suffix=$(printf '%s' "$node_uuid" | sha256sum | cut -c1-6)
   tag="psv1-${method}-${suffix}"
@@ -937,11 +1300,17 @@ EOF
    Все значения взять из: $run_dir/host.txt
    xhttpExtraParams вставить БЕЗ ИЗМЕНЕНИЙ из: $run_dir/xhttpExtraParams.json
 
-6. External Squads
-   Для базового XHTTP/CDN НЕ являются частью обязательной цепочки и специально не создаются автоматически.
-   Они нужны для отдельной логики внешних/реселлерских групп и выдачи подписок. Существующие External Squads не меняются.
+6. Подписка → Xray JSON
+   Скрипт после создания Host предложит создать отдельный XRAY_JSON шаблон для этого метода.
+   В шаблон добавляется remnawave.addVirtualHostAsOutbound=true, затем шаблон назначается созданному Host.
+   Новый шаблон поднимается вверх списка, а Default уходит вниз.
+   Удаление Default возможно только отдельным подтверждением и по умолчанию ВЫКЛ.
 
-7. CDN-провайдер
+7. External Squads
+   Скрипт предложит отдельный External Squad и привяжет к нему этот Xray JSON шаблон.
+   Пользователей массово туда НЕ переносит без отдельного подтверждения.
+
+8. CDN-провайдер
    Выполнить: $run_dir/provider-steps.txt
 
 Проверка цепочки после активации:
@@ -995,6 +1364,22 @@ EOF
 
   if rm_api_add_to_squad "$token" "$inbound_uuid"; then squad_ok=yes; ok "Inbound добавлен в выбранный Internal Squad без удаления старых inbound'ов."; else warn "Squad автоматически не изменён. Добавь inbound '$tag' в нужный Internal Squad вручную."; fi
 
+  if [[ -z "$CDN_DOMAIN" && ( "$method" == selectel || "$method" == beeline ) ]]; then
+    echo
+    ui_title "НУЖЕН ТЕХНИЧЕСКИЙ ДОМЕН CDN"
+    manual_do "Сейчас создай/активируй ресурс у провайдера по инструкции выше и скопируй выданный технический домен."
+    if [[ "$method" == selectel ]]; then
+      manual_do "Ожидается домен вида xxxx.selcdn.net."
+    else
+      manual_do "Ожидается домен вида xxx.a.trbcdn.net."
+    fi
+    read -r -p "Технический CDN-домен (Enter = оставить Host на потом): " technew
+    if [[ -n "$technew" ]]; then
+      technew="${technew,,}"
+      if valid_domain "$technew"; then CDN_DOMAIN="$technew"; save_state; else warn "Некорректный домен — Host пока не создаю."; fi
+    fi
+  fi
+
   if [[ -n "$CDN_DOMAIN" ]]; then
     host_uuid=$(rm_api_existing_host "$token" "$profile_uuid" "$inbound_uuid" "$CDN_DOMAIN" || true)
     if [[ -n "$host_uuid" ]]; then
@@ -1008,6 +1393,12 @@ EOF
     warn "Технический CDN-домен ещё неизвестен — Host пока не создаю. После выдачи домена снова запусти менеджер; существующий профиль будет использован повторно."
   fi
 
+  if [[ -n "${host_uuid:-}" ]]; then
+    rm_manage_xray_subscription_layer "$token" "$method" "$node_name" "$run_dir" "$host_uuid"
+  else
+    warn "Xray JSON/External Squad отложены до создания Host."
+  fi
+
   summary="$run_dir/result.txt"
   cat > "$summary" <<EOF
 Remnawave panel manager $INSTALLER_VERSION
@@ -1019,18 +1410,64 @@ Node assigned automatically: $assign_ok
 Squad updated automatically: $squad_ok
 Host UUID: ${host_uuid:-not-created-yet}
 CDN domain: ${CDN_DOMAIN:-not-known-yet}
+Xray JSON template: ${RM_XRAY_TEMPLATE_UUID:-not-created-or-skipped}
+Host Xray template bound: ${RM_HOST_XRAY_TEMPLATE_OK:-no}
+External Squad: ${RM_EXTERNAL_SQUAD_UUID:-not-created-or-skipped}
 Provider instructions: $run_dir/provider-steps.txt
 EOF
   printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$(date -Is)" "$node_uuid" "$method" "$profile_uuid" "$inbound_uuid" "${host_uuid:-}" >> "$RM_MANAGER_DIR/registry.tsv"
   chmod 600 "$run_dir"/* "$RM_MANAGER_DIR/registry.tsv" 2>/dev/null || true
   echo
-  ok "Настройка панели завершена настолько, насколько позволяет текущий API. Существующие методы не удалялись."
-  cat "$summary"
+  ui_title "ИТОГ — ЧТО СДЕЛАНО АВТОМАТИЧЕСКИ"
+  auto_done "Node: $node_name ($node_ip)"
+  auto_done "Config Profile: $profile_name"
+  [[ "$assign_ok" == yes ]] && auto_done "Profile назначен ноде; inbound '$tag' активирован." || manual_do "Назначь Profile/inbound ноде вручную."
+  [[ "$squad_ok" == yes ]] && auto_done "Inbound добавлен в Internal Squad." || manual_do "Добавь inbound '$tag' в Internal Squad."
+  [[ -n "${host_uuid:-}" ]] && auto_done "Host: ${CDN_DOMAIN} (UUID ${host_uuid})" || manual_do "Host ещё не создан."
+  [[ "${RM_XRAY_TEMPLATE_OK:-no}" == yes ]] && auto_done "Отдельный Xray JSON шаблон: PSV1 $(method_title "$method")."
+  [[ "${RM_HOST_XRAY_TEMPLATE_OK:-no}" == yes ]] && auto_done "Xray JSON шаблон назначен созданному Host."
+  [[ "${RM_DEFAULT_MOVED:-no}" == yes ]] && auto_done "Default Xray JSON перемещён вниз списка."
+  [[ "${RM_EXTERNAL_SQUAD_OK:-no}" == yes ]] && auto_done "External Squad создан и связан с Xray JSON шаблоном."
+  [[ "${RM_DEFAULT_DELETED:-no}" == yes ]] && auto_done "Default Xray JSON удалён по твоему подтверждению."
+
+  ui_title "ЧТО НУЖНО ПРОВЕРИТЬ/ДОДЕЛАТЬ"
+  manual_do "Users: нужный пользователь должен состоять в Internal Squad, где активирован '$tag'."
+  if [[ -n "${host_uuid:-}" && "${RM_XRAY_TEMPLATE_OK:-no}" != yes ]]; then
+    manual_do "Подписка -> Xray JSON: создай XRAY_JSON шаблон 'PSV1 $(method_title "$method")' и вставь $run_dir/xray-subscription-template.json."
+  elif [[ "${RM_XRAY_TEMPLATE_OK:-no}" == yes && "${RM_HOST_XRAY_TEMPLATE_OK:-no}" != yes ]]; then
+    manual_do "Hosts -> ${CDN_DOMAIN} -> Xray JSON Template: выбери 'PSV1 $(method_title "$method")' и сохрани."
+  fi
+  if [[ "${RM_XRAY_TEMPLATE_OK:-no}" == yes && "${RM_EXTERNAL_SQUAD_OK:-no}" != yes ]]; then
+    manual_do "External Squads: создай 'PSV1 $(method_title "$method")' и назначь ему Xray JSON шаблон 'PSV1 $(method_title "$method")'."
+  fi
+  if [[ "${RM_EXTERNAL_SQUAD_OK:-no}" == yes && "${RM_EXTERNAL_USERS_ALL:-no}" != yes ]]; then
+    manual_do "Users: для отдельного Xray JSON выбери External Squad 'PSV1 $(method_title "$method")' у нужных пользователей."
+  fi
+  [[ "${RM_XRAY_TEMPLATE_OK:-no}" == yes && "${RM_DEFAULT_MOVED:-no}" != yes ]] && manual_do "Подписка -> Xray JSON: перетащи 'PSV1 $(method_title "$method")' выше Default."
+  manual_do "Полный чек-лист сохранён: $run_dir/NEXT-STEPS.txt"
+
+  {
+    echo "РУЧНЫЕ ДЕЙСТВИЯ ПОСЛЕ АВТОМАТИКИ"
+    echo "================================"
+    echo "1. Users: пользователь должен состоять в Internal Squad с inbound '$tag'."
+    stepn=2
+    if [[ "${RM_XRAY_TEMPLATE_OK:-no}" == yes && "${RM_HOST_XRAY_TEMPLATE_OK:-no}" != yes ]]; then
+      echo "${stepn}. Hosts -> ${CDN_DOMAIN} -> Xray JSON Template: выбери 'PSV1 $(method_title "$method")'."; stepn=$((stepn+1))
+    fi
+    if [[ "${RM_EXTERNAL_SQUAD_OK:-no}" == yes && "${RM_EXTERNAL_USERS_ALL:-no}" != yes ]]; then
+      echo "${stepn}. Users: назначь нужным пользователям External Squad 'PSV1 $(method_title "$method")'."; stepn=$((stepn+1))
+    elif [[ "${RM_XRAY_TEMPLATE_OK:-no}" == yes && "${RM_EXTERNAL_SQUAD_OK:-no}" != yes ]]; then
+      echo "${stepn}. External Squads: создай отдельный squad и выбери в нём шаблон 'PSV1 $(method_title "$method")'."; stepn=$((stepn+1))
+    fi
+    echo "${stepn}. Выполни provider-side пункты из: $run_dir/provider-steps.txt"; stepn=$((stepn+1))
+    echo "${stepn}. Проверь origin/CDN URL: ожидаемый HTTP-код XHTTP без клиента — 400."
+  } > "$run_dir/MANUAL-ACTIONS.txt"
+  chmod 600 "$run_dir/MANUAL-ACTIONS.txt" 2>/dev/null || true
+
+  print_manual_file_colored "$run_dir/provider-steps.txt"
   echo
-  echo "Важно: пользователь должен состоять в том Internal Squad, куда добавлен этот inbound. Существующих пользователей скрипт автоматически не переносит."
-  echo "Полный чек-лист панели сохранён: $run_dir/NEXT-STEPS.txt"
-  echo
-  cat "$run_dir/provider-steps.txt"
+  check_do "После provider-side настройки проверь origin и CDN path; нормальный ответ XHTTP без клиента — HTTP 400."
+  manual_do "Короткая итоговая инструкция сохранена: $run_dir/MANUAL-ACTIONS.txt"
 }
 
 show_config(){
@@ -1046,6 +1483,7 @@ show_config(){
     echo "Origin-домен    : ${ORIGIN_DOMAIN:-не используется / IP}"
   fi
   echo "Домен панели    : ${PANEL_DOMAIN:-нет}"
+  [[ "${METHOD:-none}" != none ]] && echo "Cloudflare DNS  : ${USE_CLOUDFLARE:-yes}"
   echo "Каскад          : ${CASCADE:-no}"
   echo "Firewall / BBR  : ${ENABLE_UFW:-yes} / ${ENABLE_BBR:-yes}"
   echo "==========================================================="
@@ -1187,6 +1625,12 @@ collect_config(){
       ;;
   esac
 
+  if [[ "$METHOD" != none ]]; then
+    ask_yes_no USE_CLOUDFLARE "Использовать Cloudflare для DNS-записей там, где это применимо?" "${USE_CLOUDFLARE:-yes}"
+  else
+    USE_CLOUDFLARE="${USE_CLOUDFLARE:-yes}"
+  fi
+
   read -r -p "Email для Let's Encrypt (Enter = без email)${LE_EMAIL:+ [$LE_EMAIL]}: " _mail
   LE_EMAIL="${_mail:-${LE_EMAIL:-}}"
   ask_yes_no ENABLE_UFW "Настроить UFW: входящие SSH/80/443, исходящие разрешены? (рекомендуется)" "yes"
@@ -1317,6 +1761,12 @@ detect_public_ip(){
   info "Публичный IPv4 VPS: $PUBLIC_IP"
 }
 detect_public_ip
+
+if [[ "${METHOD:-none}" != none ]]; then
+  show_provider_preflight "$METHOD" "$PUBLIC_IP"
+  ask_yes_no _PREP_CONTINUE "Продолжить установку после просмотра подготовки?" "yes"
+  [[ "$_PREP_CONTINUE" == yes ]] || { manual_do "Установка остановлена до изменений сервера. Подготовь DNS/CDN и запусти этот же файл снова."; exit 0; }
+fi
 
 if [[ "${METHOD:-none}" == none ]]; then
   XRAY_PORT=0
@@ -2058,6 +2508,12 @@ provider_steps(){
   {
     echo "$(method_title "$METHOD") — настройки CDN-ресурса"
     echo "================================================"
+    if [[ "${USE_CLOUDFLARE:-yes}" == yes ]]; then
+      echo "DNS: Cloudflare = ДА; A/CNAME создавать как DNS only."
+    else
+      echo "DNS: Cloudflare = НЕТ; записи создать у текущего DNS-провайдера без proxy/CDN."
+    fi
+    echo
     case "$METHOD" in
       turboflare)
         echo "ВАЖНО: найденное нами на практике обязательное поле:"
@@ -2104,7 +2560,7 @@ provider_steps(){
     echo "После активации проверка: curl к CDN path должен дать HTTP 400."
   } > "$f"
   chmod 600 "$f"
-  cat "$f"
+  print_manual_file_colored "$f"
 }
 
 # Install panel/node before writing final nginx where possible.
