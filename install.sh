@@ -11,7 +11,7 @@ IFS=$'\n\t'
 # This installer deliberately keeps each CDN preset separate. Do not mix fields
 # between providers: path/padding/uplink settings are provider-specific.
 
-INSTALLER_VERSION="1.1.9"
+INSTALLER_VERSION="1.2.0"
 STATE_SCHEMA_CURRENT="1"
 PRESET="${INSTALLER_PRESET:-}"
 
@@ -130,7 +130,7 @@ save_state(){
   umask 077
   {
     printf 'STATE_SCHEMA=%q\n' "$STATE_SCHEMA_CURRENT"
-    for k in PANEL_KIND REMNA_ROLE METHOD REMNA_VERSION REMNA_NODE_PORT XUI_VERSION UPGRADE_XUI_XRAY XUI_EXISTING PANEL_DOMAIN ORIGIN_DOMAIN CDN_DOMAIN USE_CLOUDFLARE ENABLE_UFW ENABLE_BBR CASCADE LE_EMAIL PANEL_IP REMNA_SECRET_KEY XUI_USER XUI_PASS XUI_PANEL_PORT XUI_PATH REMNA_ADMIN_USER REMNA_ADMIN_PASS; do
+    for k in PANEL_KIND REMNA_ROLE METHOD REMNA_VERSION REMNA_NODE_PORT XUI_VERSION UPGRADE_XUI_XRAY XUI_EXISTING PANEL_DOMAIN ORIGIN_DOMAIN CDN_DOMAIN USE_CLOUDFLARE ENABLE_UFW ENABLE_BBR CASCADE CASCADE_METHOD CASCADE_RELAY_NODE_UUID CASCADE_EXIT_NODE_UUID CASCADE_RELAY_IP CASCADE_EXIT_IP CASCADE_BRIDGE_UUID CASCADE_STATUS LE_EMAIL PANEL_IP REMNA_SECRET_KEY XUI_USER XUI_PASS XUI_PANEL_PORT XUI_PATH REMNA_ADMIN_USER REMNA_ADMIN_PASS; do
       printf '%s=%q\n' "$k" "${!k:-}"
     done
   } > "$t"
@@ -1140,6 +1140,408 @@ rm_manage_xray_subscription_layer(){
 }
 
 
+rm_api_profile_doc(){
+  local token="$1" uuid="$2" r
+  r=$(rm_api GET "/api/config-profiles/${uuid}" "$token" 2>/dev/null || true)
+  jq -c '.response.configProfile // .response // .' <<<"$r" 2>/dev/null || return 1
+}
+
+rm_api_profile_inbounds(){
+  local token="$1" uuid="$2" r
+  r=$(rm_api GET "/api/config-profiles/${uuid}/inbounds" "$token" 2>/dev/null || true)
+  jq -c '(.response.inbounds // .response.items // .response // .inbounds // []) | if type=="array" then . else [] end' <<<"$r" 2>/dev/null || echo '[]'
+}
+
+rm_api_patch_profile_config(){
+  local token="$1" uuid="$2" config="$3" body resp tmp code
+  body=$(jq -nc --arg u "$uuid" --argjson c "$config" '{uuid:$u,config:$c}')
+  tmp=$(mktemp)
+  code=$(rm_api_fetch_to_file PATCH /api/config-profiles "$token" "$tmp" "$body" || true)
+  resp=$(cat "$tmp" 2>/dev/null || true); rm -f "$tmp"
+  if [[ "$code" =~ ^2[0-9][0-9]$ ]] && jq -e '.response.uuid // .uuid' >/dev/null 2>&1 <<<"$resp"; then
+    return 0
+  fi
+  printf 'HTTP=%s\n' "$code" > "$RM_MANAGER_DIR/last-api-error-cascade-profile-http.txt"
+  printf '%s\n' "$resp" > "$RM_MANAGER_DIR/last-api-error-cascade-profile.json"
+  return 1
+}
+
+rm_api_add_active_inbound_preserve(){
+  local token="$1" node_json="$2" profile_uuid="$3" inbound_uuid="$4" node_uuid profile_inbounds arr body resp body_path
+  node_uuid=$(jq -r '.uuid' <<<"$node_json")
+  # PATCH config-profile can return/reforge inbound UUIDs. Preserve old active
+  # inbounds primarily by tag, then by still-existing UUID, and append BRIDGE_IN.
+  profile_inbounds=$(rm_api_profile_inbounds "$token" "$profile_uuid")
+  arr=$(jq -nc --argjson node "$node_json" --argjson current "$profile_inbounds" --arg bridge "$inbound_uuid" '
+    ($node.configProfile.activeInbounds // []) as $old
+    | ([$old[]? | select(type=="object") | .tag // empty]) as $tags
+    | ([$old[]? | if type=="string" then . else (.uuid // empty) end | select(length>0)]) as $ids
+    | ([ $current[]? | select((.tag // "") as $t | ($tags | index($t)) != null) | .uuid ]) as $bytag
+    | ([ $current[]? | select((.uuid // "") as $u | ($ids | index($u)) != null) | .uuid ]) as $byid
+    | ($bytag + $byid + [$bridge] | map(select(length>0)) | unique)
+  ')
+  body=$(jq -nc --arg u "$node_uuid" --arg p "$profile_uuid" --argjson a "$arr" '{uuid:$u,configProfile:{activeConfigProfileUuid:$p,activeInbounds:$a}}')
+  resp=$(rm_api PATCH /api/nodes "$token" "$body" 2>/dev/null || true)
+  if jq -e '.response.uuid // .uuid' >/dev/null 2>&1 <<<"$resp"; then return 0; fi
+  body_path=$(jq -nc --arg p "$profile_uuid" --argjson a "$arr" '{configProfile:{activeConfigProfileUuid:$p,activeInbounds:$a}}')
+  resp=$(rm_api PATCH "/api/nodes/${node_uuid}" "$token" "$body_path" 2>/dev/null || true)
+  if jq -e '.response.uuid // .uuid' >/dev/null 2>&1 <<<"$resp"; then return 0; fi
+  printf '%s\n' "$resp" > "$RM_MANAGER_DIR/last-api-error-cascade-node.json"
+  return 1
+}
+rm_cascade_bridge_inbound_json(){
+  local tag="$1"
+  jq -nc --arg tag "$tag" '{tag:$tag,port:8888,listen:"0.0.0.0",protocol:"vless",settings:{clients:[],decryption:"none"},sniffing:{enabled:true,destOverride:["http","tls","quic"]},streamSettings:{network:"tcp",security:"none"}}'
+}
+
+rm_api_ensure_bridge_in_active_profile(){
+  local token="$1" node_json="$2" bridge_tag="$3" run_dir="$4"
+  local profile_uuid doc config existing bridge inbound_uuid inbounds patched
+  profile_uuid=$(jq -r '.configProfile.activeConfigProfileUuid // empty' <<<"$node_json")
+  if [[ -z "$profile_uuid" || "$profile_uuid" == "00000000-0000-0000-0000-000000000000" ]]; then
+    return 4
+  fi
+  doc=$(rm_api_profile_doc "$token" "$profile_uuid") || return 1
+  printf '%s\n' "$doc" | jq . > "$run_dir/exit-profile-before.json" 2>/dev/null || true
+  config=$(jq -c '.config // empty' <<<"$doc")
+  [[ -n "$config" && "$config" != null ]] || return 1
+  existing=$(jq -c '[.inbounds[]? | select((.port==8888) or ((.tag//"")|startswith("BRIDGE_IN")))][0] // empty' <<<"$config")
+  if [[ -n "$existing" ]]; then
+    bridge_tag=$(jq -r '.tag' <<<"$existing")
+  else
+    bridge=$(rm_cascade_bridge_inbound_json "$bridge_tag")
+    patched=$(jq -nc --argjson c "$config" --argjson b "$bridge" '$c | .inbounds=((.inbounds//[])+[$b])')
+    printf '%s\n' "$patched" | jq . > "$run_dir/exit-profile-after.json"
+    rm_api_patch_profile_config "$token" "$profile_uuid" "$patched" || return 2
+  fi
+  inbounds=$(rm_api_profile_inbounds "$token" "$profile_uuid")
+  inbound_uuid=$(jq -r --arg t "$bridge_tag" '[.[]? | select((.tag==$t) or (.port==8888)) | .uuid][0] // empty' <<<"$inbounds")
+  [[ -n "$inbound_uuid" ]] || return 3
+  jq -nc --arg p "$profile_uuid" --arg i "$inbound_uuid" --arg t "$bridge_tag" '{profileUuid:$p,inboundUuid:$i,tag:$t}'
+}
+
+rm_api_create_bridge_only_profile(){
+  local token="$1" node_uuid="$2" bridge_tag="$3" name="$4" bridge config ids
+  bridge=$(rm_cascade_bridge_inbound_json "$bridge_tag")
+  config=$(jq -nc --argjson b "$bridge" '{log:{loglevel:"warning"},inbounds:[$b],outbounds:[{tag:"DIRECT",protocol:"freedom",settings:{domainStrategy:"UseIPv4"}},{tag:"BLOCK",protocol:"blackhole"}],routing:{domainStrategy:"IPIfNonMatch",rules:[{type:"field",ip:["geoip:private"],outboundTag:"BLOCK"},{type:"field",protocol:["bittorrent"],outboundTag:"BLOCK"}]}}')
+  ids=$(rm_api_create_profile "$token" "$name" "$config") || return 1
+  printf '%s' "$ids"
+}
+
+rm_cascade_relay_config_json(){
+  local method="$1" tag="$2" exit_ip="$3" bridge_uuid="$4" inbound
+  inbound=$(rm_method_inbound_json "$method" "$tag")
+  inbound=$(jq -c --arg t "$tag" '.tag=$t | .port=7443 | .listen="127.0.0.1"' <<<"$inbound")
+  jq -nc --argjson inb "$inbound" --arg ip "$exit_ip" --arg id "$bridge_uuid" '{
+    log:{loglevel:"warning"},
+    inbounds:[$inb],
+    outbounds:[
+      {tag:"VLESS_EXIT",protocol:"vless",settings:{vnext:[{address:$ip,port:8888,users:[{id:$id,encryption:"none"}]}]},streamSettings:{network:"tcp",security:"none",sockopt:{tcpKeepAliveInterval:30,tcpNoDelay:true}},mux:{enabled:true,concurrency:8,xudpConcurrency:16,xudpProxyUDP443:"reject"}},
+      {tag:"DIRECT",protocol:"freedom",settings:{domainStrategy:"UseIPv4"}},
+      {tag:"BLOCK",protocol:"blackhole"}
+    ],
+    routing:{domainStrategy:"IPIfNonMatch",rules:[
+      {type:"field",ip:["geoip:private"],outboundTag:"BLOCK"},
+      {type:"field",domain:["geosite:private"],outboundTag:"BLOCK"},
+      {type:"field",protocol:["bittorrent"],outboundTag:"BLOCK"},
+      {type:"field",ip:["1.1.1.1","1.0.0.1","8.8.8.8","8.8.4.4"],outboundTag:"DIRECT"},
+      {type:"field",ip:["149.154.160.0/20","91.108.4.0/22","91.108.8.0/22","91.108.12.0/22","91.108.16.0/22","91.108.20.0/22","91.108.56.0/22"],outboundTag:"VLESS_EXIT"},
+      {type:"field",domain:["domain:telegram.org","domain:t.me","domain:telegra.ph"],outboundTag:"VLESS_EXIT"},
+      {type:"field",ip:["geoip:ru"],outboundTag:"DIRECT"},
+      {type:"field",domain:["geosite:category-ru"],outboundTag:"DIRECT"},
+      {type:"field",network:"tcp,udp",outboundTag:"VLESS_EXIT"}
+    ]}
+  }'
+}
+
+rm_api_ensure_named_squad(){
+  local token="$1" name="$2" inbound_a="$3" inbound_b="${4:-}" squads sq uuid old arr body resp
+  squads=$(rm_internal_squads_json "$token")
+  sq=$(jq -c --arg n "$name" '[.[]? | select(.name==$n)][0] // empty' <<<"$squads")
+  uuid=$(jq -r '.uuid // empty' <<<"$sq" 2>/dev/null || true)
+  if [[ -z "$uuid" ]]; then
+    arr=$(jq -nc --arg a "$inbound_a" --arg b "$inbound_b" '[ $a, $b ] | map(select(length>0)) | unique')
+    body=$(jq -nc --arg n "$name" --argjson a "$arr" '{name:$n,inbounds:$a}')
+    resp=$(rm_api POST /api/internal-squads "$token" "$body" 2>/dev/null || true)
+    uuid=$(jq -r '.response.uuid // .uuid // empty' <<<"$resp" 2>/dev/null || true)
+    [[ -n "$uuid" ]] || { printf '%s\n' "$resp" > "$RM_MANAGER_DIR/last-api-error-cascade-squad.json"; return 1; }
+    printf '%s' "$uuid"; return 0
+  fi
+  old=$(jq -c '[.inbounds[]? | if type=="string" then . else .uuid end | select(.!=null and .!="")]' <<<"$sq" 2>/dev/null || echo '[]')
+  arr=$(jq -nc --argjson o "$old" --arg a "$inbound_a" --arg b "$inbound_b" '$o + [$a,$b] | map(select(length>0)) | unique')
+  body=$(jq -nc --arg u "$uuid" --arg n "$name" --argjson a "$arr" '{uuid:$u,name:$n,inbounds:$a}')
+  resp=$(rm_api PATCH /api/internal-squads "$token" "$body" 2>/dev/null || true)
+  if jq -e '.response.uuid // .uuid' >/dev/null 2>&1 <<<"$resp"; then printf '%s' "$uuid"; return 0; fi
+  printf '%s\n' "$resp" > "$RM_MANAGER_DIR/last-api-error-cascade-squad.json"
+  return 1
+}
+
+rm_api_ensure_bridge_user(){
+  local token="$1" username="$2" desired_uuid="$3" squad_uuid="$4" r user user_uuid vless old arr body resp expire
+  r=$(rm_api GET "/api/users/by-username/${username}" "$token" 2>/dev/null || true)
+  user=$(jq -c '.response.user // .response // empty' <<<"$r" 2>/dev/null || true)
+  user_uuid=$(jq -r '.uuid // empty' <<<"$user" 2>/dev/null || true)
+  if [[ -n "$user_uuid" ]]; then
+    vless=$(jq -r '.vlessUuid // .vless_uuid // empty' <<<"$user")
+    [[ -n "$vless" ]] || vless="$desired_uuid"
+    old=$(jq -c '[.activeInternalSquads[]? | if type=="string" then . else .uuid end | select(.!=null and .!="")]' <<<"$user" 2>/dev/null || echo '[]')
+    arr=$(jq -nc --argjson o "$old" --arg s "$squad_uuid" '$o + [$s] | unique')
+    body=$(jq -nc --arg u "$user_uuid" --argjson a "$arr" '{uuid:$u,activeInternalSquads:$a}')
+    resp=$(rm_api PATCH /api/users "$token" "$body" 2>/dev/null || true)
+    if jq -e '.response.uuid // .uuid' >/dev/null 2>&1 <<<"$resp"; then printf '%s' "$vless"; return 0; fi
+    printf '%s\n' "$resp" > "$RM_MANAGER_DIR/last-api-error-cascade-user.json"
+    return 2
+  fi
+  expire=$(date -u -d '+10 years' '+%Y-%m-%dT%H:%M:%S.000Z' 2>/dev/null || date -u '+%Y-%m-%dT%H:%M:%S.000Z')
+  body=$(jq -nc --arg n "$username" --arg e "$expire" --arg v "$desired_uuid" --arg s "$squad_uuid" '{username:$n,expireAt:$e,trafficLimitBytes:0,trafficLimitStrategy:"NO_RESET",vlessUuid:$v,activeInternalSquads:[$s]}')
+  resp=$(rm_api POST /api/users "$token" "$body" 2>/dev/null || true)
+  if jq -e '.response.uuid // .uuid' >/dev/null 2>&1 <<<"$resp"; then printf '%s' "$desired_uuid"; return 0; fi
+  printf '%s\n' "$resp" > "$RM_MANAGER_DIR/last-api-error-cascade-user.json"
+  return 1
+}
+
+run_remna_cascade_manager(){
+  local token nodes count relay exit relay_uuid exit_uuid relay_name exit_name relay_ip exit_ip method suffix bridge_tag bridge_uuid bridge_info exit_profile_uuid bridge_inbound_uuid relay_tag relay_config relay_profile_name relay_ids relay_profile_uuid relay_inbound_uuid relay_active squad_uuid user_name host_uuid extra run_dir profile_doc existing_profile_uuid="" existing_cfg="" desired_hash="" current_hash="" update_profile=no
+  echo
+  ui_title "КАСКАД REMNAWAVE"
+  echo "Схема: CDN -> российский relay -> заграничный exit. RU-трафик выходит DIRECT с relay, остальное через exit:8888."
+  user_prepare "Нужны ДВЕ разные подключённые ноды: relay в РФ и exit за рубежом. CDN/origin должен смотреть на relay, не на exit."
+  user_prepare "Базовый CDN сначала должен быть проверен отдельно. Переключать origin на relay до готовности BRIDGE_IN/VLESS_EXIT не надо."
+  if ! rm_panel_detected; then die "Запусти --cascade на сервере центральной Remnawave-панели."; fi
+  ok "Панель найдена: ${RM_API_BASE}. Версия: $(rm_panel_version || echo unknown)"
+  token=$(rm_get_token) || { warn "Для автоматического каскада нужен API token; без него изменения панели не выполняю."; return 0; }
+  nodes=$(rm_nodes_json "$token") || true
+  count=$(jq 'length' <<<"$nodes")
+  if (( count < 2 )); then
+    warn "Для каскада нужны минимум две ноды, а API видит: $count."
+    manual_do "Создай/подключи вторую Remnawave-ноду, затем снова запусти: $INSTALL_PATH --cascade"
+    return 0
+  fi
+  echo
+  ui_title "ВЫБОР RELAY"
+  relay=$(rm_choose_node "$token") || return 1
+  relay_uuid=$(jq -r '.uuid' <<<"$relay"); relay_name=$(jq -r '.name' <<<"$relay"); relay_ip=$(jq -r '.address' <<<"$relay")
+  while true; do
+    echo
+    ui_title "ВЫБОР EXIT"
+    exit=$(rm_choose_node "$token") || return 1
+    exit_uuid=$(jq -r '.uuid' <<<"$exit")
+    [[ "$exit_uuid" != "$relay_uuid" ]] && break
+    warn "Relay и exit должны быть разными нодами."
+  done
+  exit_name=$(jq -r '.name' <<<"$exit"); exit_ip=$(jq -r '.address' <<<"$exit")
+  method=$(rm_manager_choose_method) || return 0
+  CASCADE_METHOD="$method"; CASCADE_RELAY_NODE_UUID="$relay_uuid"; CASCADE_EXIT_NODE_UUID="$exit_uuid"; CASCADE_RELAY_IP="$relay_ip"; CASCADE_EXIT_IP="$exit_ip"; CASCADE=yes
+  rm_manager_collect_domains "$method"
+  save_state
+
+  echo
+  ui_title "ПОДГОТОВКА К ПЕРЕКЛЮЧЕНИЮ"
+  user_prepare "Relay: $relay_name ($relay_ip)"
+  user_prepare "Exit:  $exit_name ($exit_ip)"
+  manual_do "DNS/origin CDN должен в итоге указывать на RELAY $relay_ip, не на exit $exit_ip. Пока не меняй, если текущий direct-метод нужен рабочим."
+  manual_do "На relay по инструкции используется Caddy, а CDN XHTTP-inbound будет слушать 127.0.0.1:7443."
+  manual_do "На exit BRIDGE_IN будет слушать TCP 8888; сетевой firewall провайдера должен разрешать 8888 от relay."
+  ask_yes_no _CASCADE_CONTINUE "Продолжить подготовку сущностей каскада в Remnawave API?" "yes"
+  [[ "$_CASCADE_CONTINUE" == yes ]] || return 0
+
+  suffix=$(printf '%s%s' "$relay_uuid" "$exit_uuid" | sha256sum | cut -c1-6)
+  bridge_tag="BRIDGE_IN-${suffix}"
+  bridge_uuid=$(cat /proc/sys/kernel/random/uuid 2>/dev/null || uuidgen 2>/dev/null || openssl rand -hex 16)
+  relay_tag="psv1-${method}-cascade-${suffix}"
+  relay_profile_name="psv1-cascade-${method}-${suffix}"; relay_profile_name="${relay_profile_name:0:30}"
+  run_dir="$RM_MANAGER_DIR/cascade-${method}-${suffix}"
+  mkdir -p "$run_dir"; chmod 700 "$run_dir"
+  printf '%s\n' "$relay" | jq . > "$run_dir/relay-node-before.json"
+  printf '%s\n' "$exit" | jq . > "$run_dir/exit-node-before.json"
+
+  exit_profile_uuid=$(jq -r '.configProfile.activeConfigProfileUuid // empty' <<<"$exit")
+  if [[ -z "$exit_profile_uuid" || "$exit_profile_uuid" == "00000000-0000-0000-0000-000000000000" ]]; then
+    danger "У exit-ноды нет активного Config Profile. Создам отдельный bridge-only profile и предложу назначить его."
+    local exit_profile_name="psv1-exit-bridge-${suffix}"
+    if bridge_info=$(rm_api_create_bridge_only_profile "$token" "$exit_uuid" "$bridge_tag" "$exit_profile_name"); then
+      exit_profile_uuid=$(jq -r '.profileUuid' <<<"$bridge_info"); bridge_inbound_uuid=$(jq -r '.inboundUuid' <<<"$bridge_info")
+      if rm_api_assign_node "$token" "$exit_uuid" "$exit_profile_uuid" "$bridge_inbound_uuid"; then auto_done "Exit: создан/назначен bridge-only profile, BRIDGE_IN активирован."; else warn "Bridge profile создан, но exit-нода не назначена автоматически."; fi
+    else
+      warn "Не удалось создать bridge-only profile для exit. Ничего дальше не переключаю."; return 0
+    fi
+  else
+    if bridge_info=$(rm_api_ensure_bridge_in_active_profile "$token" "$exit" "$bridge_tag" "$run_dir"); then
+      exit_profile_uuid=$(jq -r '.profileUuid' <<<"$bridge_info"); bridge_inbound_uuid=$(jq -r '.inboundUuid' <<<"$bridge_info"); bridge_tag=$(jq -r '.tag' <<<"$bridge_info")
+      if rm_api_add_active_inbound_preserve "$token" "$exit" "$exit_profile_uuid" "$bridge_inbound_uuid"; then
+        auto_done "Exit: BRIDGE_IN ($bridge_tag :8888) добавлен в АКТИВНЫЙ profile и Active Inbounds без удаления старых inbound'ов."
+      else
+        warn "BRIDGE_IN создан в profile, но Active Inbounds не обновлён. В конце будет ручной пункт."
+      fi
+    else
+      warn "Не удалось безопасно добавить BRIDGE_IN в активный profile exit. Останавливаюсь до relay-переключения."
+      return 0
+    fi
+  fi
+
+  relay_config=$(rm_cascade_relay_config_json "$method" "$relay_tag" "$exit_ip" "$bridge_uuid")
+  printf '%s\n' "$relay_config" | jq . > "$run_dir/relay-profile.json"
+  if ids=$(rm_api_existing_profile "$token" "$relay_profile_name" 2>/dev/null); then
+    relay_profile_uuid=$(jq -r '.profileUuid' <<<"$ids"); relay_inbound_uuid=$(jq -r '.inboundUuid' <<<"$ids")
+    profile_doc=$(rm_api_profile_doc "$token" "$relay_profile_uuid" || true)
+    existing_cfg=$(jq -c '.config // empty' <<<"$profile_doc" 2>/dev/null || true)
+    if [[ -n "$existing_cfg" ]]; then
+      desired_hash=$(printf '%s' "$relay_config" | jq -cS . | sha256sum | awk '{print $1}')
+      current_hash=$(printf '%s' "$existing_cfg" | jq -cS . | sha256sum | awk '{print $1}')
+      if [[ "$desired_hash" != "$current_hash" ]]; then
+        danger "Существующий cascade profile отличается от текущих параметров (например, сменился exit)."
+        ask_yes_no update_profile "Обновить ТОЛЬКО этот cascade profile, сохранив backup?" "no"
+        if [[ "$update_profile" == yes ]]; then
+          printf '%s\n' "$profile_doc" | jq . > "$run_dir/relay-profile-before-update.json"
+          if rm_api_patch_profile_config "$token" "$relay_profile_uuid" "$relay_config"; then
+            inbs=$(rm_api_profile_inbounds "$token" "$relay_profile_uuid")
+            relay_inbound_uuid=$(jq -r --arg t "$relay_tag" '[.[]? | select(.tag==$t) | .uuid][0] // empty' <<<"$inbs")
+            auto_done "Relay cascade profile обновлён."
+          else warn "Relay profile не обновлён; assignment не меняю."; return 0; fi
+        else
+          manual_do "Существующий cascade profile оставлен без изменений. Повтори --cascade и подтверди обновление, когда будешь готов."
+          return 0
+        fi
+      fi
+    fi
+    auto_done "Relay cascade profile найден: $relay_profile_name"
+  else
+    if relay_ids=$(rm_api_create_profile "$token" "$relay_profile_name" "$relay_config"); then
+      relay_profile_uuid=$(jq -r '.profileUuid' <<<"$relay_ids"); relay_inbound_uuid=$(jq -r '.inboundUuid' <<<"$relay_ids")
+      auto_done "Relay cascade profile создан: $relay_profile_name"
+    else warn "Не удалось создать relay cascade profile. Exit BRIDGE_IN оставлен, но трафик не переключался."; return 0; fi
+  fi
+
+  squad_uuid=$(rm_api_ensure_named_squad "$token" "PSV1-CASCADE" "$bridge_inbound_uuid" "$relay_inbound_uuid" || true)
+  if [[ -n "$squad_uuid" ]]; then auto_done "Internal Squad PSV1-CASCADE содержит BRIDGE_IN и relay CDN inbound."; else warn "Cascade squad не настроен автоматически."; fi
+
+  user_name="bridge_${suffix}"
+  if [[ -n "$squad_uuid" ]]; then
+    if b=$(rm_api_ensure_bridge_user "$token" "$user_name" "$bridge_uuid" "$squad_uuid"); then bridge_uuid="$b"; auto_done "Bridge user '$user_name' создан/найден и добавлен в PSV1-CASCADE."; else warn "Bridge user через API не настроен. Используй UUID из $run_dir/BRIDGE-UUID.txt вручную."; fi
+  fi
+  CASCADE_BRIDGE_UUID="$bridge_uuid"
+  printf '%s\n' "$bridge_uuid" > "$run_dir/BRIDGE-UUID.txt"; chmod 600 "$run_dir/BRIDGE-UUID.txt"
+
+  # If the API reused an existing bridge user with another UUID, rebuild/patch relay config before assignment.
+  relay_config=$(rm_cascade_relay_config_json "$method" "$relay_tag" "$exit_ip" "$bridge_uuid")
+  profile_doc=$(rm_api_profile_doc "$token" "$relay_profile_uuid" || true)
+  existing_cfg=$(jq -c '.config // empty' <<<"$profile_doc" 2>/dev/null || true)
+  if [[ -n "$existing_cfg" ]] && [[ "$(printf '%s' "$relay_config" | jq -cS . | sha256sum | awk '{print $1}')" != "$(printf '%s' "$existing_cfg" | jq -cS . | sha256sum | awk '{print $1}')" ]]; then
+    printf '%s\n' "$profile_doc" | jq . > "$run_dir/relay-profile-before-bridge-uuid-sync.json"
+    if rm_api_patch_profile_config "$token" "$relay_profile_uuid" "$relay_config"; then
+      inbs=$(rm_api_profile_inbounds "$token" "$relay_profile_uuid")
+      relay_inbound_uuid=$(jq -r --arg t "$relay_tag" '[.[]? | select(.tag==$t) | .uuid][0] // empty' <<<"$inbs")
+    fi
+  fi
+
+  relay_active=$(jq -r '.configProfile.activeConfigProfileUuid // empty' <<<"$relay")
+  if [[ -n "$relay_active" && "$relay_active" != "00000000-0000-0000-0000-000000000000" && "$relay_active" != "$relay_profile_uuid" ]]; then
+    danger "Relay сейчас работает на другом profile UUID=$relay_active. Переключение изменит маршрутизацию этой ноды."
+    manual_do "Backup текущего node JSON сохранён: $run_dir/relay-node-before.json"
+    ask_yes_no RM_CASCADE_ASSIGN_RELAY "Назначить relay cascade profile '$relay_profile_name' сейчас?" "no"
+  else RM_CASCADE_ASSIGN_RELAY=yes; fi
+  if [[ "$RM_CASCADE_ASSIGN_RELAY" == yes ]]; then
+    if rm_api_assign_node "$token" "$relay_uuid" "$relay_profile_uuid" "$relay_inbound_uuid"; then auto_done "Relay: cascade profile назначен, XHTTP inbound :7443 активирован."; else warn "Relay profile создан, но Node assignment не прошёл."; fi
+  else
+    manual_do "Relay не переключён. После подготовки Caddy назначь profile '$relay_profile_name' и Active Inbound '$relay_tag'."
+  fi
+
+  if [[ -n "$CDN_DOMAIN" ]]; then
+    extra=$(rm_method_host_extra_json "$method" "$(jq -c '.inbounds[0]' <<<"$relay_config")")
+    host_uuid=$(rm_api_existing_host "$token" "$relay_profile_uuid" "$relay_inbound_uuid" "$CDN_DOMAIN" || true)
+    if [[ -z "$host_uuid" ]]; then host_uuid=$(rm_api_create_host "$token" "$relay_profile_uuid" "$relay_inbound_uuid" "$method" "$CDN_DOMAIN" "PSV1 Cascade $(method_title "$method") - $relay_name" "$extra" || true); fi
+    [[ -n "$host_uuid" ]] && auto_done "Cascade Host создан/найден: $CDN_DOMAIN -> relay inbound." || warn "Cascade Host не создан автоматически."
+  fi
+
+  cat > "$run_dir/RELAY-STEPS.txt" <<EOF
+RELAY ($relay_name / $relay_ip)
+1. По присланному мануалу relay использует Caddy, не nginx.
+2. CDN/origin должен смотреть на $relay_ip.
+3. Remnawave relay inbound: 127.0.0.1:7443, tag=$relay_tag.
+4. Caddy должен передавать CDN XHTTP-path к 127.0.0.1:7443. Точный Caddyfile в исходном мануале не дан, поэтому установщик НЕ выдумывает его автоматически.
+5. Node management port разрешай только от IP панели.
+6. С relay: nc -zv $exit_ip 8888
+EOF
+  cat > "$run_dir/EXIT-STEPS.txt" <<EOF
+EXIT ($exit_name / $exit_ip)
+1. BRIDGE_IN: TCP 8888, listen 0.0.0.0, tag=$bridge_tag.
+2. BRIDGE_IN должен быть в activeInbounds активного profile.
+3. BRIDGE_IN и bridge user '$user_name' должны быть в Internal Squad PSV1-CASCADE.
+4. Firewall/SG: разреши TCP 8888 от relay $relay_ip (не открывай без необходимости всему интернету).
+5. Проверка на exit: ss -ltnp | grep 8888
+EOF
+  cat > "$run_dir/MANUAL-ACTIONS.txt" <<EOF
+[ВРУЧНУЮ] Перед финальным переключением
+1. Relay: настроить Caddy -> 127.0.0.1:7443 по path выбранного CDN.
+2. Exit: убедиться, что TCP 8888 доступен с relay и BRIDGE_IN слушает.
+3. DNS/CDN provider: origin должен указывать на RELAY $relay_ip, не на exit $exit_ip.
+4. Users: обычные пользователи, которым нужен cascade Host, должны состоять в Internal Squad с relay inbound (PSV1-CASCADE либо выбранный тобой squad).
+5. После переключения: RU сайты должны выходить с IP relay, зарубежные — с IP exit.
+EOF
+  cat > "$run_dir/VERIFY.txt" <<EOF
+# На relay
+nc -zv $exit_ip 8888
+
+# На exit
+ss -ltnp | grep 8888
+
+# После CDN/origin переключения
+curl -sk https://${CDN_DOMAIN:-CDN_DOMAIN}$(rm_method_meta "$method" path) -o /dev/null -w '%{http_code}\\n'
+# ожидается 400 после рабочей цепочки
+
+# Гео-проверка с клиента через VPN
+# 2ip.ru / google.ru -> IP relay (RU)
+# 2ip.io / example.com -> IP exit
+EOF
+  chmod 600 "$run_dir"/*.txt "$run_dir"/*.json 2>/dev/null || true
+  CASCADE_STATUS=prepared; save_state
+  echo
+  ui_title "КАСКАД — ИТОГ"
+  auto_done "Exit profile: BRIDGE_IN $bridge_tag :8888 подготовлен/проверен."
+  auto_done "Relay cascade profile: $relay_profile_name"
+  [[ -n "$squad_uuid" ]] && auto_done "Internal Squad: PSV1-CASCADE"
+  [[ -n "$host_uuid" ]] && auto_done "Cascade Host: $CDN_DOMAIN"
+  manual_do "Relay Caddy и provider-side origin требуют отдельного действия на relay/в кабинете CDN."
+  manual_do "Инструкция relay: $run_dir/RELAY-STEPS.txt"
+  manual_do "Инструкция exit:  $run_dir/EXIT-STEPS.txt"
+  check_do "Проверки: $run_dir/VERIFY.txt"
+  echo
+  echo "Повторно открыть мастер каскада: $INSTALL_PATH --cascade"
+}
+
+run_3xui_cascade_manager(){
+  local exit_ip bridge_uuid out="$OUT_DIR/3xui-cascade"
+  mkdir -p "$out"; chmod 700 "$out"
+  ui_title "КАСКАД 3x-ui"
+  user_prepare "В этом проекте каскад 3x-ui поддерживается только для VK/Yandex/TurboFlare."
+  read -r -p "IPv4 заграничного exit-сервера: " exit_ip
+  valid_ipv4 "$exit_ip" || die "Нужен IPv4 exit-сервера."
+  bridge_uuid=$(cat /proc/sys/kernel/random/uuid 2>/dev/null || uuidgen 2>/dev/null || openssl rand -hex 16)
+  cat > "$out/NEXT-STEPS.txt" <<EOF
+3x-ui CASCADE
+1. На exit: VLESS TCP inbound :8888, security=none, UUID=$bridge_uuid.
+2. На relay в xrayTemplateConfig добавить outbound CASCADE-REALITY -> $exit_ip:8888 с этим UUID.
+3. Финальное routing-правило должно быть catch-all по network \"tcp,udp\", НЕ inboundTag.
+4. RU-direct и блокировки должны стоять ВЫШЕ catch-all.
+5. xrayTemplateConfig в SQLite менять через DELETE + INSERT; затем systemctl restart x-ui.
+6. Проверить: nc -zv $exit_ip 8888; затем гео — RU через relay, зарубежные через exit.
+EOF
+  chmod 600 "$out/NEXT-STEPS.txt"
+  warn "Автоматическая правка xrayTemplateConfig 3x-ui пока не включена: это отдельный рискованный DB-шаг. Готов точный чек-лист: $out/NEXT-STEPS.txt"
+}
+
+run_cascade_manager(){
+  load_state || true
+  if rm_panel_detected >/dev/null 2>&1; then
+    run_remna_cascade_manager
+  elif [[ "${PANEL_KIND:-}" == 3xui ]] || command -v x-ui >/dev/null 2>&1 || [[ -d /etc/x-ui ]]; then
+    run_3xui_cascade_manager
+  else
+    die "Не вижу локальную центральную Remnawave или 3x-ui. Для Remnawave запускай --cascade на сервере панели."
+  fi
+}
+
+
 run_remna_panel_manager(){
   local token="" token_mode=api nodes node node_uuid node_name node_ip connected method safe suffix tag inbound config extra profile_name ids profile_uuid inbound_uuid active_profile assign_ok=no host_uuid="" squad_ok=no run_dir summary technew=""
   echo
@@ -1638,7 +2040,7 @@ collect_config(){
   if [[ "$METHOD" == none ]]; then
     CASCADE=no
   else
-    ask_yes_no CASCADE "Нужен каскад через второй сервер? (пока сначала ставится базовый CDN, затем будет создан чек-лист)" "no"
+    ask_yes_no CASCADE "Нужен каскад через второй сервер? (CDN -> RU relay -> foreign exit; можно включить позже через --cascade)" "no"
   fi
 
   if [[ "$PANEL_KIND" == remna && "$REMNA_ROLE" == node ]]; then
@@ -1664,6 +2066,10 @@ case "${1:-}" in
     [[ -n "$REMNA_SECRET_KEY" ]] || die "SECRET_KEY пустой."
     save_state
     ok "Node Port и SECRET_KEY обновлены в $STATE_FILE"
+    exit 0
+    ;;
+  --cascade)
+    run_cascade_manager
     exit 0
     ;;
   --manage-remna)
@@ -1704,6 +2110,7 @@ ${PROJECT_NAME} ${INSTALLER_VERSION}
 Статус: $INSTALL_PATH --status
 Обновить Node Port/SECRET_KEY: $INSTALL_PATH --node-credentials
 Управление существующей Remnawave: $INSTALL_PATH --manage-remna
+Каскад (включить/донастроить позже): $INSTALL_PATH --cascade
 Проверка Remnawave: $INSTALL_PATH --check-remna
 Сброс ответов: $INSTALL_PATH --reset
 Обновление из GitHub: $INSTALL_PATH --update
@@ -1729,15 +2136,17 @@ if load_state; then
     echo
     echo "Remnawave на этом сервере уже была установлена этим скриптом."
     echo "  1 — добавить/настроить новый CDN-метод для существующей ноды"
-    echo "  2 — проверить текущую установку этого сервера"
-    echo "  3 — показать сохранённый результат"
-    echo "  4 — начать новую задачу (сбросить только ответы установщика)"
+    echo "  2 — каскад: включить/донастроить relay -> exit"
+    echo "  3 — проверить текущую установку этого сервера"
+    echo "  4 — показать сохранённый результат"
+    echo "  5 — начать новую задачу (сбросить только ответы установщика)"
     echo "  0 — выйти"
     read -r -p "Выбор [1]: " _done_action; _done_action="${_done_action:-1}"
     case "$_done_action" in
       1) exec "$0" --manage-remna ;;
-      3) [[ -f "$RESULT_FILE" ]] && cat "$RESULT_FILE"; exit 0 ;;
-      4) rm -f "$STATE_FILE"; rm -rf "$MARK_DIR"; mkdir -p "$MARK_DIR"; collect_config ;;
+      2) exec "$0" --cascade ;;
+      4) [[ -f "$RESULT_FILE" ]] && cat "$RESULT_FILE"; exit 0 ;;
+      5) rm -f "$STATE_FILE"; rm -rf "$MARK_DIR"; mkdir -p "$MARK_DIR"; collect_config ;;
       0) exit 0 ;;
       *) : ;;
     esac
@@ -2678,16 +3087,21 @@ elif [[ "$REMNA_ROLE" == node || "$REMNA_ROLE" == both ]]; then XRAY_VERSION=$(d
     echo "Suggested first admin login: $REMNA_ADMIN_USER"
     echo "Suggested first admin password: $REMNA_ADMIN_PASS"
   fi
-  [[ "$CASCADE" == yes ]] && echo "Cascade: requested; base CDN configured first. Do not alter routing until both origin/CDN checks are 400."
+  [[ "$CASCADE" == yes ]] && echo "Cascade: requested; after base CDN check run: $INSTALL_PATH --cascade"
 } > "$RESULT_FILE"
 chmod 600 "$RESULT_FILE"
 mark complete
 
-cat > "$OUT_DIR/cascade-next-steps.txt" <<'EOF'
-Каскад включается только после базовой проверки CDN (origin=400 и CDN=400).
-В этой версии установщика каскад намеренно не меняет routing автоматически: один неверный tag/UUID отрезает рабочую ноду.
-Для 3x-ui правило каскада не привязывать к inboundTag: панель может переименовать inbound; использовать catch-all по network.
-Для Remnawave каскад добавляется в config profile после проверки relay->exit отдельно.
+cat > "$OUT_DIR/cascade-next-steps.txt" <<EOF
+Каскад можно включить при первой установке или позже отдельной командой:
+  $INSTALL_PATH --cascade
+
+Remnawave: мастер готовит BRIDGE_IN :8888 на exit, отдельный relay profile с XHTTP :7443 + VLESS_EXIT, Internal Squad, bridge-user и cascade Host.
+Relay и exit выбираются из уже подключённых нод. Существующие active inbound на exit сохраняются.
+Перед заменой активного profile relay всегда требуется отдельное подтверждение.
+Provider-side origin/DNS и Caddy на relay выводятся отдельной ручной инструкцией.
+
+3x-ui: пока создаётся безопасный чек-лист; финальный catch-all только по network=tcp,udp, не по inboundTag.
 EOF
 chmod 600 "$OUT_DIR/cascade-next-steps.txt"
 
@@ -2700,4 +3114,14 @@ fi
 echo "Результат:    $RESULT_FILE"
 echo "Шаблоны:      $OUT_DIR"
 echo "Лог:           $LOG_FILE"
+if [[ "${CASCADE:-no}" == yes ]]; then
+  echo
+  ui_title "КАСКАД ВЫБРАН"
+  if [[ "$origin_code" == 400 && "$cdn_code" == 400 ]]; then
+    check_do "Базовый CDN уже отвечает 400/400. На сервере центральной панели можно переходить к: $INSTALL_PATH --cascade"
+  else
+    manual_do "Сначала доведи базовый CDN до origin=400 и CDN=400. Затем на сервере центральной панели: $INSTALL_PATH --cascade"
+  fi
+  manual_do "Каскад требует две разные ноды: RU relay + foreign exit. Он не включается молча поверх недопроверенного CDN."
+fi
 echo "Повторный запуск продолжит с сохранёнными ответами."
