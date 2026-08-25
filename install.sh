@@ -11,7 +11,7 @@ IFS=$'\n\t'
 # This installer deliberately keeps each CDN preset separate. Do not mix fields
 # between providers: path/padding/uplink settings are provider-specific.
 
-INSTALLER_VERSION="1.1.6"
+INSTALLER_VERSION="1.1.7"
 STATE_SCHEMA_CURRENT="1"
 PRESET="${INSTALLER_PRESET:-}"
 
@@ -610,14 +610,17 @@ rm_profile_config_json(){
 }
 
 rm_api_create_profile(){
-  local token="$1" name="$2" config="$3" body resp
+  local token="$1" name="$2" config="$3" body resp code tmp
   body=$(jq -nc --arg name "$name" --argjson config "$config" '{name:$name,config:$config}')
-  resp=$(rm_api POST /api/config-profiles "$token" "$body" 2>/dev/null || true)
-  if jq -e '.response.uuid and .response.inbounds[0].uuid' >/dev/null 2>&1 <<<"$resp"; then
+  tmp=$(mktemp)
+  code=$(rm_api_fetch_to_file POST /api/config-profiles "$token" "$tmp" "$body" || true)
+  resp=$(cat "$tmp" 2>/dev/null || true); rm -f "$tmp"
+  if [[ "$code" =~ ^2[0-9][0-9]$ ]] && jq -e '.response.uuid and .response.inbounds[0].uuid' >/dev/null 2>&1 <<<"$resp"; then
     jq -c '{profileUuid:.response.uuid,inboundUuid:.response.inbounds[0].uuid}' <<<"$resp"
     return 0
   fi
   printf '%s\n' "$resp" > "$RM_MANAGER_DIR/last-api-error-create-profile.json"
+  printf 'HTTP=%s\nprofile_name=%s\nprofile_name_length=%s\n' "$code" "$name" "${#name}" > "$RM_MANAGER_DIR/last-api-error-create-profile-http.txt"
   return 1
 }
 
@@ -870,10 +873,16 @@ run_remna_panel_manager(){
 
   method=$(rm_manager_choose_method) || exit 0
   rm_manager_collect_domains "$method"
-  safe=$(tr '[:upper:]' '[:lower:]' <<<"$node_name" | tr -cd 'a-z0-9_-'); safe="${safe:0:24}"; [[ -n "$safe" ]] || safe="node"
+  safe=$(tr '[:upper:]' '[:lower:]' <<<"$node_name" | tr -cd 'a-z0-9_-'); [[ -n "$safe" ]] || safe="node"
   suffix=$(printf '%s' "$node_uuid" | sha256sum | cut -c1-6)
   tag="psv1-${method}-${suffix}"
-  profile_name="psv1-${method}-${safe}-${suffix}"
+  # Remnawave API limits Config Profile names to 30 characters.
+  # Build a readable but always-valid name instead of letting POST /api/config-profiles fail.
+  profile_prefix="psv1-${method}-"
+  max_safe=$((30 - ${#profile_prefix} - 1 - ${#suffix}))
+  (( max_safe < 1 )) && max_safe=1
+  safe="${safe:0:max_safe}"
+  profile_name="${profile_prefix}${safe}-${suffix}"
   inbound=$(rm_method_inbound_json "$method" "$tag")
   config=$(rm_profile_config_json "$inbound" "$method")
   extra=$(rm_method_host_extra_json "$method" "$inbound")
@@ -945,6 +954,11 @@ EOF
       ok "Создан новый Config Profile: $profile_name"
     else
       warn "API не создал профиль. Ничего существующего не изменено."
+      [[ -s "$RM_MANAGER_DIR/last-api-error-create-profile-http.txt" ]] && { echo "Диагностика создания профиля:"; cat "$RM_MANAGER_DIR/last-api-error-create-profile-http.txt"; }
+      if [[ -s "$RM_MANAGER_DIR/last-api-error-create-profile.json" ]]; then
+        echo "Ответ API:"
+        jq . "$RM_MANAGER_DIR/last-api-error-create-profile.json" 2>/dev/null || cat "$RM_MANAGER_DIR/last-api-error-create-profile.json"
+      fi
       echo "Полная пошаговая инструкция: $run_dir/NEXT-STEPS.txt"
       cat "$run_dir/NEXT-STEPS.txt"
       return 0

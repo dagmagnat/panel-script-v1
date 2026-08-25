@@ -1,6 +1,6 @@
-# panel-script-v1 — v1.1.6
+# panel-script-v1 — v1.1.7
 
-## 1.1.6 API/node fallback
+## 1.1.7 API/node fallback
 
 API token validation now accepts any successful 2xx JSON response instead of requiring one exact configProfiles wrapper. List parsers support array/items/data wrappers for profiles, nodes, hosts and internal squads. Host creation tries current `xhttpExtraParams` first and legacy `xHttpExtraParams` as fallback.
 
@@ -118,5 +118,5 @@ External Squads не входят в обязательную цепочку о�
 
 ### Если Node видна в панели, а API token не возвращает `/api/nodes`
 
-В v1.1.6 это больше не считается «панель пустая». Скрипт показывает HTTP-диагностику и предлагает временно войти обычным логином/паролем администратора. Полученный admin JWT используется только для текущего мастера, чтобы прочитать Node и выполнить безопасное добавление Profile/Inbound/Internal Squad/Host.
+В v1.1.7 это больше не считается «панель пустая». Скрипт показывает HTTP-диагностику и предлагает временно войти обычным логином/паролем администратора. Полученный admin JWT используется только для текущего мастера, чтобы прочитать Node и выполнить безопасное добавление Profile/Inbound/Internal Squad/Host.
 
