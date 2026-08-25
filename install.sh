@@ -11,7 +11,7 @@ IFS=$'\n\t'
 # This installer deliberately keeps each CDN preset separate. Do not mix fields
 # between providers: path/padding/uplink settings are provider-specific.
 
-INSTALLER_VERSION="1.0.1"
+INSTALLER_VERSION="1.0.2"
 STATE_SCHEMA_CURRENT="1"
 PRESET="${INSTALLER_PRESET:-}"
 
@@ -451,7 +451,7 @@ if [[ ! -s "$SELF_CERT_DIR/server.crt" || ! -s "$SELF_CERT_DIR/server.key" ]]; t
   chmod 600 "$SELF_CERT_DIR/server.key"
 fi
 
-if ! marked bootstrap_nginx; then
+write_bootstrap_nginx(){
   info "Готовлю безопасный nginx bootstrap до Certbot..."
   cp -a /etc/nginx/nginx.conf "$BACKUP_DIR/nginx.conf.$(date +%Y%m%d-%H%M%S)" 2>/dev/null || true
   mkdir -p /etc/nginx/sites-available /etc/nginx/sites-enabled
@@ -459,11 +459,15 @@ if ! marked bootstrap_nginx; then
   cp -a /etc/nginx/sites-enabled/. "$BACKUP_DIR/sites-enabled-before-bootstrap/" 2>/dev/null || true
   find /etc/nginx/sites-enabled -mindepth 1 -maxdepth 1 -exec rm -rf {} +
   cat > /etc/nginx/sites-available/cdn-bootstrap.conf <<EOF
+# panel-script-v1 bootstrap
 server {
     listen 80 default_server;
     listen [::]:80 default_server;
     server_name _;
-    location ^~ /.well-known/acme-challenge/ { root ${ACME_ROOT}; default_type text/plain; }
+    location ^~ /.well-known/acme-challenge/ {
+        alias ${ACME_ROOT}/.well-known/acme-challenge/;
+        default_type text/plain;
+    }
     location / { root ${WEBROOT}; try_files \$uri /index.html; }
 }
 server {
@@ -476,16 +480,61 @@ server {
 }
 EOF
   ln -sfn /etc/nginx/sites-available/cdn-bootstrap.conf /etc/nginx/sites-enabled/cdn-bootstrap.conf
-  nginx -t; systemctl enable --now nginx; systemctl reload nginx
-  mark bootstrap_nginx
+  nginx -t
+  systemctl enable --now nginx
+  systemctl reload nginx
+}
+
+# v1.0.1 marked bootstrap_nginx before validating ACME. Always validate again;
+# if the marker is stale, recreate the bootstrap automatically.
+if ! marked bootstrap_nginx; then
+  write_bootstrap_nginx
 fi
 
+acme_probe(){
+  local host="$1" url="$2" code body
+  code=$(curl --noproxy '*' -sS --max-time 5 -o /tmp/acme-body -w '%{http_code}' -H "Host: ${host}" "$url" 2>/dev/null || true)
+  body=$(cat /tmp/acme-body 2>/dev/null || true)
+  rm -f /tmp/acme-body
+  [[ "$code" == 200 && "$body" == "$ACME_TEST" ]]
+}
+
 ACME_TEST="acme-$(openssl rand -hex 5)"
-printf '%s\n' "$ACME_TEST" > "$ACME_ROOT/.well-known/acme-challenge/$ACME_TEST"; chmod 0644 "$ACME_ROOT/.well-known/acme-challenge/$ACME_TEST"
-code=$(curl --noproxy '*' -sS --max-time 5 -o /tmp/acme-body -w '%{http_code}' -H 'Host: acme-test.invalid' "http://127.0.0.1/.well-known/acme-challenge/$ACME_TEST" 2>/dev/null || true)
-body=$(cat /tmp/acme-body 2>/dev/null || true); rm -f /tmp/acme-body "$ACME_ROOT/.well-known/acme-challenge/$ACME_TEST"
-[[ "$code" == 200 && "$body" == "$ACME_TEST" ]] || die "nginx не отдаёт ACME webroot локально (HTTP ${code:-000})."
-ok "ACME webroot локально работает (200)."
+printf '%s\n' "$ACME_TEST" > "$ACME_ROOT/.well-known/acme-challenge/$ACME_TEST"
+chmod 0644 "$ACME_ROOT/.well-known/acme-challenge/$ACME_TEST"
+
+ACME_OK=no
+if acme_probe acme-test.invalid "http://127.0.0.1/.well-known/acme-challenge/$ACME_TEST"; then
+  ACME_OK=yes
+  ok "ACME webroot через loopback работает (200)."
+else
+  warn "Loopback-проверка ACME не дала 200; проверяю публичный IPv4 интерфейс."
+  if acme_probe acme-test.invalid "http://${PUBLIC_IP}/.well-known/acme-challenge/$ACME_TEST"; then
+    ACME_OK=yes
+    ok "ACME webroot через публичный IPv4 работает (200)."
+  fi
+fi
+
+if [[ "$ACME_OK" != yes ]]; then
+  warn "Пересоздаю bootstrap nginx: возможно, остался маркер от v1.0.1."
+  rm -f "$MARK_DIR/bootstrap_nginx"
+  write_bootstrap_nginx
+  if acme_probe acme-test.invalid "http://127.0.0.1/.well-known/acme-challenge/$ACME_TEST" ||      acme_probe acme-test.invalid "http://${PUBLIC_IP}/.well-known/acme-challenge/$ACME_TEST"; then
+    ACME_OK=yes
+  fi
+fi
+
+if [[ "$ACME_OK" != yes ]]; then
+  echo "--- nginx listeners ---" >&2
+  ss -ltnp | grep -E ':(80|443)\b' >&2 || true
+  echo "--- active nginx ACME/listen lines ---" >&2
+  nginx -T 2>&1 | grep -nE 'panel-script-v1 bootstrap|listen .*80|server_name|acme-challenge' | tail -n 80 >&2 || true
+  rm -f "$ACME_ROOT/.well-known/acme-challenge/$ACME_TEST"
+  die "nginx не отдаёт ACME webroot ни через loopback, ни через публичный IPv4. Диагностика напечатана выше."
+fi
+
+rm -f "$ACME_ROOT/.well-known/acme-challenge/$ACME_TEST"
+mark bootstrap_nginx
 
 resolve_v4(){ dig +short A "$1" | grep -E '^([0-9]{1,3}\.){3}[0-9]{1,3}$' | head -1 || true; }
 certbot_for_domain(){
