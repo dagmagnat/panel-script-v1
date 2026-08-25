@@ -11,7 +11,7 @@ IFS=$'\n\t'
 # This installer deliberately keeps each CDN preset separate. Do not mix fields
 # between providers: path/padding/uplink settings are provider-specific.
 
-INSTALLER_VERSION="1.1.1"
+INSTALLER_VERSION="1.1.2"
 STATE_SCHEMA_CURRENT="1"
 PRESET="${INSTALLER_PRESET:-}"
 
@@ -174,24 +174,84 @@ method_nginx_style(){ case "$METHOD" in beeline|turboflare) echo rewrite ;; *) e
 # files plus manual steps instead of overwriting anything.
 RM_MANAGER_TOKEN_FILE="$STATE_DIR/remna-manager.token"
 RM_MANAGER_DIR="$OUT_DIR/remna-methods"
+RM_API_BASE="${RM_API_BASE:-}"
+RM_API_INSECURE="${RM_API_INSECURE:-no}"
 mkdir -p "$RM_MANAGER_DIR"
 
+rm_try_api_base(){
+  local base="${1%/}" code=""
+  [[ -n "$base" ]] || return 1
+  code=$(curl -sS -o /dev/null --connect-timeout 2 --max-time 5 -w '%{http_code}' "${base}/api/auth/status" 2>/dev/null || true)
+  if [[ -n "$code" && "$code" != 000 ]]; then
+    RM_API_BASE="$base"
+    RM_API_INSECURE=no
+    return 0
+  fi
+  code=$(curl -ksS -o /dev/null --connect-timeout 2 --max-time 5 -w '%{http_code}' "${base}/api/auth/status" 2>/dev/null || true)
+  if [[ -n "$code" && "$code" != 000 ]]; then
+    RM_API_BASE="$base"
+    RM_API_INSECURE=yes
+    return 0
+  fi
+  return 1
+}
+
+rm_discover_api_base(){
+  local c hp ip candidate
+
+  if [[ -n "${RM_API_BASE:-}" ]] && rm_try_api_base "$RM_API_BASE"; then return 0; fi
+
+  # Classic compose used by earlier versions of this installer.
+  if rm_try_api_base "http://127.0.0.1:3000"; then return 0; fi
+
+  # Remnawave can also be published on another localhost port or only inside a
+  # Docker network. Discover both layouts instead of assuming :3000 on host.
+  if command -v docker >/dev/null 2>&1; then
+    for c in remnawave remnawave-rest-api; do
+      docker inspect "$c" >/dev/null 2>&1 || continue
+      hp=$(docker inspect -f '{{with (index .NetworkSettings.Ports "3000/tcp")}}{{(index . 0).HostPort}}{{end}}' "$c" 2>/dev/null || true)
+      if [[ "$hp" =~ ^[0-9]+$ ]] && rm_try_api_base "http://127.0.0.1:${hp}"; then return 0; fi
+      ip=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "$c" 2>/dev/null || true)
+      if [[ -n "$ip" ]] && rm_try_api_base "http://${ip}:3000"; then return 0; fi
+    done
+  fi
+
+  # When manager is launched via a fresh process, PANEL_DOMAIN only exists if
+  # saved state was loaded. v1.1.1 forgot to do this, which is why a working
+  # panel behind nginx could be reported as "not found".
+  if [[ -n "${PANEL_DOMAIN:-}" ]]; then
+    candidate="https://${PANEL_DOMAIN}"
+    if rm_try_api_base "$candidate"; then return 0; fi
+    candidate="http://${PANEL_DOMAIN}"
+    if rm_try_api_base "$candidate"; then return 0; fi
+  fi
+
+  return 1
+}
+
 rm_panel_detected(){
-  [[ -f /opt/remnawave/docker-compose.yml ]] || docker ps --format '{{.Names}}' 2>/dev/null | grep -qx remnawave || return 1
-  # Любой HTTP-код означает, что процесс панели отвечает; 000/ошибка соединения — нет.
-  curl -sS -o /dev/null --max-time 4 http://127.0.0.1:3000/api/auth/status >/dev/null 2>&1 || \
-    curl -sS -o /dev/null --max-time 4 http://127.0.0.1:3000/ >/dev/null 2>&1
+  # API availability matters more than a particular Docker layout. This also
+  # supports panels installed by older/newer Remnawave compose files.
+  rm_discover_api_base
 }
 
 rm_panel_version(){
+  local line=""
   if [[ -f /opt/remnawave/docker-compose.yml ]]; then
-    grep -Eo 'remnawave/backend:[A-Za-z0-9._-]+' /opt/remnawave/docker-compose.yml | head -1 | cut -d: -f2 || true
+    line=$(grep -m1 -Eo 'remnawave/backend:[A-Za-z0-9._-]+' /opt/remnawave/docker-compose.yml 2>/dev/null || true)
+    [[ -n "$line" ]] && printf '%s\n' "${line#*:}" && return 0
   fi
+  if command -v docker >/dev/null 2>&1; then
+    line=$(docker inspect -f '{{.Config.Image}}' remnawave 2>/dev/null || docker inspect -f '{{.Config.Image}}' remnawave-rest-api 2>/dev/null || true)
+    [[ "$line" == *:* ]] && printf '%s\n' "${line##*:}" && return 0
+  fi
+  return 1
 }
 
 rm_api(){
-  local method="$1" path="$2" token="${3:-}" data="${4:-}" url="http://127.0.0.1:3000${path}"
+  local method="$1" path="$2" token="${3:-}" data="${4:-}" url="${RM_API_BASE%/}${path}"
   local args=(-sS --max-time 20 -X "$method" "$url" -H 'Content-Type: application/json' -H 'X-Remnawave-Client-Type: browser')
+  [[ "${RM_API_INSECURE:-no}" == yes ]] && args+=(-k)
   [[ -n "$token" ]] && args+=(-H "Authorization: Bearer $token")
   [[ -n "$data" ]] && args+=(-d "$data")
   curl "${args[@]}"
@@ -216,7 +276,7 @@ rm_get_token(){
     rm -f "$RM_MANAGER_TOKEN_FILE"
   fi
   echo >&2
-  echo "Как войти в локальную Remnawave API?" >&2
+  echo "Как войти в Remnawave API (${RM_API_BASE})?" >&2
   echo "  1 — логин и пароль администратора панели (проще)" >&2
   echo "  2 — вставить API token" >&2
   echo "  3 — без API: только подготовить JSON и пошаговую инструкцию" >&2
@@ -393,7 +453,7 @@ rm_api_create_profile(){
 rm_api_existing_profile(){
   local token="$1" name="$2" r uuid inb
   r=$(rm_api GET /api/config-profiles "$token" 2>/dev/null || true)
-  uuid=$(jq -r --arg n "$name" '.response.configProfiles[]? | select(.name==$n) | .uuid' <<<"$r" | head -1)
+  uuid=$(jq -r --arg n "$name" '[.response.configProfiles[]? | select(.name==$n) | .uuid][0] // empty' <<<"$r")
   [[ -n "$uuid" ]] || return 1
   r=$(rm_api GET "/api/config-profiles/${uuid}/inbounds" "$token" 2>/dev/null || true)
   inb=$(jq -r '.response.inbounds[0].uuid // .response[0].uuid // empty' <<<"$r" 2>/dev/null || true)
@@ -428,7 +488,7 @@ rm_api_existing_host(){
     | select(.address==$a)
     | select((.inbound.configProfileUuid // "")==$p)
     | select((.inbound.configProfileInboundUuid // "")==$i)
-    | .uuid' <<<"$r" 2>/dev/null | head -1
+    | .uuid' <<<"$r" 2>/dev/null | sed -n '1p'
 }
 
 rm_api_create_host(){
@@ -533,16 +593,29 @@ run_remna_panel_manager(){
   echo
   echo "=== Remnawave: добавить CDN-метод в существующую панель ==="
   echo "Этот режим НЕ переустанавливает панель и НЕ удаляет существующие профили/хосты."
-  if ! rm_panel_detected; then
-    die "На этом сервере не найдена работающая Remnawave на 127.0.0.1:3000. Для удалённой ноды выбери обычный режим 'только нода'."
-  fi
-  ok "Панель найдена. Версия образа: $(rm_panel_version || echo unknown)"
   command -v jq >/dev/null 2>&1 || { apt-get update && apt-get install -y jq; }
 
-  set +e
-  token=$(rm_get_token); rc=$?
-  set -e
-  if [[ $rc -eq 2 ]]; then token_mode=manual; token=""; elif [[ $rc -ne 0 ]]; then warn "API-вход не получился; продолжу в ручном режиме."; token_mode=manual; token=""; fi
+  if rm_panel_detected; then
+    ok "Панель найдена. API: ${RM_API_BASE}. Версия образа: $(rm_panel_version || echo unknown)"
+  else
+    warn "Remnawave установлена/была установлена, но API автоматически не найден."
+    echo "Это больше НЕ останавливает мастер: можно указать URL панели или получить готовую ручную инструкцию."
+    local entered_url=""
+    read -r -p "URL панели (пример https://panel.example.com; Enter = ручной режим): " entered_url
+    if [[ -n "$entered_url" ]] && rm_try_api_base "$entered_url"; then
+      ok "API панели найден по адресу ${RM_API_BASE}."
+    else
+      token_mode=manual
+      token=""
+    fi
+  fi
+
+  if [[ "$token_mode" == api ]]; then
+    set +e
+    token=$(rm_get_token); rc=$?
+    set -e
+    if [[ $rc -eq 2 ]]; then token_mode=manual; token=""; elif [[ $rc -ne 0 ]]; then warn "API-вход не получился; продолжу в ручном режиме."; token_mode=manual; token=""; fi
+  fi
 
   if [[ "$token_mode" == api ]]; then
     set +e; node=$(rm_choose_node "$token"); rc=$?; set -e
@@ -573,7 +646,7 @@ run_remna_panel_manager(){
 
   method=$(rm_manager_choose_method) || exit 0
   rm_manager_collect_domains "$method"
-  safe=$(tr '[:upper:]' '[:lower:]' <<<"$node_name" | tr -cd 'a-z0-9_-' | cut -c1-24); [[ -n "$safe" ]] || safe="node"
+  safe=$(tr '[:upper:]' '[:lower:]' <<<"$node_name" | tr -cd 'a-z0-9_-'); safe="${safe:0:24}"; [[ -n "$safe" ]] || safe="node"
   suffix=$(printf '%s' "$node_uuid" | sha256sum | cut -c1-6)
   tag="psv1-${method}-${suffix}"
   profile_name="psv1-${method}-${safe}-${suffix}"
@@ -596,15 +669,43 @@ Inbound tag: $tag
 EOF
   rm_manager_provider_steps "$method" "$node_ip" "$run_dir/provider-steps.txt"
 
-  if [[ "$token_mode" == manual ]]; then
-    cat > "$run_dir/NEXT-STEPS.txt" <<EOF
-1. Config Profiles → Create profile → имя: $profile_name → вставить profile.json.
-2. Node '$node_name' → Change Profile → выбрать $profile_name → включить единственный inbound '$tag'.
-3. Internal Squads → нужный squad → добавить inbound '$tag'.
-4. Hosts → Create host → значения из host.txt; xhttpExtraParams = xhttpExtraParams.json.
-5. Выполнить provider-steps.txt.
+  cat > "$run_dir/NEXT-STEPS.txt" <<EOF
+ПАНЕЛЬ REMNAWAVE — обязательная цепочка для $(method_title "$method")
+================================================================
+1. Config Profiles → Create profile
+   Имя: $profile_name
+   Вставить содержимое: $run_dir/profile.json
+   Внутри уже зашит Xray inbound '$tag' с нужным XHTTP preset.
+
+2. Nodes → '$node_name' → Change Profile
+   Выбрать: $profile_name
+   В Active inbounds ОБЯЗАТЕЛЬНО включить '$tag'.
+   Без этой галочки Xray на ноде не поднимет CDN-порт.
+
+3. Internal Squads
+   Открыть Default-Squad или создать отдельный squad и добавить inbound '$tag'.
+
+4. Users
+   Для каждого пользователя, которому нужен этот CDN: Active internal squads → отметить squad из шага 3.
+   Иначе подписка может вернуть No hosts found.
+
+5. Hosts → Create host
+   Все значения взять из: $run_dir/host.txt
+   xhttpExtraParams вставить БЕЗ ИЗМЕНЕНИЙ из: $run_dir/xhttpExtraParams.json
+
+6. External Squads
+   Для базового XHTTP/CDN НЕ обязательны. Они нужны, если ты отдельно управляешь шаблонами/выдачей подписок.
+   Скрипт их сам не создаёт и существующие External Squads не меняет.
+
+7. CDN-провайдер
+   Выполнить: $run_dir/provider-steps.txt
+
+Проверка цепочки после активации:
+  профиль содержит inbound → профиль назначен ноде → inbound Active → inbound в Internal Squad → пользователь в этом Squad → Host привязан к inbound.
 Ничего существующего удалять не нужно.
 EOF
+
+  if [[ "$token_mode" == manual ]]; then
     ok "Готов комплект ручной настройки: $run_dir"
     cat "$run_dir/NEXT-STEPS.txt"
     return 0
@@ -619,7 +720,9 @@ EOF
       profile_uuid=$(jq -r '.profileUuid' <<<"$ids"); inbound_uuid=$(jq -r '.inboundUuid' <<<"$ids")
       ok "Создан новый Config Profile: $profile_name"
     else
-      warn "API не создал профиль. Ничего существующего не изменено. Используй $run_dir/profile.json вручную."
+      warn "API не создал профиль. Ничего существующего не изменено."
+      echo "Полная пошаговая инструкция: $run_dir/NEXT-STEPS.txt"
+      cat "$run_dir/NEXT-STEPS.txt"
       return 0
     fi
   fi
@@ -676,6 +779,7 @@ EOF
   cat "$summary"
   echo
   echo "Важно: пользователь должен состоять в том Internal Squad, куда добавлен этот inbound. Существующих пользователей скрипт автоматически не переносит."
+  echo "Полный чек-лист панели сохранён: $run_dir/NEXT-STEPS.txt"
   echo
   cat "$run_dir/provider-steps.txt"
 }
@@ -870,14 +974,15 @@ case "${1:-}" in
     exit 0
     ;;
   --manage-remna)
+    load_state || true
     run_remna_panel_manager
     exit 0
     ;;
   --check-remna)
     if rm_panel_detected; then
-      ok "Remnawave обнаружена и отвечает локально. Версия образа: $(rm_panel_version || echo unknown)"
+      ok "Remnawave обнаружена. API: ${RM_API_BASE}. Версия образа: $(rm_panel_version || echo unknown)"
       docker ps --format 'table {{.Names}}\t{{.Status}}' | grep -E 'NAMES|remnawave' || true
-      curl -sS -o /dev/null -w 'API http://127.0.0.1:3000 -> HTTP %{http_code}\n' http://127.0.0.1:3000/api/auth/status || true
+      rm_api GET /api/auth/status '' '' >/dev/null 2>&1 && ok "API отвечает через ${RM_API_BASE}" || true
     else
       die "Работающая Remnawave на этом сервере не найдена."
     fi
@@ -1415,7 +1520,7 @@ xui_create_inbound(){
     rm -f "$cookie"; mark xui_inbound; return 0
   fi
   list=$(curl -sS --max-time 10 -b "$cookie" "$base/panel/api/inbounds/list" 2>/dev/null || true)
-  iid=$(echo "$list" | jq -r --argjson p "$XRAY_PORT" '.obj[]? | select(.port==$p and .protocol=="vless") | .id' | head -1)
+  iid=$(echo "$list" | jq -r --argjson p "$XRAY_PORT" '[.obj[]? | select(.port==$p and .protocol=="vless") | .id][0] // empty')
   if [[ "$iid" =~ ^[0-9]+$ ]]; then
     resp=$(curl -sS --max-time 20 -b "$cookie" -H 'Content-Type: application/json' -X POST --data-binary "$payload" "$base/panel/api/inbounds/update/$iid" 2>/dev/null || true)
   else

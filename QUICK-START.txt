@@ -1,4 +1,6 @@
-panel-script-v1 v1.1.0 — БЫСТРЫЙ СТАРТ
+panel-script-v1 v1.1.2
+
+panel-script-v1 v1.1.1 — БЫСТРЫЙ СТАРТ
 ======================================
 
 ПУБЛИЧНЫЙ GITHUB:
@@ -14,7 +16,7 @@ curl -fsSL https://raw.githubusercontent.com/dagmagnat/panel-script-v1/main/inst
 ЕСЛИ НОД ЕЩЁ НЕТ:
 1) В панели: Nodes -> Create node
 2) Address = IP европейского VPS
-3) Port = 2222
+3) Выбери Node Port в панели (например 2222 или 2233) и запомни его
 4) Скопировать SECRET_KEY
 5) На европейском VPS запустить install.sh
 6) Remnawave -> Только нода -> выбрать CDN
@@ -41,3 +43,9 @@ HTTPS к источнику = ВКЛ
 
 Версия:
 /root/panel-script-v1.sh --version
+
+
+Если --manage-remna не видит localhost:3000:
+- v1.1.2 сам попробует Docker и домен панели;
+- затем можно ввести https://домен-панели;
+- при недоступном API он всё равно создаст ручные файлы и NEXT-STEPS.txt.
