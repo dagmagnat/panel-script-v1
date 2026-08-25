@@ -1,4 +1,8 @@
-# panel-script-v1 — v1.1.3
+# panel-script-v1 — v1.1.4
+
+## 1.1.4 API compatibility fix
+
+API token validation now accepts any successful 2xx JSON response instead of requiring one exact configProfiles wrapper. List parsers support array/items/data wrappers for profiles, nodes, hosts and internal squads. Host creation tries current `xhttpExtraParams` first and legacy `xHttpExtraParams` as fallback.
 
 Универсальный установщик для Remnawave и 3x-ui с CDN/XHTTP-пресетами.
 
@@ -104,3 +108,10 @@ Node Port настраивается в карточке ноды Remnawave и �
 ## API token Remnawave: важное отличие
 
 В окне сведений API Token поле **UUID** — это идентификатор записи, а не секретный token для `Authorization`. Для менеджера нужен именно секретный API token, который выдаётся при создании токена. Скрипт 1.1.3 распознаёт UUID, принимает как чистый token, так и строку с префиксом `Bearer `, и при ошибке показывает HTTP-код вместо аварийного завершения.
+
+
+## Remnawave API: список нод
+
+Начиная с v1.1.5 менеджер не предполагает один фиксированный JSON-wrapper для `GET /api/nodes`. Он ищет массив объектов нод рекурсивно и сохраняет сырой ответ API в `/root/panel-script-v1-output/remna-methods/last-nodes-response.json`. Это устраняет ложное сообщение «в панели нет нод», когда Node видна и Connected в интерфейсе.
+
+External Squads не входят в обязательную цепочку обычного CDN/XHTTP. Для базовой схемы нужны Config Profile/Xray inbound → Node/Active Inbounds → Internal Squad → User → Host. External Squad используется только при отдельной reseller/multi-tenant логике подписок и автоматически не создаётся.

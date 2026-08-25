@@ -11,7 +11,7 @@ IFS=$'\n\t'
 # This installer deliberately keeps each CDN preset separate. Do not mix fields
 # between providers: path/padding/uplink settings are provider-specific.
 
-INSTALLER_VERSION="1.1.4"
+INSTALLER_VERSION="1.1.5"
 STATE_SCHEMA_CURRENT="1"
 PRESET="${INSTALLER_PRESET:-}"
 
@@ -381,65 +381,50 @@ rm_get_token(){
   printf '%s' "$token"
 }
 
+rm_pick_entity_array(){
+  # Usage: rm_pick_entity_array <kind>. Reads one API JSON response on stdin.
+  # Remnawave has changed list wrappers between releases. Instead of assuming
+  # one wrapper, recursively find an array whose elements look like the entity
+  # returned by the endpoint. The endpoint itself limits the search domain.
+  local kind="$1"
+  jq -c --arg kind "$kind" '
+    def looks($k; $o):
+      ($o|type)=="object" and
+      (if $k=="nodes" then (($o.uuid? != null) and ($o.name? != null) and ($o.address? != null))
+       elif $k=="profiles" then (($o.uuid? != null) and ($o.name? != null))
+       elif $k=="hosts" then (($o.uuid? != null) and ($o.address? != null) and (($o.remark? != null) or ($o.inbound? != null)))
+       elif $k=="squads" then (($o.uuid? != null) and ($o.name? != null))
+       else false end);
+    ([.. | arrays | select(length>0 and looks($kind; .[0]))] | sort_by(length) | reverse | .[0]) // []
+  ' 2>/dev/null || echo '[]'
+}
+
 rm_nodes_json(){
-  local token="$1" r
+  local token="$1" r f="$RM_MANAGER_DIR/last-nodes-response.json"
   r=$(rm_api GET /api/nodes "$token" 2>/dev/null || true)
-  jq -c '
-    def list(x):
-      if (x|type)=="array" then x
-      elif (x|type)=="object" and (x.items?|type)=="array" then x.items
-      elif (x|type)=="object" and (x.data?|type)=="array" then x.data
-      else [] end;
-    if (.response|type)=="array" then .response
-    else list(.response.nodes // .nodes // .response.items // .response.data // empty)
-    end
-  ' <<<"$r" 2>/dev/null || echo '[]'
+  printf '%s\n' "$r" > "$f"; chmod 600 "$f" 2>/dev/null || true
+  rm_pick_entity_array nodes <<<"$r"
 }
 
 rm_profiles_json(){
-  local token="$1" r
+  local token="$1" r f="$RM_MANAGER_DIR/last-profiles-response.json"
   r=$(rm_api GET /api/config-profiles "$token" 2>/dev/null || true)
-  jq -c '
-    def list(x):
-      if (x|type)=="array" then x
-      elif (x|type)=="object" and (x.items?|type)=="array" then x.items
-      elif (x|type)=="object" and (x.data?|type)=="array" then x.data
-      elif (x|type)=="object" and (x.profiles?|type)=="array" then x.profiles
-      else [] end;
-    list(.response.configProfiles // .configProfiles // .response.profiles // .response.items // .response.data // empty)
-  ' <<<"$r" 2>/dev/null || echo '[]'
+  printf '%s\n' "$r" > "$f"; chmod 600 "$f" 2>/dev/null || true
+  rm_pick_entity_array profiles <<<"$r"
 }
 
 rm_hosts_json(){
-  local token="$1" r
+  local token="$1" r f="$RM_MANAGER_DIR/last-hosts-response.json"
   r=$(rm_api GET /api/hosts "$token" 2>/dev/null || true)
-  jq -c '
-    def list(x):
-      if (x|type)=="array" then x
-      elif (x|type)=="object" and (x.items?|type)=="array" then x.items
-      elif (x|type)=="object" and (x.data?|type)=="array" then x.data
-      elif (x|type)=="object" and (x.hosts?|type)=="array" then x.hosts
-      else [] end;
-    if (.response|type)=="array" then .response
-    else list(.response.hosts // .hosts // .response.items // .response.data // empty)
-    end
-  ' <<<"$r" 2>/dev/null || echo '[]'
+  printf '%s\n' "$r" > "$f"; chmod 600 "$f" 2>/dev/null || true
+  rm_pick_entity_array hosts <<<"$r"
 }
 
 rm_internal_squads_json(){
-  local token="$1" r
+  local token="$1" r f="$RM_MANAGER_DIR/last-internal-squads-response.json"
   r=$(rm_api GET /api/internal-squads "$token" 2>/dev/null || true)
-  jq -c '
-    def list(x):
-      if (x|type)=="array" then x
-      elif (x|type)=="object" and (x.items?|type)=="array" then x.items
-      elif (x|type)=="object" and (x.data?|type)=="array" then x.data
-      elif (x|type)=="object" and (x.internalSquads?|type)=="array" then x.internalSquads
-      else [] end;
-    if (.response|type)=="array" then .response
-    else list(.response.internalSquads // .internalSquads // .response.items // .response.data // empty)
-    end
-  ' <<<"$r" 2>/dev/null || echo '[]'
+  printf '%s\n' "$r" > "$f"; chmod 600 "$f" 2>/dev/null || true
+  rm_pick_entity_array squads <<<"$r"
 }
 
 rm_choose_node(){
@@ -772,7 +757,16 @@ run_remna_panel_manager(){
     if node=$(rm_choose_node "$token"); then rc=0; else rc=$?; fi
     if [[ $rc -eq 2 ]]; then
       echo
-      warn "В панели пока нет ни одной ноды. Сначала создай её."
+      # Do not state that the panel is empty unless the API response really
+      # contains no node-like object. A changed response wrapper used to cause
+      # a false "no nodes" message even while Nodes UI showed a connected node.
+      if jq -e '.. | objects | select((.uuid? != null) and (.name? != null) and (.address? != null))' "$RM_MANAGER_DIR/last-nodes-response.json" >/dev/null 2>&1; then
+        warn "API вернул ноду, но формат ответа этой сборки Remnawave пока не разобран. Панель НЕ пустая."
+        warn "Сырой ответ сохранён: $RM_MANAGER_DIR/last-nodes-response.json"
+        echo "Скрипт не будет создавать/перезаписывать сущности вслепую. Обнови installer и запусти --manage-remna снова."
+        exit 0
+      fi
+      warn "API действительно не вернул ни одной ноды. Сначала создай её."
       echo "1. Панель → Nodes → Create node."
       echo "2. Address = IP европейского VPS; Node Port выбери свободный (например 2222/2233) и запомни."
       echo "3. Скопируй SECRET_KEY."
@@ -845,8 +839,8 @@ EOF
    xhttpExtraParams вставить БЕЗ ИЗМЕНЕНИЙ из: $run_dir/xhttpExtraParams.json
 
 6. External Squads
-   Для базового XHTTP/CDN НЕ обязательны. Они нужны, если ты отдельно управляешь шаблонами/выдачей подписок.
-   Скрипт их сам не создаёт и существующие External Squads не меняет.
+   Для базового XHTTP/CDN НЕ являются частью обязательной цепочки и специально не создаются автоматически.
+   Они нужны для отдельной логики внешних/реселлерских групп и выдачи подписок. Существующие External Squads не меняются.
 
 7. CDN-провайдер
    Выполнить: $run_dir/provider-steps.txt
