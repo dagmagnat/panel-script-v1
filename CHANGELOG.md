@@ -1,5 +1,16 @@
 # Changelog
 
+## 1.2.1
+
+- Remnawave `--cascade`: добавлен выбор **одной exit-ноды или нескольких exit-нод** из списка уже подключённых нод.
+- Multi-exit режим создаёт отдельный `BRIDGE_IN :8888`/bridge-user для каждой exit-ноды и сохраняет существующие Active Inbounds.
+- Relay profile для пула создаёт `VLESS_EXIT_*` и Xray `routing.balancers` с `balancerTag=EXIT_POOL`.
+- Доступные безопасные стратегии пула: `roundRobin` (по умолчанию) и `random`; `leastPing`/`leastLoad` не включаются автоматически без observatory.
+- При повторном запуске bridge-user переиспользуется до сравнения relay profile, поэтому случайный новый UUID больше не должен вызывать ложное предложение переписать существующий cascade profile.
+- Состояние сохраняет режим/список exit (`CASCADE_EXIT_MODE`, `CASCADE_EXIT_NODE_UUIDS`, `CASCADE_EXIT_IPS`, `CASCADE_STRATEGY`) при сохранении совместимых одиночных полей.
+- Итоги каскада теперь содержат `selected-exits.json`, `exit-pool.json`, общий `EXIT-STEPS.txt` и проверки всех `exit:8888`.
+- Уточнён текст про Remnawave admin: сгенерированные данные — только подсказка для ручной регистрации; установщик не задаёт реальный пароль администратора.
+
 ## 1.2.0
 
 - Каскад стал отдельным режимом: `--cascade`.
