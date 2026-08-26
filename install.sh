@@ -11,7 +11,7 @@ IFS=$'\n\t'
 # This installer deliberately keeps each CDN preset separate. Do not mix fields
 # between providers: path/padding/uplink settings are provider-specific.
 
-INSTALLER_VERSION="1.2.1"
+INSTALLER_VERSION="1.2.3"
 STATE_SCHEMA_CURRENT="1"
 PRESET="${INSTALLER_PRESET:-}"
 
@@ -130,7 +130,7 @@ save_state(){
   umask 077
   {
     printf 'STATE_SCHEMA=%q\n' "$STATE_SCHEMA_CURRENT"
-    for k in PANEL_KIND REMNA_ROLE METHOD REMNA_VERSION REMNA_NODE_PORT XUI_VERSION UPGRADE_XUI_XRAY XUI_EXISTING PANEL_DOMAIN ORIGIN_DOMAIN CDN_DOMAIN USE_CLOUDFLARE ENABLE_UFW ENABLE_BBR CASCADE CASCADE_METHOD CASCADE_RELAY_NODE_UUID CASCADE_EXIT_MODE CASCADE_EXIT_NODE_UUID CASCADE_EXIT_NODE_UUIDS CASCADE_RELAY_IP CASCADE_EXIT_IP CASCADE_EXIT_IPS CASCADE_STRATEGY CASCADE_BRIDGE_UUID CASCADE_STATUS LE_EMAIL PANEL_IP REMNA_SECRET_KEY XUI_USER XUI_PASS XUI_PANEL_PORT XUI_PATH; do
+    for k in PANEL_KIND REMNA_ROLE METHOD REMNA_VERSION REMNA_NODE_PORT REMNA_EXISTING_PANEL_SIDE_BY_SIDE XUI_VERSION UPGRADE_XUI_XRAY XUI_EXISTING PANEL_DOMAIN ORIGIN_DOMAIN CDN_DOMAIN USE_CLOUDFLARE ENABLE_UFW ENABLE_BBR CASCADE CASCADE_METHOD CASCADE_RELAY_NODE_UUID CASCADE_EXIT_MODE CASCADE_EXIT_NODE_UUID CASCADE_EXIT_NODE_UUIDS CASCADE_RELAY_IP CASCADE_EXIT_IP CASCADE_EXIT_IPS CASCADE_STRATEGY CASCADE_BRIDGE_UUID CASCADE_STATUS LE_EMAIL PANEL_IP REMNA_SECRET_KEY XUI_USER XUI_PASS XUI_PANEL_PORT XUI_PATH; do
       printf '%s=%q\n' "$k" "${!k:-}"
     done
   } > "$t"
@@ -148,9 +148,35 @@ load_state(){
 method_title(){
   case "$1" in
     vk) echo "VK Cloud" ;; yandex) echo "Yandex Cloud" ;; beeline) echo "Beeline CDN/CDNvideo" ;;
-    timeweb) echo "Timeweb CDN" ;; selectel) echo "Selectel CDN" ;; turboflare) echo "TurboFlare" ;; *) echo "$1" ;;
+    timeweb) echo "Timeweb CDN" ;; selectel) echo "Selectel CDN" ;; turboflare) echo "TurboFlare" ;;
+    none) echo "Без CDN / нода для каскада" ;; *) echo "$1" ;;
   esac
 }
+
+local_remna_panel_present(){
+  if command -v docker >/dev/null 2>&1 && docker inspect remnawave >/dev/null 2>&1; then
+    return 0
+  fi
+  [[ -f /opt/remnawave/docker-compose.yml && -f /opt/remnawave/.env ]]
+}
+
+is_side_by_side_remna_node(){
+  [[ "${PANEL_KIND:-}" == remna && "${REMNA_ROLE:-}" == node ]] || return 1
+  [[ "${REMNA_EXISTING_PANEL_SIDE_BY_SIDE:-no}" == yes ]] && return 0
+  local_remna_panel_present
+}
+
+is_bare_remna_node(){
+  [[ "${PANEL_KIND:-}" == remna && "${REMNA_ROLE:-}" == node && "${METHOD:-none}" == none ]]
+}
+
+nginx_foreign_enabled_sites(){
+  [[ -d /etc/nginx/sites-enabled ]] || return 1
+  find /etc/nginx/sites-enabled -mindepth 1 -maxdepth 1 -printf '%f\n' 2>/dev/null \
+    | grep -Ev '^(default|cdn-bootstrap\.conf|cdn-origin\.conf|remnawave-panel\.conf)$' \
+    | grep -q .
+}
+
 method_port(){
   case "$PANEL_KIND:$METHOD" in
     3xui:vk) echo 2053 ;; 3xui:yandex) echo 4443 ;; 3xui:turboflare) echo 10089 ;;
@@ -373,8 +399,10 @@ rm_get_token(){
   echo "  1 — логин и пароль администратора панели (проще)" >&2
   echo "  2 — вставить API token" >&2
   echo "  3 — без API: только подготовить JSON и пошаговую инструкцию" >&2
+  echo "  0 — назад" >&2
   read -r -p "Выбор [1]: " choice; choice="${choice:-1}"
   case "$choice" in
+    0) return 10 ;;
     3) return 2 ;;
     2)
       read -r -s -p "API token (НЕ UUID записи токена): " token; echo >&2
@@ -500,18 +528,27 @@ rm_internal_squads_json(){
 }
 
 rm_choose_node(){
-  local token="$1" nodes n count i choice nrc=0
+  local token="$1" exclude_uuid="${2:-}" nodes filtered n count i choice nrc=0
   if nodes=$(rm_nodes_json "$token"); then nrc=0; else nrc=$?; fi
   [[ $nrc -eq 0 ]] || return "$nrc"
-  count=$(jq 'length' <<<"$nodes")
+  if [[ -n "$exclude_uuid" ]]; then
+    filtered=$(jq -c --arg x "$exclude_uuid" '[.[]? | select((.uuid // "") != $x)]' <<<"$nodes")
+  else
+    filtered="$nodes"
+  fi
+  count=$(jq 'length' <<<"$filtered")
   if (( count == 0 )); then
     return 2
   fi
   echo >&2
-  echo "Ноды, которые уже есть в панели:" >&2
+  if [[ -n "$exclude_uuid" ]]; then
+    echo "Ноды, доступные для выбора (предыдущая нода исключена):" >&2
+  else
+    echo "Ноды, которые уже есть в панели:" >&2
+  fi
   i=1
   while (( i <= count )); do
-    n=$(jq -c ".[${i}-1]" <<<"$nodes")
+    n=$(jq -c ".[${i}-1]" <<<"$filtered")
     printf '  %d — %s | %s:%s | connected=%s\n' "$i" \
       "$(jq -r '.name // "без имени"' <<<"$n")" \
       "$(jq -r '.address // "?"' <<<"$n")" \
@@ -519,12 +556,14 @@ rm_choose_node(){
       "$(jq -r '.isConnected // .is_connected // false' <<<"$n")" >&2
     ((i++))
   done
+  echo "  0 — назад" >&2
   while true; do
     read -r -p "Выбери ноду [1]: " choice; choice="${choice:-1}"
+    [[ "$choice" == 0 ]] && return 1
     [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= count )) && break
-    warn "Выбери число от 1 до $count." >&2
+    warn "Выбери число от 1 до $count или 0 для возврата." >&2
   done
-  jq -c ".[${choice}-1]" <<<"$nodes"
+  jq -c ".[${choice}-1]" <<<"$filtered"
 }
 
 
@@ -550,9 +589,11 @@ rm_choose_multiple_nodes(){
     ((i++))
   done
 
+  echo "  0 — назад" >&2
   while true; do
-    read -r -p "Выбери exit-ноды через запятую (например 1,3,4): " raw
+    read -r -p "Выбери exit-ноды через запятую (например 1,3,4; 0 = назад): " raw
     raw="${raw// /}"
+    [[ "$raw" == 0 ]] && return 1
     [[ -n "$raw" ]] || { warn "Нужно выбрать хотя бы одну exit-ноду." >&2; continue; }
     IFS=',' read -r -a picks <<<"$raw"
     result='[]'
@@ -777,7 +818,9 @@ rm_api_add_to_squad(){
     sq=$(jq -c ".[${choice}-1]" <<<"$squads")
     printf '  %d — %s\n' "$choice" "$(jq -r '.name // .uuid' <<<"$sq")"
   done
+  echo "  0 — назад"
   read -r -p "Выбор [1]: " choice; choice="${choice:-1}"
+  [[ "$choice" == 0 ]] && return 2
   [[ "$choice" =~ ^[0-9]+$ ]] && (( choice>=1 && choice<=count )) || choice=1
   sq=$(jq -c ".[${choice}-1]" <<<"$squads")
   uuid=$(jq -r '.uuid' <<<"$sq")
@@ -1378,6 +1421,7 @@ rm_api_ensure_bridge_user(){
 run_remna_cascade_manager(){
   local token nodes count relay relay_uuid relay_name relay_ip method pool_suffix relay_tag relay_config relay_profile_name relay_ids relay_profile_uuid relay_inbound_uuid relay_active squad_uuid host_uuid="" extra run_dir profile_doc existing_cfg desired_hash current_hash update_profile=no
   local exit_mode exit_mode_choice exits exit_count strategy_choice strategy first_exit first_exit_uuid first_exit_ip exit_keys exit_records='[]'
+  local panel_public_ip="" relay_addr_ip="" relay_on_panel=no relay_proxy_note=""
   local i e e_uuid e_name e_ip e_suffix bridge_tag bridge_uuid bridge_info exit_profile_uuid bridge_inbound_uuid exit_profile_name exit_dir record user_name b inbs
 
   echo
@@ -1387,7 +1431,14 @@ run_remna_cascade_manager(){
   user_prepare "CDN/origin должен смотреть на relay, не на exit. Базовый CDN сначала проверь отдельно."
   if ! rm_panel_detected; then die "Запусти --cascade на сервере центральной Remnawave-панели."; fi
   ok "Панель найдена: ${RM_API_BASE}. Версия: $(rm_panel_version || echo unknown)"
-  token=$(rm_get_token) || { warn "Для автоматического каскада нужен API token; без него изменения панели не выполняю."; return 0; }
+  if token=$(rm_get_token); then
+    :
+  else
+    local _token_rc=$?
+    [[ $_token_rc -eq 10 ]] && return 0
+    warn "Для автоматического каскада нужен API token; без него изменения панели не выполняю."
+    return 0
+  fi
   nodes=$(rm_nodes_json "$token") || true
   count=$(jq 'length' <<<"$nodes")
   if (( count < 2 )); then
@@ -1396,48 +1447,88 @@ run_remna_cascade_manager(){
     return 0
   fi
 
-  echo
-  ui_title "ВЫБОР RELAY"
-  relay=$(rm_choose_node "$token") || return 1
-  relay_uuid=$(jq -r '.uuid' <<<"$relay"); relay_name=$(jq -r '.name' <<<"$relay"); relay_ip=$(jq -r '.address' <<<"$relay")
-
-  echo
-  ui_title "РЕЖИМ EXIT"
-  echo "  1 — одна exit-нода"
-  echo "  2 — несколько exit-нод (пул, балансировка соединений)"
-  read -r -p "Выбор [1]: " exit_mode_choice; exit_mode_choice="${exit_mode_choice:-1}"
-  if [[ "$exit_mode_choice" == 2 ]]; then
-    exit_mode=pool
-    exits=$(rm_choose_multiple_nodes "$token" "$relay_uuid") || return 1
-    exit_count=$(jq 'length' <<<"$exits")
-    if (( exit_count < 2 )); then
-      warn "Для пула выбрана только одна exit-нода — переключаюсь в одиночный режим."
-      exit_mode=single
+  local _cascade_selection_done=no
+  while true; do
+    echo
+    ui_title "ВЫБОР RELAY"
+    relay=$(rm_choose_node "$token") || return 0
+    relay_uuid=$(jq -r '.uuid' <<<"$relay"); relay_name=$(jq -r '.name' <<<"$relay"); relay_ip=$(jq -r '.address' <<<"$relay")
+    panel_public_ip=$(curl -4 -fsS --max-time 4 https://api.ipify.org 2>/dev/null || true)
+    if valid_ipv4 "$relay_ip"; then
+      relay_addr_ip="$relay_ip"
+    else
+      relay_addr_ip=$(getent ahostsv4 "$relay_ip" 2>/dev/null | awk 'NR==1{print $1}' || true)
     fi
-  else
-    exit_mode=single
+    relay_on_panel=no
+    if local_remna_panel_present && [[ -n "$panel_public_ip" && "$relay_addr_ip" == "$panel_public_ip" ]]; then
+      relay_on_panel=yes
+      danger "Выбранный relay находится на ЭТОМ ЖЕ VPS, где работает Remnawave-панель."
+      manual_do "Не запускай отдельный Caddy на :80/:443 — он конфликтует с nginx панели. Для origin используй отдельный server_name в существующем nginx -> 127.0.0.1:7443."
+    fi
+
     while true; do
       echo
-      ui_title "ВЫБОР EXIT"
-      e=$(rm_choose_node "$token") || return 1
-      e_uuid=$(jq -r '.uuid' <<<"$e")
-      [[ "$e_uuid" != "$relay_uuid" ]] && break
-      warn "Relay и exit должны быть разными нодами."
-    done
-    exits=$(jq -nc --argjson e "$e" '[$e]')
-    exit_count=1
-  fi
+      ui_title "РЕЖИМ EXIT"
+      echo "  1 — одна exit-нода"
+      echo "  2 — несколько exit-нод (пул, балансировка соединений)"
+      echo "  0 — назад к выбору relay"
+      read -r -p "Выбор [1]: " exit_mode_choice; exit_mode_choice="${exit_mode_choice:-1}"
+      case "$exit_mode_choice" in
+        0) break ;;
+        2)
+          exit_mode=pool
+          if ! exits=$(rm_choose_multiple_nodes "$token" "$relay_uuid"); then
+            continue
+          fi
+          exit_count=$(jq 'length' <<<"$exits")
+          if (( exit_count < 2 )); then
+            warn "Для пула выбрана только одна exit-нода — переключаюсь в одиночный режим."
+            exit_mode=single
+          fi
+          ;;
+        1|"")
+          exit_mode=single
+          echo
+          ui_title "ВЫБОР EXIT"
+          if ! e=$(rm_choose_node "$token" "$relay_uuid"); then
+            continue
+          fi
+          e_uuid=$(jq -r '.uuid' <<<"$e")
+          exits=$(jq -nc --argjson e "$e" '[$e]')
+          exit_count=1
+          ;;
+        *)
+          warn "Выбери 1, 2 или 0."
+          continue
+          ;;
+      esac
 
-  strategy=roundRobin
-  if [[ "$exit_mode" == pool ]]; then
-    echo
-    ui_title "СТРАТЕГИЯ EXIT-POOL"
-    echo "  1 — roundRobin (по очереди; рекомендуется для первого теста)"
-    echo "  2 — random (случайный exit для нового соединения)"
-    echo "  leastPing/leastLoad здесь не включаю автоматически: для них нужен observatory."
-    read -r -p "Выбор [1]: " strategy_choice; strategy_choice="${strategy_choice:-1}"
-    [[ "$strategy_choice" == 2 ]] && strategy=random || strategy=roundRobin
-  fi
+      strategy=roundRobin
+      if [[ "$exit_mode" == pool ]]; then
+        echo
+        ui_title "СТРАТЕГИЯ EXIT-POOL"
+        echo "  1 — roundRobin (по очереди; рекомендуется для первого теста)"
+        echo "  2 — random (случайный exit для нового соединения)"
+        echo "  0 — назад к выбору exit"
+        echo "  leastPing/leastLoad здесь не включаю автоматически: для них нужен observatory."
+        while true; do
+          read -r -p "Выбор [1]: " strategy_choice; strategy_choice="${strategy_choice:-1}"
+          case "$strategy_choice" in
+            1|"") strategy=roundRobin; break ;;
+            2) strategy=random; break ;;
+            0) strategy=""; break ;;
+            *) warn "Выбери 1, 2 или 0." ;;
+          esac
+        done
+        [[ -z "$strategy" ]] && continue
+      fi
+
+      _cascade_selection_done=yes
+      break
+    done
+
+    [[ "$_cascade_selection_done" == yes ]] && break
+  done
 
   first_exit=$(jq -c '.[0]' <<<"$exits")
   first_exit_uuid=$(jq -r '.uuid' <<<"$first_exit")
@@ -1448,6 +1539,11 @@ run_remna_cascade_manager(){
   CASCADE_METHOD="$method"; CASCADE_RELAY_NODE_UUID="$relay_uuid"; CASCADE_RELAY_IP="$relay_ip"; CASCADE=yes
   CASCADE_EXIT_MODE="$exit_mode"; CASCADE_EXIT_NODE_UUID="$first_exit_uuid"; CASCADE_EXIT_NODE_UUIDS="$exit_keys"; CASCADE_EXIT_IP="$first_exit_ip"; CASCADE_EXIT_IPS=$(jq -r 'map(.address)|join(",")' <<<"$exits"); CASCADE_STRATEGY="$strategy"
   rm_manager_collect_domains "$method"
+  if [[ "$relay_on_panel" == yes && "$method" == turboflare && -z "${ORIGIN_DOMAIN:-}" ]]; then
+    danger "TurboFlare origin по голому IP:443 нельзя безопасно совместить с панелью на том же :443."
+    manual_do "Для relay на сервере панели задай отдельный origin-домен либо используй отдельный RU relay VPS. Каскад API пока не меняю."
+    return 0
+  fi
   save_state
 
   echo
@@ -1462,6 +1558,9 @@ run_remna_cascade_manager(){
   [[ "$exit_mode" == pool ]] && user_prepare "EXIT_POOL: $exit_count нод, strategy=$strategy. Балансируются НОВЫЕ соединения; один TCP-поток не суммирует скорость нескольких VPS."
   manual_do "DNS/origin CDN должен в итоге указывать на RELAY $relay_ip. Пока не меняй, если текущий direct-метод нужен рабочим."
   manual_do "На relay CDN XHTTP-inbound будет слушать 127.0.0.1:7443. На каждой exit BRIDGE_IN будет слушать TCP 8888."
+  if [[ "$relay_on_panel" == yes ]]; then
+    manual_do "Relay совмещён с панелью: существующий nginx панели сохраняется; нужен отдельный origin-vhost/server_name, проксирующий CDN path на 127.0.0.1:7443."
+  fi
   ask_yes_no _CASCADE_CONTINUE "Продолжить подготовку сущностей каскада в Remnawave API?" "yes"
   [[ "$_CASCADE_CONTINUE" == yes ]] || return 0
 
@@ -1629,11 +1728,16 @@ run_remna_cascade_manager(){
     [[ -n "$host_uuid" ]] && auto_done "Cascade Host создан/найден: $CDN_DOMAIN -> relay inbound." || warn "Cascade Host не создан автоматически."
   fi
 
+  if [[ "$relay_on_panel" == yes ]]; then
+    relay_proxy_note="3. Relay находится на VPS панели: НЕ запускать Caddy на :80/:443. Сохрани nginx панели и добавь отдельный origin server_name -> 127.0.0.1:7443."
+  else
+    relay_proxy_note="3. По присланному мануалу отдельный relay использует Caddy, не nginx; точный Caddyfile установщик не выдумывает."
+  fi
   cat > "$run_dir/RELAY-STEPS.txt" <<EOF
 RELAY ($relay_name / $relay_ip)
 1. CDN/origin должен смотреть на $relay_ip.
 2. Remnawave relay inbound: 127.0.0.1:7443, tag=$relay_tag.
-3. По присланному мануалу relay использует Caddy, не nginx; точный Caddyfile установщик не выдумывает.
+$relay_proxy_note
 4. Node management port разрешай только от IP панели.
 5. Режим exit: $exit_mode; strategy=$strategy; exits=$exit_count.
 EOF
@@ -1671,9 +1775,14 @@ curl -sk https://${CDN_DOMAIN:-CDN_DOMAIN}$(rm_method_meta "$method" path) -o /d
 # RU -> IP relay
 # зарубежные -> один из выбранных exit; при roundRobin/random IP может меняться между НОВЫМИ соединениями.
 EOF
+  if [[ "$relay_on_panel" == yes ]]; then
+    relay_proxy_note="1. Relay на VPS панели: НЕ запускать Caddy на :80/:443; добавить отдельный nginx origin server_name -> 127.0.0.1:7443, не меняя panel vhost/сертификат."
+  else
+    relay_proxy_note="1. Relay: настроить Caddy -> 127.0.0.1:7443 по path выбранного CDN."
+  fi
   cat > "$run_dir/MANUAL-ACTIONS.txt" <<EOF
 [ВРУЧНУЮ] Перед финальным переключением
-1. Relay: настроить Caddy -> 127.0.0.1:7443 по path выбранного CDN.
+$relay_proxy_note
 2. На КАЖДОЙ exit: TCP 8888 доступен с relay и BRIDGE_IN слушает.
 3. DNS/CDN provider: origin должен указывать на RELAY $relay_ip, не на exit.
 4. Users: обычные пользователи, которым нужен cascade Host, должны иметь доступ к Internal Squad с relay inbound.
@@ -1693,7 +1802,7 @@ EOF
   auto_done "На каждой exit подготовлен BRIDGE_IN :8888 и отдельный bridge-user."
   [[ -n "$squad_uuid" ]] && auto_done "Internal Squad: PSV1-CASCADE"
   [[ -n "$host_uuid" ]] && auto_done "Cascade Host: $CDN_DOMAIN"
-  manual_do "Provider-side origin/DNS и Caddy на relay требуют отдельного действия."
+  manual_do "Provider-side origin/DNS и reverse proxy relay требуют отдельного действия (отдельный relay: Caddy; relay на VPS панели: существующий nginx)."
   manual_do "Инструкция relay: $run_dir/RELAY-STEPS.txt"
   manual_do "Все exit:        $run_dir/EXIT-STEPS.txt"
   check_do "Проверки:       $run_dir/VERIFY.txt"
@@ -1763,7 +1872,9 @@ run_remna_panel_manager(){
       :
     else
       rc=$?
-      if [[ $rc -eq 4 ]]; then
+      if [[ $rc -eq 10 ]]; then
+        return 0
+      elif [[ $rc -eq 4 ]]; then
         warn "Похоже, был вставлен UUID токена. Запусти менеджер ещё раз и выбери логин/пароль либо вставь настоящий API token."
         token_mode=manual; token=""
       elif [[ $rc -eq 2 ]]; then
@@ -1790,7 +1901,7 @@ run_remna_panel_manager(){
       echo "Попробовать получить список нод через обычный admin JWT (логин/пароль панели)?"
       echo "  1 — да, войти администратором и продолжить автоматически"
       echo "  2 — перейти в ручной режим с готовыми JSON"
-      echo "  0 — выйти"
+      echo "  0 — назад"
       read -r -p "Выбор [1]: " retry_choice; retry_choice="${retry_choice:-1}"
       case "$retry_choice" in
         1)
@@ -1806,7 +1917,7 @@ run_remna_panel_manager(){
           fi
           ;;
         2) token_mode=manual ;;
-        0) exit 0 ;;
+        0) return 0 ;;
         *) token_mode=manual ;;
       esac
       if [[ "$token_mode" == manual ]]; then
@@ -1817,6 +1928,8 @@ run_remna_panel_manager(){
         valid_ipv4 "$node_ip" || die "Нужен IPv4 ноды."
         node_uuid="manual"
       fi
+    elif [[ $rc -eq 1 ]]; then
+      return 0
     elif [[ $rc -ne 0 ]]; then
       die "Не удалось выбрать ноду."
     fi
@@ -2087,15 +2200,42 @@ show_config(){
 }
 
 choose_panel(){
-  if [[ "$PRESET" == 3xui:* ]]; then PANEL_KIND=3xui; return; fi
-  if [[ "$PRESET" == remna:* ]]; then PANEL_KIND=remna; return; fi
+  if [[ "$PRESET" == 3xui:* ]]; then PANEL_KIND=3xui; return 0; fi
+  if [[ "$PRESET" == remna:* ]]; then PANEL_KIND=remna; return 0; fi
   echo
   echo "Выбери панель:"
   echo "  1 — Remnawave (все 6 методов; лучше для панели + множества нод)"
   echo "  2 — 3x-ui (только VK / Yandex / TurboFlare; совместимый режим v3.3.1)"
-  while true; do read -r -p "Выбор [1]: " a; a="${a:-1}"; case "$a" in 1) PANEL_KIND=remna; break ;; 2) PANEL_KIND=3xui; break ;; esac; done
+  echo "  0 — выйти"
+  while true; do
+    read -r -p "Выбор [1]: " a; a="${a:-1}"
+    case "$a" in 1) PANEL_KIND=remna; return 0 ;; 2) PANEL_KIND=3xui; return 0 ;; 0) return 1 ;; esac
+  done
 }
 choose_remna_role(){
+  if [[ "${REMNA_EXISTING_PANEL_SIDE_BY_SIDE:-no}" == yes && "$PRESET" == "remna:none" ]]; then
+    REMNA_ROLE=node
+    return 0
+  fi
+  if local_remna_panel_present; then
+    echo
+    danger "На этом VPS уже обнаружена существующая Remnawave-панель. Переустановка панели заблокирована."
+    echo "Что сделать с существующей Remnawave?"
+    echo "  1 — добавить/настроить CDN-метод для существующей ноды"
+    echo "  2 — добавить remnanode на ЭТОТ VPS БЕЗ CDN (relay/exit каскада)"
+    echo "  3 — проверить существующую панель"
+    echo "  0 — назад"
+    while true; do
+      read -r -p "Выбор [2]: " a; a="${a:-2}"
+      case "$a" in
+        1) exec "$0" --manage-remna ;;
+        2) REMNA_ROLE=node; METHOD=none; PRESET="remna:none"; REMNA_EXISTING_PANEL_SIDE_BY_SIDE=yes; return 0 ;;
+        3) exec "$0" --check-remna ;;
+        0) return 1 ;;
+        *) warn "Выбери 1, 2, 3 или 0." ;;
+      esac
+    done
+  fi
   echo
   echo "Что сделать с Remnawave?"
   echo "  1 — установить новую центральную панель"
@@ -2103,23 +2243,38 @@ choose_remna_role(){
   echo "  3 — установить только ноду на этом VPS"
   echo "  4 — установить панель + ноду на одном VPS"
   echo "  5 — проверить существующую панель"
-  echo "  0 — выйти"
+  echo "  0 — назад"
   while true; do
     read -r -p "Выбор [2]: " a; a="${a:-2}"
     case "$a" in
-      1) REMNA_ROLE=panel; break ;;
+      1) REMNA_ROLE=panel; return 0 ;;
       2) exec "$0" --manage-remna ;;
-      3) REMNA_ROLE=node; break ;;
-      4) REMNA_ROLE=both; break ;;
+      3) REMNA_ROLE=node; return 0 ;;
+      4) REMNA_ROLE=both; return 0 ;;
       5) exec "$0" --check-remna ;;
-      0) exit 0 ;;
+      0) return 1 ;;
+    esac
+  done
+}
+choose_remna_version(){
+  echo
+  echo "Версия Remnawave:"
+  echo "  1 — $REMNA_MANUAL_VERSION (по присланным мануалам, рекомендуется для первого теста)"
+  echo "  2 — $REMNA_NEWER_VERSION (новее; конфиги методов ещё надо перепроверить на практике)"
+  echo "  0 — назад"
+  while true; do
+    read -r -p "Выбор [1]: " rv; rv="${rv:-1}"
+    case "$rv" in
+      1) REMNA_VERSION="$REMNA_MANUAL_VERSION"; return 0 ;;
+      2) REMNA_VERSION="$REMNA_NEWER_VERSION"; return 0 ;;
+      0) return 1 ;;
     esac
   done
 }
 choose_method(){
   if [[ -n "$PRESET" ]]; then
     METHOD="${PRESET#*:}"
-    return
+    return 0
   fi
   echo
   if [[ "$PANEL_KIND" == 3xui ]]; then
@@ -2127,50 +2282,90 @@ choose_method(){
     echo "  1 — VK Cloud"
     echo "  2 — Yandex Cloud"
     echo "  3 — TurboFlare"
-    while true; do read -r -p "Выбор [3]: " a; a="${a:-3}"; case "$a" in 1) METHOD=vk; break ;; 2) METHOD=yandex; break ;; 3) METHOD=turboflare; break ;; esac; done
+    echo "  0 — назад"
+    while true; do
+      read -r -p "Выбор [3]: " a; a="${a:-3}"
+      case "$a" in 1) METHOD=vk; return 0 ;; 2) METHOD=yandex; return 0 ;; 3) METHOD=turboflare; return 0 ;; 0) return 1 ;; esac
+    done
   else
-    echo "Метод CDN:"
+    echo "Метод / назначение ноды:"
     echo "  1 — VK Cloud"
     echo "  2 — Yandex Cloud"
     echo "  3 — Beeline / CDNvideo"
     echo "  4 — Timeweb"
     echo "  5 — Selectel"
     echo "  6 — TurboFlare"
-    while true; do read -r -p "Выбор [6]: " a; a="${a:-6}"; case "$a" in 1) METHOD=vk; break ;; 2) METHOD=yandex; break ;; 3) METHOD=beeline; break ;; 4) METHOD=timeweb; break ;; 5) METHOD=selectel; break ;; 6) METHOD=turboflare; break ;; esac; done
+    if [[ "${REMNA_ROLE:-}" == node || "${REMNA_ROLE:-}" == both ]]; then
+      echo "  7 — БЕЗ CDN — только нода для каскада (relay/exit)"
+    fi
+    echo "  0 — назад"
+    local default_method=6
+    if [[ "${REMNA_ROLE:-}" == node ]] && local_remna_panel_present; then
+      default_method=7
+      user_prepare "На этом VPS уже обнаружена Remnawave-панель: безопасный выбор по умолчанию — служебная нода БЕЗ CDN."
+    fi
+    while true; do
+      read -r -p "Выбор [$default_method]: " a; a="${a:-$default_method}"
+      case "$a" in
+        1) METHOD=vk; return 0 ;;
+        2) METHOD=yandex; return 0 ;;
+        3) METHOD=beeline; return 0 ;;
+        4) METHOD=timeweb; return 0 ;;
+        5) METHOD=selectel; return 0 ;;
+        6) METHOD=turboflare; return 0 ;;
+        7) if [[ "${REMNA_ROLE:-}" == node || "${REMNA_ROLE:-}" == both ]]; then METHOD=none; return 0; fi ;;
+        0) return 1 ;;
+      esac
+    done
   fi
 }
+
 
 collect_config(){
   echo
   echo "=== CDN/XHTTP Universal Installer $INSTALLER_VERSION ==="
   echo "Примеры доменов вымышленные; реальные домены в код не зашиваются."
-  choose_panel
-  if [[ "$PANEL_KIND" == remna ]]; then
-    choose_remna_role
-    echo
-    echo "Версия Remnawave:"
-    echo "  1 — $REMNA_MANUAL_VERSION (по присланным мануалам, рекомендуется для первого теста)"
-    echo "  2 — $REMNA_NEWER_VERSION (новее; конфиги методов ещё надо перепроверить на практике)"
-    read -r -p "Выбор [1]: " rv; rv="${rv:-1}"; [[ "$rv" == 2 ]] && REMNA_VERSION="$REMNA_NEWER_VERSION" || REMNA_VERSION="$REMNA_MANUAL_VERSION"
-    XUI_VERSION=""
-    if [[ "$REMNA_ROLE" == both ]]; then
-      echo "Для panel+node выбери Node Port сейчас, а в окне создания ноды укажи ТО ЖЕ значение."
-      ask_port REMNA_NODE_PORT "Node Port" "${REMNA_NODE_PORT:-2222}"
-    fi
-  else
-    REMNA_ROLE=""; REMNA_VERSION=""
-    XUI_VERSION="$XUI_COMPAT_VERSION"
-    echo
-    warn "3x-ui фиксируется на $XUI_VERSION: в этих мануалах ссылка строится через legacy External Proxy."
-    warn "Новые версии 3x-ui используют другой механизм Hosts; их не включаю автоматически до отдельной проверки."
-    ask_yes_no UPGRADE_XUI_XRAY "После установки заменить bundled Xray на $XRAY_MANUAL_VERSION? (мануалы рекомендуют; для уже рабочего TurboFlare 26.6.1 менять не обязательно)" "no"
-  fi
+  local _stage=panel
+  while true; do
+    case "$_stage" in
+      panel)
+        choose_panel || exit 0
+        if [[ "$PANEL_KIND" == remna ]]; then _stage=remna_role; else _stage=xui_method; fi
+        ;;
+      remna_role)
+        if choose_remna_role; then _stage=remna_version; else _stage=panel; fi
+        ;;
+      remna_version)
+        if choose_remna_version; then
+          XUI_VERSION=""
+          if [[ "$REMNA_ROLE" == both ]]; then
+            echo "Для panel+node выбери Node Port сейчас, а в окне создания ноды укажи ТО ЖЕ значение."
+            ask_port REMNA_NODE_PORT "Node Port" "${REMNA_NODE_PORT:-2222}"
+          fi
+          if [[ "$REMNA_ROLE" == panel ]]; then METHOD=none; _stage=done; else _stage=remna_method; fi
+        else
+          _stage=remna_role
+        fi
+        ;;
+      remna_method)
+        if choose_method; then _stage=done; else _stage=remna_version; fi
+        ;;
+      xui_method)
+        REMNA_ROLE=""; REMNA_VERSION=""
+        XUI_VERSION="$XUI_COMPAT_VERSION"
+        echo
+        warn "3x-ui фиксируется на $XUI_VERSION: в этих мануалах ссылка строится через legacy External Proxy."
+        warn "Новые версии 3x-ui используют другой механизм Hosts; их не включаю автоматически до отдельной проверки."
+        ask_yes_no UPGRADE_XUI_XRAY "После установки заменить bundled Xray на $XRAY_MANUAL_VERSION? (мануалы рекомендуют; для уже рабочего TurboFlare 26.6.1 менять не обязательно)" "no"
+        if choose_method; then _stage=done; else _stage=panel; fi
+        ;;
+      done) break ;;
+    esac
+  done
 
-  # Для отдельной центральной Remnawave-панели CDN не нужен.
-  if [[ "$PANEL_KIND" == remna && "$REMNA_ROLE" == panel ]]; then
-    METHOD=none
-  else
-    choose_method
+  if [[ "$PANEL_KIND" == remna && "$REMNA_ROLE" == node ]] && local_remna_panel_present; then
+    REMNA_EXISTING_PANEL_SIDE_BY_SIDE=yes
+    auto_done "Обнаружена локальная Remnawave-панель: включён защитный режим panel+node."
   fi
 
   if [[ "$PANEL_KIND" == remna && ( "$REMNA_ROLE" == panel || "$REMNA_ROLE" == both ) ]]; then
@@ -2184,7 +2379,7 @@ collect_config(){
     XUI_PANEL_PORT="${XUI_PANEL_PORT:-$((47115 + RANDOM % 1000))}"
     XUI_PATH="${XUI_PATH:-$(random_path)}"
   else
-    PANEL_DOMAIN=""
+    [[ "${REMNA_EXISTING_PANEL_SIDE_BY_SIDE:-no}" == yes ]] || PANEL_DOMAIN=""
   fi
 
   ORIGIN_DOMAIN="${ORIGIN_DOMAIN:-}"
@@ -2228,22 +2423,47 @@ collect_config(){
     USE_CLOUDFLARE="${USE_CLOUDFLARE:-yes}"
   fi
 
-  read -r -p "Email для Let's Encrypt (Enter = без email)${LE_EMAIL:+ [$LE_EMAIL]}: " _mail
-  LE_EMAIL="${_mail:-${LE_EMAIL:-}}"
-  ask_yes_no ENABLE_UFW "Настроить UFW: входящие SSH/80/443, исходящие разрешены? (рекомендуется)" "yes"
-  ask_yes_no ENABLE_BBR "Включить BBR + базовый TCP-тюнинг? (рекомендуется)" "yes"
-  if [[ "$METHOD" == none ]]; then
-    CASCADE=no
+  if is_bare_remna_node; then
+    LE_EMAIL=""
+    ENABLE_UFW=no
+    ask_yes_no ENABLE_BBR "Включить BBR + базовый TCP-тюнинг? (рекомендуется)" "yes"
+    CASCADE=yes
+    if is_side_by_side_remna_node; then
+      REMNA_EXISTING_PANEL_SIDE_BY_SIDE=yes
+      info "На этом VPS уже есть Remnawave-панель. Служебная нода не будет переписывать nginx/ACME/UFW панели."
+    else
+      REMNA_EXISTING_PANEL_SIDE_BY_SIDE=no
+    fi
   else
-    ask_yes_no CASCADE "Нужен каскад? (CDN -> RU relay -> один или несколько foreign exit; выбор делается через --cascade)" "no"
+    read -r -p "Email для Let's Encrypt (Enter = без email)${LE_EMAIL:+ [$LE_EMAIL]}: " _mail
+    LE_EMAIL="${_mail:-${LE_EMAIL:-}}"
+    if is_side_by_side_remna_node; then
+      ENABLE_UFW=no
+      danger "На этом VPS уже работает Remnawave-панель: UFW/nginx панели автоматически не переписываю."
+      manual_do "Для CDN-ноды на том же VPS origin-vhost нужно добавлять отдельно и без замены panel vhost. Для каскада безопаснее выбрать 'БЕЗ CDN'."
+    else
+      ask_yes_no ENABLE_UFW "Настроить UFW: входящие SSH/80/443, исходящие разрешены? (рекомендуется)" "yes"
+    fi
+    ask_yes_no ENABLE_BBR "Включить BBR + базовый TCP-тюнинг? (рекомендуется)" "yes"
+    if [[ "$METHOD" == none ]]; then
+      CASCADE=no
+    else
+      ask_yes_no CASCADE "Нужен каскад? (CDN -> RU relay -> один или несколько foreign exit; выбор делается через --cascade)" "no"
+    fi
   fi
 
   if [[ "$PANEL_KIND" == remna && "$REMNA_ROLE" == node ]]; then
+    if [[ "$METHOD" == none ]]; then
+      echo
+      user_prepare "Это служебная Remnawave Node без CDN. Она нужна как relay или exit для --cascade."
+      user_prepare "Сначала создай эту Node в панели. Для сервера панели + ноды на одном VPS используй публичный IP этого VPS и свободный Node Port."
+      manual_do "CDN-метод, origin-домен и Host сейчас НЕ создаются — их подготовит мастер --cascade на центральной панели."
+    fi
     read -r -p "IP сервера панели Remnawave: " PANEL_IP
     while ! valid_ipv4 "$PANEL_IP"; do read -r -p "Нужен IPv4 панели: " PANEL_IP; done
     echo "Node Port — это поле 'Node Port' в окне создания ноды. Он НЕ обязан быть 2222."
     ask_port REMNA_NODE_PORT "Node Port из панели Remnawave" "${REMNA_NODE_PORT:-2222}"
-    read -r -p "SECRET_KEY ноды из панели Remnawave: " REMNA_SECRET_KEY
+    read -r -s -p "SECRET_KEY ноды из панели Remnawave (ввод скрыт): " REMNA_SECRET_KEY; echo
     [[ -n "$REMNA_SECRET_KEY" ]] || die "Для node-only нужен SECRET_KEY."
   fi
   save_state
@@ -2331,17 +2551,26 @@ if load_state; then
     echo
     echo "Remnawave на этом сервере уже была установлена этим скриптом."
     echo "  1 — добавить/настроить новый CDN-метод для существующей ноды"
-    echo "  2 — каскад: relay -> один exit / пул exit-нод"
-    echo "  3 — проверить текущую установку этого сервера"
-    echo "  4 — показать сохранённый результат"
-    echo "  5 — начать новую задачу (сбросить только ответы установщика)"
+    echo "  2 — добавить remnanode на ЭТОТ VPS без CDN (для relay/exit каскада)"
+    echo "  3 — каскад: relay -> один exit / пул exit-нод"
+    echo "  4 — проверить текущую установку этого сервера"
+    echo "  5 — показать сохранённый результат"
+    echo "  6 — начать новую задачу (сбросить только ответы установщика)"
     echo "  0 — выйти"
     read -r -p "Выбор [1]: " _done_action; _done_action="${_done_action:-1}"
     case "$_done_action" in
       1) exec "$0" --manage-remna ;;
-      2) exec "$0" --cascade ;;
-      4) [[ -f "$RESULT_FILE" ]] && cat "$RESULT_FILE"; exit 0 ;;
-      5) rm -f "$STATE_FILE"; rm -rf "$MARK_DIR"; mkdir -p "$MARK_DIR"; collect_config ;;
+      2)
+        # Keep panel state/markers intact; only start a new node task.
+        rm -f "$MARK_DIR/complete"
+        PRESET="remna:none"
+        PANEL_KIND=remna; REMNA_ROLE=node; METHOD=none; REMNA_EXISTING_PANEL_SIDE_BY_SIDE=yes
+        collect_config
+        ;;
+      3) exec "$0" --cascade ;;
+      4) exec "$0" --check-remna ;;
+      5) [[ -f "$RESULT_FILE" ]] && cat "$RESULT_FILE"; exit 0 ;;
+      6) rm -f "$STATE_FILE"; rm -rf "$MARK_DIR"; mkdir -p "$MARK_DIR"; collect_config ;;
       0) exit 0 ;;
       *) : ;;
     esac
@@ -2388,7 +2617,14 @@ if ! marked packages; then
   info "Ставлю системные пакеты..."
   export DEBIAN_FRONTEND=noninteractive
   apt-get update
-  apt-get upgrade -y
+  if is_bare_remna_node || is_side_by_side_remna_node; then
+    # A node task on a VPS that already hosts the panel must never replace the
+    # active reverse proxy, certificates or firewall policy.
+    apt-get install -y curl jq ca-certificates openssl uuid-runtime unzip iptables dnsutils
+    auto_done "Защитный node-режим: nginx/certbot/UFW и полный apt upgrade панели не трогаю."
+    mark packages
+  else
+    apt-get upgrade -y
   # Do not install ufw together with iptables-persistent. On Ubuntu 24.04
   # (including some provider mirrors) those packages conflict, and
   # netfilter-persistent may be unavailable. We only need plain iptables;
@@ -2403,6 +2639,7 @@ if ! marked packages; then
     apt-get install -y ufw
   fi
   mark packages
+  fi
 fi
 
 if [[ "${ENABLE_BBR:-yes}" == yes ]] && ! marked tuning; then
@@ -2448,6 +2685,10 @@ if [[ "${ENABLE_UFW:-yes}" == yes ]] && ! marked firewall; then
   mark firewall
 fi
 
+PANEL_CERT_OK=no
+ORIGIN_CERT_OK=no
+
+if ! is_bare_remna_node && ! is_side_by_side_remna_node; then
 # Placeholder and safe bootstrap nginx. The permissions below intentionally repair
 # an earlier installer bug where umask 077 made ACME webroot return HTTP 403.
 umask 022
@@ -2469,8 +2710,13 @@ fi
 
 write_bootstrap_nginx(){
   info "Готовлю безопасный nginx bootstrap до Certbot..."
-  cp -a /etc/nginx/nginx.conf "$BACKUP_DIR/nginx.conf.$(date +%Y%m%d-%H%M%S)" 2>/dev/null || true
   mkdir -p /etc/nginx/sites-available /etc/nginx/sites-enabled
+  if nginx_foreign_enabled_sites; then
+    danger "В /etc/nginx/sites-enabled найдены чужие/неизвестные vhost. Автоматически очищать каталог нельзя."
+    find /etc/nginx/sites-enabled -mindepth 1 -maxdepth 1 -printf '  - %f\n' >&2 2>/dev/null || true
+    die "Bootstrap nginx остановлен ДО изменений. Используй чистый VPS или перенеси/объедини существующие vhost вручную."
+  fi
+  cp -a /etc/nginx/nginx.conf "$BACKUP_DIR/nginx.conf.$(date +%Y%m%d-%H%M%S)" 2>/dev/null || true
   mkdir -p "$BACKUP_DIR/sites-enabled-before-bootstrap"
   cp -a /etc/nginx/sites-enabled/. "$BACKUP_DIR/sites-enabled-before-bootstrap/" 2>/dev/null || true
   find /etc/nginx/sites-enabled -mindepth 1 -maxdepth 1 -exec rm -rf {} +
@@ -2572,6 +2818,13 @@ ORIGIN_CERT_OK=no
 if [[ -n "${ORIGIN_DOMAIN:-}" ]]; then
   [[ -s /etc/letsencrypt/live/cdn-origin/fullchain.pem ]] && ORIGIN_CERT_OK=yes || certbot_for_domain "$ORIGIN_DOMAIN" cdn-origin && ORIGIN_CERT_OK=yes || true
 fi
+else
+  if is_side_by_side_remna_node; then
+    info "Защитный режим panel+node: существующий nginx/ACME панели не изменяю и bootstrap не включаю."
+  else
+    info "Служебная нода без CDN: существующий nginx/ACME на сервере не изменяю."
+  fi
+fi
 
 install_docker(){
   command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1 && return 0
@@ -2581,6 +2834,9 @@ install_docker(){
 
 install_remna_panel(){
   marked remna_panel && return 0
+  if local_remna_panel_present; then
+    die "На диске/в Docker уже обнаружена Remnawave-панель. Автопереустановка и перезапись /opt/remnawave/.env заблокированы; используй режим существующей панели."
+  fi
   install_docker
   local app_secret pg_pass metrics_pass webhook
   app_secret=$(openssl rand -hex 64); pg_pass=$(openssl rand -hex 24); metrics_pass=$(openssl rand -hex 16); webhook=$(openssl rand -hex 32)
@@ -2675,9 +2931,24 @@ download_xray(){
 }
 
 install_remna_node(){
-  marked remna_node && return 0
+  if marked remna_node; then
+    if docker inspect remnanode >/dev/null 2>&1; then
+      return 0
+    fi
+    warn "Маркер remna_node есть, но контейнер remnanode не найден — восстанавливаю ноду."
+    rm -f "$MARK_DIR/remna_node"
+  fi
   ensure_remna_node_port
   install_docker
+
+  if docker inspect remnanode >/dev/null 2>&1; then
+    danger "Контейнер remnanode уже существует, но не принадлежит текущей незавершённой задаче установщика."
+    manual_do "Его .env/SECRET_KEY автоматически НЕ перезаписываются. Для изменения связи используй --node-credentials."
+    return 0
+  fi
+  if ss -ltnp 2>/dev/null | awk '{print $4}' | grep -Eq "(^|:)$REMNA_NODE_PORT$"; then
+    die "Node Port $REMNA_NODE_PORT уже занят. Выбери другой свободный порт в карточке Node и повтори установку."
+  fi
   mkdir -p /opt/remnanode
   download_xray /opt/remnanode/xray-custom "$XRAY_MANUAL_VERSION"
 
@@ -2932,6 +3203,23 @@ EOF
 }
 
 write_nginx(){
+  if is_side_by_side_remna_node; then
+    if [[ "$METHOD" == none ]]; then
+      auto_done "Panel+node safe mode: активные nginx vhost панели оставлены без изменений."
+    else
+      danger "Panel+node safe mode: CDN origin nginx НЕ включён автоматически, чтобы не заменить рабочий vhost/сертификат панели."
+      manual_do "Используй отдельный origin-домен и добавь отдельный server_name в существующий nginx вручную либо вынеси relay/CDN-ноду на отдельный VPS."
+    fi
+    return 0
+  fi
+  if [[ "$PANEL_KIND" == remna && "$METHOD" == none ]]; then
+    if [[ "$REMNA_ROLE" == panel || "$REMNA_ROLE" == both ]]; then
+      write_remna_panel_only_nginx
+    else
+      info "Нода без CDN: nginx не меняю. Для relay reverse proxy/Caddy настраивается позже через --cascade."
+    fi
+    return 0
+  fi
   if [[ "$PANEL_KIND" == remna && "$REMNA_ROLE" == panel ]]; then
     write_remna_panel_only_nginx
     return 0
@@ -3180,7 +3468,11 @@ if [[ "$PANEL_KIND" == remna ]]; then
   fi
   if [[ "$REMNA_ROLE" == node || "$REMNA_ROLE" == both ]]; then
     install_remna_node
-    generate_remna_templates
+    if [[ "$METHOD" != none ]]; then
+      generate_remna_templates
+    else
+      auto_done "Remnawave Node установлена без CDN-профиля; каскад настроится позже через --cascade."
+    fi
   fi
 else
   install_xui
@@ -3213,19 +3505,26 @@ if [[ "$PANEL_KIND" == remna ]]; then
     echo "  3) После запуска ноды вернись на этот сервер и выполни: $INSTALL_PATH --manage-remna"
     echo "     Менеджер выберет эту ноду, спросит CDN/домены и попробует сам создать Profile, Active inbound, Squad и Host через API."
   else
-    warn "Remnawave: нода установлена. Теперь метод нужно привязать в центральной панели."
-    echo "На СЕРВЕРЕ ПАНЕЛИ запусти: /root/panel-script-v1.sh --manage-remna"
-    echo "Менеджер выберет эту ноду и попробует сам создать Profile, включить inbound, добавить его в Squad и создать Host."
-    echo "Если API установленной версии отличается, он ничего не удалит и оставит готовые файлы для ручного ввода."
-    echo
-    echo "Готовые файлы на этой ноде:"
-    echo "  $OUT_DIR/remnawave-profile-${METHOD}.json"
-    echo "  $OUT_DIR/remnawave-host-extra-${METHOD}.json"
-    echo "  $OUT_DIR/remnawave-host-${METHOD}.txt"
-    echo
-    echo "В панели сделай по порядку: Config profile → вставить profile JSON → назначить профиль ноде → Active inbounds → squad → user → host."
-    echo "В host поле xhttpExtraParams вставить файл host-extra БЕЗ изменений."
-    read -r -p "Если уже сделал — Enter для проверок; s = пропустить до следующего запуска: " p; [[ "${p,,}" == s ]] || true
+    if [[ "$METHOD" == none ]]; then
+      ok "Remnawave Node установлена БЕЗ CDN-метода. Это нормальный режим для relay/exit каскада."
+      echo "На сервере центральной панели запусти: /root/panel-script-v1.sh --cascade"
+      echo "Там выбери эту ноду как RELAY или EXIT. CDN Profile/Host сейчас создавать не нужно."
+      [[ "${REMNA_EXISTING_PANEL_SIDE_BY_SIDE:-no}" == yes ]] && echo "Панель на этом же VPS не переустанавливалась; её nginx/ACME не переписывались."
+    else
+      warn "Remnawave: нода установлена. Теперь метод нужно привязать в центральной панели."
+      echo "На СЕРВЕРЕ ПАНЕЛИ запусти: /root/panel-script-v1.sh --manage-remna"
+      echo "Менеджер выберет эту ноду и попробует сам создать Profile, включить inbound, добавить его в Squad и создать Host."
+      echo "Если API установленной версии отличается, он ничего не удалит и оставит готовые файлы для ручного ввода."
+      echo
+      echo "Готовые файлы на этой ноде:"
+      echo "  $OUT_DIR/remnawave-profile-${METHOD}.json"
+      echo "  $OUT_DIR/remnawave-host-extra-${METHOD}.json"
+      echo "  $OUT_DIR/remnawave-host-${METHOD}.txt"
+      echo
+      echo "В панели сделай по порядку: Config profile → вставить profile JSON → назначить профиль ноде → Active inbounds → squad → user → host."
+      echo "В host поле xhttpExtraParams вставить файл host-extra БЕЗ изменений."
+      read -r -p "Если уже сделал — Enter для проверок; s = пропустить до следующего запуска: " p; [[ "${p,,}" == s ]] || true
+    fi
   fi
 fi
 
@@ -3241,7 +3540,7 @@ if [[ "$METHOD" == turboflare ]]; then
 fi
 
 origin_code="skip"
-if [[ "$PANEL_KIND" == 3xui || "$REMNA_ROLE" == node || "$REMNA_ROLE" == both ]]; then
+if [[ "$METHOD" != none && ( "$PANEL_KIND" == 3xui || "$REMNA_ROLE" == node || "$REMNA_ROLE" == both ) ]]; then
   if [[ "$METHOD" == vk || "$METHOD" == timeweb ]]; then
     origin_code=$(curl -sS --max-time 15 -o /dev/null -w '%{http_code}' "http://${PUBLIC_IP}${SERVER_PATH}" -H "Host: ${ORIGIN_DOMAIN:-$PUBLIC_IP}" 2>/dev/null || true)
   else
@@ -3289,6 +3588,10 @@ elif [[ "$REMNA_ROLE" == node || "$REMNA_ROLE" == both ]]; then XRAY_VERSION=$(d
 } > "$RESULT_FILE"
 chmod 600 "$RESULT_FILE"
 mark complete
+if [[ "${REMNA_EXISTING_PANEL_SIDE_BY_SIDE:-no}" == yes && "$REMNA_ROLE" == node && "$METHOD" == none ]]; then
+  REMNA_ROLE=both
+  save_state
+fi
 
 cat > "$OUT_DIR/cascade-next-steps.txt" <<EOF
 Каскад можно включить при первой установке или позже отдельной командой:
@@ -3297,7 +3600,7 @@ cat > "$OUT_DIR/cascade-next-steps.txt" <<EOF
 Remnawave: мастер выбирает relay и одну либо несколько exit-нод. На каждой exit готовится BRIDGE_IN :8888 и отдельный bridge-user.
 Для нескольких exit relay profile создаёт VLESS_EXIT_* + routing.balancers/EXIT_POOL (roundRobin или random). Существующие active inbound на exit сохраняются.
 Перед заменой активного profile relay всегда требуется отдельное подтверждение.
-Provider-side origin/DNS и Caddy на relay выводятся отдельной ручной инструкцией.
+Provider-side origin/DNS и reverse proxy relay выводятся отдельной ручной инструкцией (Caddy на отдельном relay; существующий nginx при panel+relay на одном VPS).
 
 3x-ui: пока создаётся безопасный чек-лист; финальный catch-all только по network=tcp,udp, не по inboundTag.
 EOF
@@ -3315,11 +3618,14 @@ echo "Лог:           $LOG_FILE"
 if [[ "${CASCADE:-no}" == yes ]]; then
   echo
   ui_title "КАСКАД ВЫБРАН"
-  if [[ "$origin_code" == 400 && "$cdn_code" == 400 ]]; then
+  if [[ "$METHOD" == none ]]; then
+    check_do "Служебная нода готова. На сервере центральной панели запусти: $INSTALL_PATH --cascade"
+    manual_do "В мастере выбери эту ноду как RELAY или EXIT. CDN/origin на этой базовой установке не нужен."
+  elif [[ "$origin_code" == 400 && "$cdn_code" == 400 ]]; then
     check_do "Базовый CDN уже отвечает 400/400. На сервере центральной панели можно переходить к: $INSTALL_PATH --cascade"
   else
     manual_do "Сначала доведи базовый CDN до origin=400 и CDN=400. Затем на сервере центральной панели: $INSTALL_PATH --cascade"
   fi
-  manual_do "Каскад требует RU relay + минимум одну foreign exit-ноду. Можно выбрать пул exit-нод; он не включается молча поверх недопроверенного CDN."
+  manual_do "Каскад требует RU relay + минимум одну foreign exit-ноду. Можно выбрать пул exit-нод."
 fi
 echo "Повторный запуск продолжит с сохранёнными ответами."
