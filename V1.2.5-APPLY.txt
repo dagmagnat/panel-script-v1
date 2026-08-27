@@ -1,0 +1,71 @@
+panel-script-v1 v1.2.5 hotfix
+
+ВАЖНО: этот архив НЕ содержит полный install.sh. Он патчит ваш существующий
+install.sh версии 1.2.3 или 1.2.4.
+
+Применение:
+
+  cp install.sh install.sh.before-v1.2.5
+  chmod +x apply-v1.2.5-hotfix.sh
+  ./apply-v1.2.5-hotfix.sh install.sh
+  bash -n install.sh
+  ./install.sh --version
+
+Ожидается:
+  panel-script-v1 1.2.5
+
+Что добавлено поверх v1.2.4:
+
+1) TurboFlare parent-zone override
+   По умолчанию опасная parent-zone схема всё ещё блокируется.
+   Если вся зона уже авторитетно обслуживается TurboFlare и вы осознанно
+   используете, например:
+
+     CDN_DOMAIN=aer01.ru
+     PANEL_DOMAIN=pnl.aer01.ru
+
+   запускайте cascade так:
+
+     PSV1_ALLOW_PARENT_CDN=1 ./install.sh --cascade
+
+2) TurboFlare IP-origin + nginx panel default_server
+   Если --cascade запускается на том же RUS relay, где локальный nginx обслуживает
+   Remnawave Panel, installer автоматически добавляет в HTTPS vhost панели:
+
+     /static/getFile/video/segment.ts -> 127.0.0.1:7443
+
+   Это исправляет случай, когда TurboFlare умеет origin только IP:443 и отправляет
+   Host CDN-домена, из-за чего запрос раньше попадал в Remnawave Panel и давал JSON 404.
+
+   Патч:
+   - не меняет location / панели;
+   - не трогает VLESS_EXIT / BRIDGE_IN;
+   - создаёт backup;
+   - делает nginx -t;
+   - откатывается при ошибке;
+   - идемпотентен по marker PSV1-CASCADE-TURBOFLARE.
+
+3) Страховочный standalone-скрипт
+
+   Если installer не смог применить локальный nginx patch автоматически:
+
+     ./cascade-nginx-fix.sh --panel-domain pnl.aer01.ru
+
+   затем:
+
+     ./cascade-nginx-fix.sh --panel-domain pnl.aer01.ru --apply
+
+Для текущей схемы пользователя:
+
+  CDN:        aer01.ru
+  RUS relay:  94.102.88.112
+  NL exit:    64.188.113.43:8888
+  panel:      pnl.aer01.ru
+  cascade XHTTP local: 127.0.0.1:7443
+
+После установки проверка через CDN:
+
+  curl -vk https://aer01.ru/static/getFile/video/segment.ts -o /dev/null
+
+Ожидается ответ от XHTTP (обычно HTTP 400 для простого curl) и заголовок x-padding,
+а НЕ JSON 404 от Remnawave Panel.
