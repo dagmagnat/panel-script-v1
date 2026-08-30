@@ -3048,6 +3048,9 @@ case "${1:-}" in
     install -d -m 0700 "$(dirname "$INSTALL_PATH")"
     tmp_update=$(mktemp)
     curl -fsSL "${PROJECT_RAW}/install.sh" -o "$tmp_update"
+    # GitHub отдает байты как есть. Нормализуем случайный CRLF до проверки,
+    # чтобы Linux не пытался запустить несуществующий интерпретатор "bash\r".
+    sed -i 's/\r$//' "$tmp_update"
     bash -n "$tmp_update"
     install -m 0700 "$tmp_update" "$INSTALL_PATH"
     rm -f "$tmp_update"

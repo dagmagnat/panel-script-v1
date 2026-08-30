@@ -44,9 +44,14 @@ Beeline, Timeweb и Selectel для 3x-ui в проекте не считают�
 ```bash
 curl -fsSL https://raw.githubusercontent.com/dagmagnat/panel-script-v1/main/install.sh \
 -o /root/panel-script-v1.sh && \
+sed -i 's/\r$//' /root/panel-script-v1.sh && \
 chmod 700 /root/panel-script-v1.sh && \
 /root/panel-script-v1.sh
 ```
+
+`sed` в команде убирает Windows-переносы CRLF, если GitHub отдал
+`install.sh` в таком формате. Файл с обычными Linux-переносами LF команда не
+изменяет.
 
 Скрипт задаст вопросы и сохранит прогресс. Если установка остановилась на ошибке, после исправления просто запусти тот же файл снова.
 
@@ -67,6 +72,7 @@ chmod 700 /root/panel-script-v1.sh && \
 ```bash
 curl -fsSL "https://raw.githubusercontent.com/dagmagnat/panel-script-v1/main/install.sh?nocache=$(date +%s)" \
 -o /root/panel-script-v1.sh && \
+sed -i 's/\r$//' /root/panel-script-v1.sh && \
 chmod 700 /root/panel-script-v1.sh
 ```
 
