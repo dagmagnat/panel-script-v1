@@ -1,0 +1,27 @@
+panel-script-v1 v1.2.8
+
+Обновление существующего установщика на сервере панели:
+
+  cp /root/panel-script-v1.sh /root/panel-script-v1.sh.before-v1.2.8
+  cp install.sh /root/panel-script-v1.sh
+  sed -i 's/\r$//' /root/panel-script-v1.sh
+  chmod 700 /root/panel-script-v1.sh
+  bash -n /root/panel-script-v1.sh
+  /root/panel-script-v1.sh --version
+
+Ожидается:
+
+  panel-script-v1 1.2.8
+
+Затем повторить:
+
+  /root/panel-script-v1.sh --cascade
+
+Выбрать те же RUS relay, SWE exit, TurboFlare и домены. Уже созданные profile,
+BRIDGE_IN, Host и PSV1-CASCADE переиспользуются. Скрипт повторно закрепит
+bridge_995cb9 после окончательного обновления squad и ещё раз проверит его в
+post-check.
+
+Если API всё равно не закрепит пользователя, посмотреть:
+
+  cat /root/panel-script-v1-output/remna-methods/last-api-error-cascade-user-postcheck.json

@@ -11,7 +11,7 @@ IFS=$'\n\t'
 # This installer deliberately keeps each CDN preset separate. Do not mix fields
 # between providers: path/padding/uplink settings are provider-specific.
 
-INSTALLER_VERSION="1.2.7"
+INSTALLER_VERSION="1.2.8"
 STATE_SCHEMA_CURRENT="1"
 PRESET="${INSTALLER_PRESET:-}"
 
@@ -1572,7 +1572,9 @@ rm_user_has_squad(){
 
 rm_api_wait_bridge_user_state(){
   local token="$1" username="$2" squad_uuid="$3" user user_uuid vless attempt
-  for attempt in 1 2 3; do
+  # Node/squad events in Remnawave 3.3.0 can briefly make a freshly updated
+  # user read stale while Xray configs are being regenerated.
+  for attempt in 1 2 3 4 5 6 7 8; do
     user=$(rm_api_user_doc "$token" "$username")
     user_uuid=$(jq -r '.uuid // empty' <<<"$user" 2>/dev/null || true)
     vless=$(jq -r '.vlessUuid // .vless_uuid // empty' <<<"$user" 2>/dev/null || true)
@@ -1580,7 +1582,7 @@ rm_api_wait_bridge_user_state(){
       jq -nc --arg u "$user_uuid" --arg v "$vless" '{userUuid:$u,vlessUuid:$v}'
       return 0
     fi
-    (( attempt < 3 )) && sleep 1
+    (( attempt < 8 )) && sleep 1
   done
   return 1
 }
@@ -1694,7 +1696,7 @@ rm_api_ensure_bridge_user(){
 
 rm_verify_cascade_api_postconditions(){
   local token="$1" relay_uuid="$2" relay_profile_uuid="$3" relay_inbound_uuid="$4" squad_uuid="$5" exit_records="$6"
-  local squad profile expected e_count i e_uuid e_profile e_inbound username state
+  local squad profile expected e_count i e_uuid e_profile e_inbound username state user
 
   rm_api_wait_node_assignment "$token" "$relay_uuid" "$relay_profile_uuid" "$relay_inbound_uuid" || {
     warn "Post-check: relay profile/inbound не подтверждены на relay-ноде."
@@ -1738,8 +1740,17 @@ rm_verify_cascade_api_postconditions(){
       return 1
     }
     if ! state=$(rm_api_wait_bridge_user_state "$token" "$username" "$squad_uuid"); then
-      warn "Post-check: bridge-user '$username' не подтверждён в PSV1-CASCADE."
-      return 1
+      # Re-read and repair once after all squad inbound and node events. This is
+      # idempotent and handles the stale/lost membership seen on Remnawave 3.3.0.
+      user=$(rm_api_user_doc "$token" "$username")
+      if [[ -n "$user" ]] && state=$(rm_api_attach_user_to_squad "$token" "$user" "$squad_uuid"); then
+        warn "Post-check: повторно закрепил bridge-user '$username' в PSV1-CASCADE после синхронизации нод."
+      else
+        rm_api_save_redacted_response "$RM_MANAGER_DIR/last-api-error-cascade-user-postcheck.json" "${user:-{}}"
+        warn "Post-check: bridge-user '$username' не подтверждён в PSV1-CASCADE."
+        warn "Фактическое состояние пользователя: $RM_MANAGER_DIR/last-api-error-cascade-user-postcheck.json"
+        return 1
+      fi
     fi
     if [[ "$(jq -r '.vlessUuid' <<<"$state")" != "$(jq -r ".[$i].bridgeUuid" <<<"$exit_records")" ]]; then
       warn "Post-check: UUID bridge-user '$username' расходится с VLESS_EXIT."
@@ -2231,6 +2242,25 @@ run_remna_cascade_manager(){
     i=$((i+1))
   done
   auto_done "PSV1-CASCADE содержит relay inbound и все BRIDGE_IN."
+
+  # Updating the squad's inbound set causes node regeneration in Remnawave.
+  # Re-confirm each service user against the final squad before assigning relay.
+  i=0
+  while (( i < exit_count )); do
+    user_name=$(jq -r ".[$i].userName" <<<"$exit_records")
+    bridge_uuid=$(jq -r ".[$i].bridgeUuid" <<<"$exit_records")
+    if b=$(rm_api_ensure_bridge_user "$token" "$user_name" "$bridge_uuid" "$squad_uuid"); then
+      if [[ "$b" != "$bridge_uuid" ]]; then
+        warn "Bridge user '$user_name' неожиданно сменил VLESS UUID после обновления squad. Relay не переключаю."
+        return 0
+      fi
+      auto_done "Bridge user '$user_name' подтверждён в окончательном составе PSV1-CASCADE."
+    else
+      warn "Bridge user '$user_name' потерял членство после обновления squad и не восстановлен. Relay не переключаю."
+      return 0
+    fi
+    i=$((i+1))
+  done
 
   relay_active=$(jq -r '.configProfile.activeConfigProfileUuid // empty' <<<"$relay")
   if [[ -n "$relay_active" && "$relay_active" != "00000000-0000-0000-0000-000000000000" && "$relay_active" != "$relay_profile_uuid" ]]; then
