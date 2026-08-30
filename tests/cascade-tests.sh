@@ -10,6 +10,8 @@ trap - ERR
 TEST_TMP=$(mktemp -d)
 trap 'rm -rf "$TEST_TMP"' EXIT
 RM_MANAGER_DIR="$TEST_TMP"
+# API retry tests should not spend real seconds waiting on mocked state.
+sleep(){ :; }
 
 fail(){ echo "[FAIL] $*" >&2; exit 1; }
 pass(){ echo "[ OK ] $*"; }
@@ -62,9 +64,42 @@ rm_api(){
       jq -nc --argjson u "$(cat "$USER_FILE")" '{response:$u}'
       ;;
     user-patch:PATCH:/api/users)
+      jq -e '.username=="bridge_existing" and (has("uuid")|not)' >/dev/null <<<"$body" || return 1
       jq --argjson b "$body" '.activeInternalSquads=($b.activeInternalSquads | map({uuid:.,name:"PSV1-CASCADE"}))' "$USER_FILE" > "$USER_FILE.next"
       mv "$USER_FILE.next" "$USER_FILE"
       jq -nc --arg v "$(jq -r '.vlessUuid' "$USER_FILE")" '{response:{id:102,vlessUuid:$v}}'
+      ;;
+    user-bulk:GET:/api/users/by-username/bridge_bulk)
+      jq -nc --argjson u "$(cat "$USER_FILE")" '{response:$u}'
+      ;;
+    user-bulk:PATCH:/api/users)
+      echo '{"response":{"eventSent":true}}'
+      ;;
+    user-bulk:POST:/api/internal-squads/squad-1/bulk-actions/add-many-users)
+      jq -e '.userIds==[103]' >/dev/null <<<"$body" || return 1
+      jq '.activeInternalSquads=[{uuid:"squad-1",name:"PSV1-CASCADE"}]' "$USER_FILE" > "$USER_FILE.next"
+      mv "$USER_FILE.next" "$USER_FILE"
+      echo '{"response":{"affectedRows":1}}'
+      ;;
+    user-bulk:POST:/api/internal-squads/squad-1/bulk-actions/add-users)
+      fail "unsafe add-users endpoint must not be called"
+      ;;
+    user-minimal:GET:/api/users/by-username/bridge_minimal)
+      if [[ -s "$USER_FILE" ]]; then jq -nc --argjson u "$(cat "$USER_FILE")" '{response:$u}'; else echo '{"response":null}'; fi
+      ;;
+    user-minimal:POST:/api/users)
+      if jq -e 'has("vlessUuid")' >/dev/null <<<"$body"; then
+        echo '{"statusCode":400,"message":"custom vless UUID rejected"}'
+      else
+        echo '{"id":104,"uuid":"user-4","username":"bridge_minimal","vlessUuid":"66666666-6666-4666-8666-666666666666","activeInternalSquads":[]}' > "$USER_FILE"
+        echo '{"response":{"id":104}}'
+      fi
+      ;;
+    user-minimal:PATCH:/api/users)
+      jq -e '.username=="bridge_minimal"' >/dev/null <<<"$body" || return 1
+      jq --argjson b "$body" '.activeInternalSquads=($b.activeInternalSquads | map({uuid:.,name:"PSV1-CASCADE"}))' "$USER_FILE" > "$USER_FILE.next"
+      mv "$USER_FILE.next" "$USER_FILE"
+      echo '{"response":{"eventSent":true}}'
       ;;
     squad:GET:/api/internal-squads/squad-1)
       jq -nc --argjson s "$(cat "$SQUAD_FILE")" '{response:$s}'
@@ -112,10 +147,28 @@ test_bridge_user_short_create_response(){
 test_bridge_user_short_patch_response(){
   local got desired='44444444-4444-4444-8444-444444444444'
   TEST_SCENARIO=user-patch
-  jq -nc --arg v "$desired" '{uuid:"user-2",username:"bridge_existing",vlessUuid:$v,activeInternalSquads:[]}' > "$USER_FILE"
+  jq -nc --arg v "$desired" '{id:102,uuid:"user-2",username:"bridge_existing",vlessUuid:$v,activeInternalSquads:[]}' > "$USER_FILE"
   got=$(rm_api_ensure_bridge_user token bridge_existing ignored squad-1)
   [[ "$got" == "$desired" ]] || fail "patch: shortened response must be verified by GET"
   assert_jq "$(cat "$USER_FILE")" 'any(.activeInternalSquads[]; .uuid=="squad-1")' "patch: user is factually in PSV1-CASCADE"
+}
+
+test_bridge_user_selective_bulk_fallback(){
+  local got desired='55555555-5555-4555-8555-555555555555'
+  TEST_SCENARIO=user-bulk
+  jq -nc --arg v "$desired" '{id:103,uuid:"user-3",username:"bridge_bulk",vlessUuid:$v,activeInternalSquads:[]}' > "$USER_FILE"
+  got=$(rm_api_ensure_bridge_user token bridge_bulk ignored squad-1)
+  [[ "$got" == "$desired" ]] || fail "bulk: selective add-many-users fallback failed"
+  assert_jq "$(cat "$USER_FILE")" 'any(.activeInternalSquads[]; .uuid=="squad-1")' "bulk: only selected numeric user id is attached"
+}
+
+test_bridge_user_minimal_create_fallback(){
+  local got expected='66666666-6666-4666-8666-666666666666'
+  TEST_SCENARIO=user-minimal
+  : > "$USER_FILE"
+  got=$(rm_api_ensure_bridge_user token bridge_minimal 77777777-7777-4777-8777-777777777777 squad-1)
+  [[ "$got" == "$expected" ]] || fail "create: server-generated VLESS UUID fallback failed"
+  assert_jq "$(cat "$USER_FILE")" 'any(.activeInternalSquads[]; .uuid=="squad-1")' "create: minimal user is attached after creation"
 }
 
 test_squad_summary_does_not_drop_inbounds(){
@@ -154,6 +207,8 @@ test_api_postconditions(){
 test_relay_profiles
 test_bridge_user_short_create_response
 test_bridge_user_short_patch_response
+test_bridge_user_selective_bulk_fallback
+test_bridge_user_minimal_create_fallback
 test_squad_summary_does_not_drop_inbounds
 test_node_assignment_uses_read_after_write
 test_incompatible_bridge_is_rejected

@@ -11,7 +11,7 @@ IFS=$'\n\t'
 # This installer deliberately keeps each CDN preset separate. Do not mix fields
 # between providers: path/padding/uplink settings are provider-specific.
 
-INSTALLER_VERSION="1.2.6"
+INSTALLER_VERSION="1.2.7"
 STATE_SCHEMA_CURRENT="1"
 PRESET="${INSTALLER_PRESET:-}"
 
@@ -1586,25 +1586,31 @@ rm_api_wait_bridge_user_state(){
 }
 
 rm_api_attach_user_to_squad(){
-  local token="$1" user="$2" squad_uuid="$3" user_uuid old arr body resp="" state
+  local token="$1" user="$2" squad_uuid="$3" user_uuid user_id username old arr body resp="" state
   user_uuid=$(jq -r '.uuid // empty' <<<"$user" 2>/dev/null || true)
-  [[ -n "$user_uuid" ]] || return 1
+  user_id=$(jq -r '.id // empty' <<<"$user" 2>/dev/null || true)
+  username=$(jq -r '.username // empty' <<<"$user" 2>/dev/null || true)
+  [[ -n "$username" ]] || return 1
   old=$(jq -c '[.activeInternalSquads[]? | if type=="string" then . else .uuid end | select(type=="string" and length>0)]' <<<"$user" 2>/dev/null || echo '[]')
   arr=$(jq -nc --argjson o "$old" --arg s "$squad_uuid" '$o + [$s] | unique')
-  body=$(jq -nc --arg u "$user_uuid" --argjson a "$arr" '{uuid:$u,activeInternalSquads:$a}')
+  # Remnawave 3.3.x accepts username or numeric id here, not user UUID.
+  # Username is supported by both 3.3.x and newer releases.
+  body=$(jq -nc --arg u "$username" --argjson a "$arr" '{username:$u,activeInternalSquads:$a}')
   resp=$(rm_api PATCH /api/users "$token" "$body" 2>/dev/null || true)
-  if state=$(rm_api_wait_bridge_user_state "$token" "$(jq -r '.username' <<<"$user")" "$squad_uuid"); then
+  if state=$(rm_api_wait_bridge_user_state "$token" "$username" "$squad_uuid"); then
     printf '%s' "$state"
     return 0
   fi
 
-  # Remnawave also exposes the squad-specific bulk endpoint. It is a reliable
-  # fallback when PATCH /users returns a shortened response or its cache lags.
-  body=$(jq -nc --arg u "$user_uuid" '{userUuids:[$u]}')
-  resp=$(rm_api POST "/api/internal-squads/${squad_uuid}/bulk-actions/add-users" "$token" "$body" 2>/dev/null || true)
-  if state=$(rm_api_wait_bridge_user_state "$token" "$(jq -r '.username' <<<"$user")" "$squad_uuid"); then
-    printf '%s' "$state"
-    return 0
+  # /bulk-actions/add-users adds ALL users and must never be used here.
+  # 3.3.x exposes the selective endpoint with numeric userIds.
+  if [[ "$user_id" =~ ^[0-9]+$ ]]; then
+    body=$(jq -nc --argjson u "$user_id" '{userIds:[$u]}')
+    resp=$(rm_api POST "/api/internal-squads/${squad_uuid}/bulk-actions/add-many-users" "$token" "$body" 2>/dev/null || true)
+    if state=$(rm_api_wait_bridge_user_state "$token" "$username" "$squad_uuid"); then
+      printf '%s' "$state"
+      return 0
+    fi
   fi
   rm_api_save_redacted_response "$RM_MANAGER_DIR/last-api-error-cascade-user.json" "$resp"
   return 1
@@ -1612,7 +1618,7 @@ rm_api_attach_user_to_squad(){
 
 rm_api_ensure_bridge_user(){
   local token="$1" username="$2" desired_uuid="$3" squad_uuid="$4"
-  local user vless body resp expire state attempt
+  local user vless body minimal_body resp minimal_resp='' expire state attempt full_json minimal_json diagnostic msg
 
   user=$(rm_api_user_doc "$token" "$username")
   vless=$(jq -r '.vlessUuid // .vless_uuid // empty' <<<"$user" 2>/dev/null || true)
@@ -1659,7 +1665,30 @@ rm_api_ensure_bridge_user(){
     (( attempt < 3 )) && sleep 1
   done
 
-  rm_api_save_redacted_response "$RM_MANAGER_DIR/last-api-error-cascade-user.json" "$resp"
+  # Compatibility fallback: let Remnawave generate protocol credentials and
+  # attach the new user afterwards. This also recovers from a rejected custom
+  # vlessUuid or a create-time squad validation difference.
+  user=$(rm_api_user_doc "$token" "$username")
+  if [[ -z "$user" ]]; then
+    minimal_body=$(jq -nc --arg n "$username" --arg e "$expire" '{username:$n,expireAt:$e}')
+    minimal_resp=$(rm_api POST /api/users "$token" "$minimal_body" 2>/dev/null || true)
+    for attempt in 1 2 3; do
+      user=$(rm_api_user_doc "$token" "$username")
+      if [[ -n "$user" ]] && state=$(rm_api_attach_user_to_squad "$token" "$user" "$squad_uuid"); then
+        jq -r '.vlessUuid' <<<"$state"
+        return 0
+      fi
+      (( attempt < 3 )) && sleep 1
+    done
+  fi
+
+  full_json=$(jq -c . <<<"$resp" 2>/dev/null || jq -nc --arg raw "$resp" '{raw:$raw}')
+  minimal_json=$(jq -c . <<<"$minimal_resp" 2>/dev/null || jq -nc --arg raw "$minimal_resp" '{raw:$raw}')
+  diagnostic=$(jq -nc --argjson full "$full_json" --argjson minimal "$minimal_json" '{fullCreateResponse:$full,minimalCreateResponse:$minimal}')
+  rm_api_save_redacted_response "$RM_MANAGER_DIR/last-api-error-cascade-user.json" "$diagnostic"
+  msg=$(jq -r '.message // .error // .errorCode // empty | if type=="array" then join("; ") else tostring end' <<<"$resp" 2>/dev/null || true)
+  [[ -n "$msg" ]] && warn "Remnawave отклонила создание bridge-user: $msg" >&2
+  warn "Диагностика сохранена: $RM_MANAGER_DIR/last-api-error-cascade-user.json" >&2
   return 1
 }
 

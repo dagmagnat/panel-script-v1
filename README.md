@@ -4,7 +4,7 @@
 
 Цель проекта — максимально автоматизировать установку, но при этом явно показывать пользователю, что скрипт сделал сам и какие действия нужно выполнить вручную в кабинете CDN/DNS.
 
-> Текущая версия README рассчитана на `panel-script-v1 1.2.6`. В архиве уже лежит полный готовый `install.sh`; применять старый hotfix v1.2.5 поверх него не нужно.
+> Текущая версия README рассчитана на `panel-script-v1 1.2.7`. В архиве уже лежит полный готовый `install.sh`; применять старые hotfix-файлы поверх него не нужно.
 
 ## Что поддерживается
 
@@ -42,7 +42,11 @@ Beeline, Timeweb и Selectel для 3x-ui в проекте не считают�
 ## Установка
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/dagmagnat/panel-script-v1/main/install.sh -o /root/panel-script-v1.sh && sed -i 's/\r$//' /root/panel-script-v1.sh && chmod 700 /root/panel-script-v1.sh && /root/panel-script-v1.sh
+curl -fsSL https://raw.githubusercontent.com/dagmagnat/panel-script-v1/main/install.sh \
+-o /root/panel-script-v1.sh && \
+sed -i 's/\r$//' /root/panel-script-v1.sh && \
+chmod 700 /root/panel-script-v1.sh && \
+/root/panel-script-v1.sh
 ```
 
 `sed` в команде убирает Windows-переносы CRLF, если GitHub отдал
@@ -121,7 +125,7 @@ chmod 700 /root/panel-script-v1.sh
 
 Начиная с 1.2.3 такой сценарий защищён отдельным safe mode. Если на VPS уже обнаружена Remnawave panel, node-задача **не имеет права** очищать `sites-enabled`, включать self-signed bootstrap вместо панели, менять UFW или перезаписывать `/opt/remnawave/.env`. Переустановка существующей панели из нового мастера блокируется.
 
-Если эта же нода потом выбрана как relay в `--cascade`, не запускай отдельный Caddy на `80/443`: эти порты уже занимает nginx панели. Для обычных CDN нужен отдельный домен/`server_name`, который в существующем nginx проксирует нужный path на relay Xray `127.0.0.1:7443`. Для TurboFlare v1.2.6 поддерживает и origin=`IP:443`: перед изменениями Remnawave мастер добавляет и проверяет только XHTTP-location в HTTPS `default_server` панели, не меняя `location /`.
+Если эта же нода потом выбрана как relay в `--cascade`, не запускай отдельный Caddy на `80/443`: эти порты уже занимает nginx панели. Для обычных CDN нужен отдельный домен/`server_name`, который в существующем nginx проксирует нужный path на relay Xray `127.0.0.1:7443`. Начиная с v1.2.6 TurboFlare поддерживает и origin=`IP:443`: перед изменениями Remnawave мастер добавляет и проверяет только XHTTP-location в HTTPS `default_server` панели, не меняя `location /`.
 
 Все основные нумерованные меню имеют `0 — назад`/`0 — выйти`, чтобы можно было вернуться при ошибочном выборе до изменений сервера.
 
@@ -178,6 +182,11 @@ External Squad, если он нужен выбранной схеме
 На каждой выбранной exit-ноде мастер добавляет/reuse `BRIDGE_IN :8888` в **активном** Config Profile и Active Inbounds, не удаляя существующие inbound. Для каждого exit создаётся отдельный bridge-user/VLESS UUID. На relay создаётся отдельный cascade Config Profile с CDN inbound `127.0.0.1:7443`. Для одной exit используется `VLESS_EXIT`; для нескольких — отдельные `VLESS_EXIT_*` и `routing.balancers` с `balancerTag=EXIT_POOL`.
 
 Записи через API проверяются повторным чтением. Короткий успешный ответ `POST/PATCH` сам по себе не считается доказательством: мастер перечитывает Node, Internal Squad и bridge-user, при необходимости использует squad bulk-action и только затем собирает `VLESS_EXIT`. Это важно для Remnawave 3.3.0, где ответы создания пользователя могут отличаться по набору полей.
+
+В v1.2.7 исправлена совместимость bridge-user с Remnawave 3.3.0: обновление
+пользователя выполняется по `username`, а выборочный fallback использует
+`add-many-users` с числовым `userIds`. Endpoint `add-users`, добавляющий в squad
+сразу всех пользователей панели, каскадом не вызывается.
 
 Балансируется выбор outbound для **новых соединений**. Это не bonding: один TCP-поток не складывает скорость нескольких VPS.
 

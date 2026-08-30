@@ -1,0 +1,29 @@
+panel-script-v1 v1.2.7
+
+В ЭТОМ АРХИВЕ install.sh УЖЕ ГОТОВ. Старые hotfix-файлы применять не нужно.
+
+Обновление существующего установщика на сервере панели:
+
+  cp /root/panel-script-v1.sh /root/panel-script-v1.sh.before-v1.2.7
+  cp install.sh /root/panel-script-v1.sh
+  sed -i 's/\r$//' /root/panel-script-v1.sh
+  chmod 700 /root/panel-script-v1.sh
+  bash -n /root/panel-script-v1.sh
+  /root/panel-script-v1.sh --version
+
+Ожидается:
+
+  panel-script-v1 1.2.7
+
+Затем повторить:
+
+  /root/panel-script-v1.sh --cascade
+
+Созданный ранее bridge-only profile и Internal Squad PSV1-CASCADE будут
+переиспользованы. В v1.2.7 bridge-user для Remnawave 3.3.0 обновляется по
+username; fallback добавляет только выбранного пользователя через
+add-many-users/userIds и никогда не вызывает массовый add-users.
+
+Если API снова откажет, посмотреть безопасно отредактированную диагностику:
+
+  cat /root/panel-script-v1-output/remna-methods/last-api-error-cascade-user.json
