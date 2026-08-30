@@ -42,11 +42,7 @@ Beeline, Timeweb и Selectel для 3x-ui в проекте не считают�
 ## Установка
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/dagmagnat/panel-script-v1/main/install.sh \
--o /root/panel-script-v1.sh && \
-sed -i 's/\r$//' /root/panel-script-v1.sh && \
-chmod 700 /root/panel-script-v1.sh && \
-/root/panel-script-v1.sh
+curl -fsSL https://raw.githubusercontent.com/dagmagnat/panel-script-v1/main/install.sh -o /root/panel-script-v1.sh && sed -i 's/\r$//' /root/panel-script-v1.sh && chmod 700 /root/panel-script-v1.sh && /root/panel-script-v1.sh
 ```
 
 `sed` в команде убирает Windows-переносы CRLF, если GitHub отдал
