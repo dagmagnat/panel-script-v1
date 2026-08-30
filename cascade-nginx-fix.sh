@@ -8,7 +8,7 @@ CONF="/etc/nginx/sites-available/remnawave-panel.conf"
 usage(){
   cat <<USAGE
 Usage:
-  $0 --panel-domain pnl.example.com [--cascade-port 7443] [--apply]
+  $0 --panel-domain pnl.example.com [--cascade-port 7443] [--conf /path/to/panel.conf] [--apply]
 
 Dry-run by default. The script patches only the HTTPS panel vhost path:
   /static/getFile/video/segment.ts -> 127.0.0.1:<cascade-port>
@@ -22,6 +22,7 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --panel-domain) PANEL_DOMAIN="${2:-}"; shift 2 ;;
     --cascade-port) CASCADE_PORT="${2:-}"; shift 2 ;;
+    --conf) CONF="${2:-}"; shift 2 ;;
     --apply) APPLY=1; shift ;;
     -h|--help) usage; exit 0 ;;
     *) echo "[FAIL] Unknown argument: $1" >&2; usage; exit 2 ;;
@@ -30,7 +31,7 @@ done
 
 [[ $EUID -eq 0 ]] || { echo "[FAIL] Run as root" >&2; exit 1; }
 [[ -n "$PANEL_DOMAIN" ]] || { echo "[FAIL] --panel-domain is required" >&2; exit 2; }
-[[ "$CASCADE_PORT" =~ ^[0-9]+$ ]] || { echo "[FAIL] Bad --cascade-port" >&2; exit 2; }
+[[ "$CASCADE_PORT" =~ ^[0-9]+$ ]] && (( 10#$CASCADE_PORT >= 1 && 10#$CASCADE_PORT <= 65535 )) || { echo "[FAIL] Bad --cascade-port" >&2; exit 2; }
 command -v nginx >/dev/null 2>&1 || { echo "[FAIL] nginx not found" >&2; exit 1; }
 [[ -f "$CONF" ]] || { echo "[FAIL] $CONF not found" >&2; exit 1; }
 
@@ -41,8 +42,11 @@ cp -a "$CONF" "$TMP"
 python3 - "$TMP" "$PANEL_DOMAIN" "$CASCADE_PORT" <<'PY'
 from pathlib import Path
 import re, sys
-path=Path(sys.argv[1]); panel=sys.argv[2]; port=sys.argv[3]; s=path.read_text()
+path=Path(sys.argv[1]); panel=sys.argv[2]; port=sys.argv[3]; s=path.read_text(encoding='utf-8')
 if 'PSV1-CASCADE-TURBOFLARE BEGIN' in s:
+    expected=f'proxy_pass http://127.0.0.1:{port};'
+    if expected not in s:
+        raise SystemExit(f'[FAIL] marker exists, but expected "{expected}" was not found')
     print('[OK] marker already present')
     raise SystemExit(0)
 blocks=[]; pos=0
@@ -107,7 +111,7 @@ loc=f'''{ind}# PSV1-CASCADE-TURBOFLARE BEGIN
 {ind}# PSV1-CASCADE-TURBOFLARE END
 
 '''
-insert=st+m.start(); s=s[:insert]+loc+s[insert:]; path.write_text(s)
+insert=st+m.start(); s=s[:insert]+loc+s[insert:]; path.write_text(s, encoding='utf-8')
 print('[OK] patch prepared')
 PY
 
@@ -126,10 +130,28 @@ if ! nginx -t; then
   echo "[FAIL] nginx -t failed; restored $BACKUP" >&2
   exit 1
 fi
-systemctl reload nginx
+if command -v systemctl >/dev/null 2>&1; then
+  if ! systemctl reload nginx; then
+    cp -a "$BACKUP" "$CONF"
+    systemctl reload nginx >/dev/null 2>&1 || true
+    echo "[FAIL] nginx reload failed; restored $BACKUP" >&2
+    exit 1
+  fi
+elif ! nginx -s reload; then
+  cp -a "$BACKUP" "$CONF"
+  nginx -s reload >/dev/null 2>&1 || true
+  echo "[FAIL] nginx reload failed; restored $BACKUP" >&2
+  exit 1
+fi
 
 echo "[ OK ] nginx reloaded"
-nginx -T 2>/dev/null | grep -q 'PSV1-CASCADE-TURBOFLARE BEGIN' || { echo "[FAIL] marker not loaded" >&2; exit 1; }
-nginx -T 2>/dev/null | grep -q "proxy_pass http://127.0.0.1:${CASCADE_PORT}" || { echo "[FAIL] cascade proxy not loaded" >&2; exit 1; }
+NGINX_DUMP=$(nginx -T 2>/dev/null || true)
+if ! grep -Fq 'PSV1-CASCADE-TURBOFLARE BEGIN' <<<"$NGINX_DUMP" || \
+   ! grep -Fq "proxy_pass http://127.0.0.1:${CASCADE_PORT}" <<<"$NGINX_DUMP"; then
+  cp -a "$BACKUP" "$CONF"
+  if command -v systemctl >/dev/null 2>&1; then systemctl reload nginx >/dev/null 2>&1 || true; else nginx -s reload >/dev/null 2>&1 || true; fi
+  echo "[FAIL] cascade location not loaded; restored $BACKUP" >&2
+  exit 1
+fi
 echo "[ OK ] /static/getFile/video/segment.ts -> 127.0.0.1:${CASCADE_PORT}"
 echo "[INFO] Backup: $BACKUP"

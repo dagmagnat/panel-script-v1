@@ -1,0 +1,29 @@
+panel-script-v1 v1.2.6
+
+В ЭТОМ АРХИВЕ install.sh УЖЕ ГОТОВ. apply-v1.2.5-hotfix.sh применять не нужно.
+
+Обновление существующего установщика на сервере панели:
+
+  cp /root/panel-script-v1.sh /root/panel-script-v1.sh.before-v1.2.6
+  cp install.sh /root/panel-script-v1.sh
+  chmod 700 /root/panel-script-v1.sh
+  bash -n /root/panel-script-v1.sh
+  /root/panel-script-v1.sh --version
+
+Ожидается:
+
+  panel-script-v1 1.2.6
+
+Затем:
+
+  /root/panel-script-v1.sh --cascade
+
+Для осознанной parent-zone схемы TurboFlare, где NS всей зоны уже делегированы
+TurboFlare, оставлен явный opt-in:
+
+  PSV1_ALLOW_PARENT_CDN=1 /root/panel-script-v1.sh --cascade
+
+Успешный автоматический запуск заканчивается состоянием api-verified. Если
+показано failed-postcheck, relay не считается готовым: смотри каталог
+/root/panel-script-v1-output/remna-methods/cascade-*/ и повтори --cascade после
+исправления указанного условия.

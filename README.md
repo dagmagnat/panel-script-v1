@@ -4,7 +4,7 @@
 
 Цель проекта — максимально автоматизировать установку, но при этом явно показывать пользователю, что скрипт сделал сам и какие действия нужно выполнить вручную в кабинете CDN/DNS.
 
-> Текущая версия README рассчитана на `panel-script-v1 1.2.3`.
+> Текущая версия README рассчитана на `panel-script-v1 1.2.6`. В архиве уже лежит полный готовый `install.sh`; применять старый hotfix v1.2.5 поверх него не нужно.
 
 ## Что поддерживается
 
@@ -119,7 +119,7 @@ chmod 700 /root/panel-script-v1.sh
 
 Начиная с 1.2.3 такой сценарий защищён отдельным safe mode. Если на VPS уже обнаружена Remnawave panel, node-задача **не имеет права** очищать `sites-enabled`, включать self-signed bootstrap вместо панели, менять UFW или перезаписывать `/opt/remnawave/.env`. Переустановка существующей панели из нового мастера блокируется.
 
-Если эта же нода потом выбрана как relay в `--cascade`, не запускай отдельный Caddy на `80/443`: эти порты уже занимает nginx панели. Для CDN origin нужен отдельный домен/`server_name`, который в существующем nginx проксирует нужный path на relay Xray `127.0.0.1:7443`. Для TurboFlare на shared panel+relay нужен отдельный origin-домен; вариант origin=`IP:443` на том же VPS небезопасен и мастер его останавливает.
+Если эта же нода потом выбрана как relay в `--cascade`, не запускай отдельный Caddy на `80/443`: эти порты уже занимает nginx панели. Для обычных CDN нужен отдельный домен/`server_name`, который в существующем nginx проксирует нужный path на relay Xray `127.0.0.1:7443`. Для TurboFlare v1.2.6 поддерживает и origin=`IP:443`: перед изменениями Remnawave мастер добавляет и проверяет только XHTTP-location в HTTPS `default_server` панели, не меняя `location /`.
 
 Все основные нумерованные меню имеют `0 — назад`/`0 — выйти`, чтобы можно было вернуться при ошибочном выборе до изменений сервера.
 
@@ -175,13 +175,27 @@ External Squad, если он нужен выбранной схеме
 
 На каждой выбранной exit-ноде мастер добавляет/reuse `BRIDGE_IN :8888` в **активном** Config Profile и Active Inbounds, не удаляя существующие inbound. Для каждого exit создаётся отдельный bridge-user/VLESS UUID. На relay создаётся отдельный cascade Config Profile с CDN inbound `127.0.0.1:7443`. Для одной exit используется `VLESS_EXIT`; для нескольких — отдельные `VLESS_EXIT_*` и `routing.balancers` с `balancerTag=EXIT_POOL`.
 
+Записи через API проверяются повторным чтением. Короткий успешный ответ `POST/PATCH` сам по себе не считается доказательством: мастер перечитывает Node, Internal Squad и bridge-user, при необходимости использует squad bulk-action и только затем собирает `VLESS_EXIT`. Это важно для Remnawave 3.3.0, где ответы создания пользователя могут отличаться по набору полей.
+
 Балансируется выбор outbound для **новых соединений**. Это не bonding: один TCP-поток не складывает скорость нескольких VPS.
 
 Существующий активный Profile relay не заменяется молча: перед переключением требуется отдельное подтверждение. Provider-side DNS/origin, Caddy на relay и firewall/SG для `8888` выводятся как `[ВРУЧНУЮ]`. Сначала базовый CDN рекомендуется довести до `origin=400` и `CDN=400`, затем включать каскад.
 
 Файлы каскада сохраняются в отдельном каталоге: `relay-profile.json`, `selected-exits.json`, `exit-pool.json`, `RELAY-STEPS.txt`, `EXIT-STEPS.txt`, `VERIFY.txt`, `MANUAL-ACTIONS.txt`.
 
+Если relay был назначен автоматически, в конце выполняется обязательный API post-check: Active Profile/Inbound relay, Active Inbound каждой exit, полный состав `PSV1-CASCADE`, фактическое членство bridge-user, совпадение VLESS UUID и catch-all routing. При любой ошибке состояние записывается как `failed-postcheck`, а не как готовый каскад.
+
 Для 3x-ui команда `--cascade` пока создаёт безопасный чек-лист. Автоматическая правка `xrayTemplateConfig`/SQLite намеренно не включена до отдельной живой проверки.
+
+## Проверка исходников
+
+```bash
+bash -n install.sh
+bash -n cascade-nginx-fix.sh
+bash tests/cascade-tests.sh
+```
+
+Тесты покрывают single/pool routing, короткие ответы Remnawave при создании и обновлении bridge-user, сохранение старых inbound в squad, read-after-write назначения ноды и отказ от несовместимого слушателя на `:8888`.
 
 ## Cloudflare
 

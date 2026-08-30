@@ -1,51 +1,40 @@
-panel-script-v1 v1.1.2
-
-panel-script-v1 v1.1.1 — БЫСТРЫЙ СТАРТ
+panel-script-v1 v1.2.6 — БЫСТРЫЙ СТАРТ
 ======================================
 
-ПУБЛИЧНЫЙ GITHUB:
-https://github.com/dagmagnat/panel-script-v1
+Новый VPS:
 
-Команда на новом VPS:
+  chmod 700 install.sh
+  ./install.sh
 
-curl -fsSL https://raw.githubusercontent.com/dagmagnat/panel-script-v1/main/install.sh -o /root/panel-script-v1.sh && chmod 700 /root/panel-script-v1.sh && /root/panel-script-v1.sh
+Существующая Remnawave:
 
-ЕСЛИ ПАНЕЛЬ REMNAWAVE УЖЕ СТОИТ:
-/root/panel-script-v1.sh --manage-remna
+  ./install.sh --manage-remna
 
-ЕСЛИ НОД ЕЩЁ НЕТ:
-1) В панели: Nodes -> Create node
-2) Address = IP европейского VPS
-3) Выбери Node Port в панели (например 2222 или 2233) и запомни его
-4) Скопировать SECRET_KEY
-5) На европейском VPS запустить install.sh
-6) Remnawave -> Только нода -> выбрать CDN
-7) Ввести IP панели + SECRET_KEY
-8) Вернуться на сервер панели
-9) /root/panel-script-v1.sh --manage-remna
-10) Выбрать эту ноду + тот же CDN
+Каскад Remnawave (запускать на сервере центральной панели):
 
-Можно иметь одновременно:
-NODE-1 -> TurboFlare
-NODE-2 -> Selectel
-NODE-3 -> VK
-и управлять ими из одной панели.
+  ./install.sh --cascade
 
-Рекомендуется: 1 VPS-нода = 1 CDN-метод.
+Нужны минимум две подключённые ноды:
+  - RU relay принимает CDN-трафик;
+  - foreign exit слушает BRIDGE_IN TCP :8888.
 
-TurboFlare:
-Сайты -> домен -> Редактирование -> Адрес = IP НОДЫ:443
-HTTPS к источнику = ВКЛ
-Устаревший кэш = ВЫКЛ
+Для TurboFlare на одном VPS с панелью поддерживается origin IP:443: мастер
+сначала проверит точечный nginx bridge на 127.0.0.1:7443, затем изменит API.
 
-Обновить скрипт:
-/root/panel-script-v1.sh --update
+Успешный автоматический каскад получает статус api-verified. Статус
+failed-postcheck означает, что одно из обязательных условий не подтвердилось и
+каскад нельзя считать готовым.
+
+Проверки исходников:
+
+  bash -n install.sh
+  bash -n cascade-nginx-fix.sh
+  bash tests/cascade-tests.sh
 
 Версия:
-/root/panel-script-v1.sh --version
 
+  ./install.sh --version
 
-Если --manage-remna не видит localhost:3000:
-- v1.1.2 сам попробует Docker и домен панели;
-- затем можно ввести https://домен-панели;
-- при недоступном API он всё равно создаст ручные файлы и NEXT-STEPS.txt.
+Обновление из GitHub:
+
+  ./install.sh --update

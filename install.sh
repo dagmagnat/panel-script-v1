@@ -11,7 +11,7 @@ IFS=$'\n\t'
 # This installer deliberately keeps each CDN preset separate. Do not mix fields
 # between providers: path/padding/uplink settings are provider-specific.
 
-INSTALLER_VERSION="1.2.3"
+INSTALLER_VERSION="1.2.6"
 STATE_SCHEMA_CURRENT="1"
 PRESET="${INSTALLER_PRESET:-}"
 
@@ -39,13 +39,15 @@ ACME_ROOT="/var/www/certbot"
 SELF_CERT_DIR="/etc/nginx/cdn-installer-selfsigned"
 
 # Preserve unfinished state from pre-GitHub v0.9 if it exists.
-if [[ ! -e "$STATE_DIR" && -d "$LEGACY_STATE_DIR" ]]; then
-  cp -a "$LEGACY_STATE_DIR" "$STATE_DIR" 2>/dev/null || true
+if [[ "${PSV1_SOURCE_ONLY:-0}" != 1 ]]; then
+  if [[ ! -e "$STATE_DIR" && -d "$LEGACY_STATE_DIR" ]]; then
+    cp -a "$LEGACY_STATE_DIR" "$STATE_DIR" 2>/dev/null || true
+  fi
+  mkdir -p "$STATE_DIR" "$MARK_DIR" "$OUT_DIR" "$BACKUP_DIR"
+  chmod 700 "$STATE_DIR" "$OUT_DIR"
+  touch "$LOG_FILE"; chmod 600 "$LOG_FILE"
+  exec > >(tee -a "$LOG_FILE") 2>&1
 fi
-mkdir -p "$STATE_DIR" "$MARK_DIR" "$OUT_DIR" "$BACKUP_DIR"
-chmod 700 "$STATE_DIR" "$OUT_DIR"
-touch "$LOG_FILE"; chmod 600 "$LOG_FILE"
-exec > >(tee -a "$LOG_FILE") 2>&1
 
 C_RESET='\033[0m'; C_BOLD='\033[1m'; C_GREEN='\033[0;32m'; C_YELLOW='\033[1;33m'; C_RED='\033[0;31m'; C_CYAN='\033[0;36m'; C_MAGENTA='\033[0;35m'
 info(){ echo -e "${C_CYAN}[*]${C_RESET} $*"; }
@@ -72,10 +74,12 @@ on_error(){
 }
 trap 'on_error $LINENO' ERR
 
-[[ $EUID -eq 0 ]] || die "Запусти скрипт от root."
-source /etc/os-release
-[[ "${ID:-}" == "ubuntu" ]] || die "Скрипт рассчитан на Ubuntu."
-case "${VERSION_ID:-}" in 22.04|24.04) ;; *) warn "Ubuntu ${VERSION_ID:-unknown}: основной сценарий проверяется под 22.04/24.04." ;; esac
+if [[ "${PSV1_SOURCE_ONLY:-0}" != 1 ]]; then
+  [[ $EUID -eq 0 ]] || die "Запусти скрипт от root."
+  source /etc/os-release
+  [[ "${ID:-}" == "ubuntu" ]] || die "Скрипт рассчитан на Ubuntu."
+  case "${VERSION_ID:-}" in 22.04|24.04) ;; *) warn "Ubuntu ${VERSION_ID:-unknown}: основной сценарий проверяется под 22.04/24.04." ;; esac
+fi
 
 valid_domain(){ [[ "$1" =~ ^([A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z]{2,63}$ ]]; }
 valid_ipv4(){ [[ "$1" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; }
@@ -208,7 +212,7 @@ RM_MANAGER_TOKEN_FILE="$STATE_DIR/remna-manager.token"
 RM_MANAGER_DIR="$OUT_DIR/remna-methods"
 RM_API_BASE="${RM_API_BASE:-}"
 RM_API_INSECURE="${RM_API_INSECURE:-no}"
-mkdir -p "$RM_MANAGER_DIR"
+[[ "${PSV1_SOURCE_ONLY:-0}" == 1 ]] || mkdir -p "$RM_MANAGER_DIR"
 
 rm_try_api_base(){
   local base="${1%/}" code=""
@@ -677,6 +681,25 @@ rm_manager_choose_method(){
   done
 }
 
+rm_domain_is_same_or_child(){
+  local child="${1,,}" parent="${2,,}"
+  [[ -n "$child" && -n "$parent" ]] || return 1
+  [[ "$child" == "$parent" || "$child" == *."$parent" ]]
+}
+rm_turboflare_domain_conflicts(){
+  local cdn="${CDN_DOMAIN:-}" d
+  [[ -n "$cdn" ]] || return 1
+  for d in "${PANEL_DOMAIN:-}" "${ORIGIN_DOMAIN:-}"; do
+    [[ -n "$d" ]] || continue
+    if rm_domain_is_same_or_child "$d" "$cdn"; then
+      return 0
+    fi
+  done
+  return 1
+}
+rm_turboflare_parent_zone_allowed(){
+  [[ "${PSV1_ALLOW_PARENT_CDN:-0}" == "1" ]]
+}
 rm_manager_collect_domains(){
   local method="$1"
   ORIGIN_DOMAIN=""; CDN_DOMAIN=""
@@ -747,18 +770,49 @@ rm_api_existing_profile(){
   jq -nc --arg p "$uuid" --arg i "$inb" '{profileUuid:$p,inboundUuid:$i}'
 }
 
+rm_api_node_doc(){
+  local token="$1" node_uuid="$2" r node nodes
+  r=$(rm_api GET "/api/nodes/${node_uuid}" "$token" 2>/dev/null || true)
+  node=$(jq -c '.response.node // .response // .node // empty' <<<"$r" 2>/dev/null || true)
+  if [[ -z "$node" || "$(jq -r '.uuid // empty' <<<"$node" 2>/dev/null || true)" != "$node_uuid" ]]; then
+    nodes=$(rm_nodes_json "$token" 2>/dev/null || true)
+    node=$(jq -c --arg u "$node_uuid" '[.[]? | select(.uuid==$u)][0] // empty' <<<"$nodes" 2>/dev/null || true)
+  fi
+  printf '%s' "$node"
+}
+
+rm_node_has_active_profile_inbound(){
+  local node="$1" profile_uuid="$2" inbound_uuid="$3"
+  jq -e --arg p "$profile_uuid" --arg i "$inbound_uuid" '
+    (.configProfile.activeConfigProfileUuid // "") == $p
+    and ([.configProfile.activeInbounds[]? | if type=="string" then . else .uuid end] | index($i) != null)
+  ' >/dev/null 2>&1 <<<"$node"
+}
+
+rm_api_wait_node_assignment(){
+  local token="$1" node_uuid="$2" profile_uuid="$3" inbound_uuid="$4" node attempt
+  for attempt in 1 2 3; do
+    node=$(rm_api_node_doc "$token" "$node_uuid")
+    if [[ -n "$node" ]] && rm_node_has_active_profile_inbound "$node" "$profile_uuid" "$inbound_uuid"; then
+      return 0
+    fi
+    (( attempt < 3 )) && sleep 1
+  done
+  return 1
+}
+
 rm_api_assign_node(){
   local token="$1" node_uuid="$2" profile_uuid="$3" inbound_uuid="$4" body resp body_path
   # Remnawave 3.x встречается в двух формах API: PATCH /api/nodes с uuid в body
   # и PATCH /api/nodes/{uuid}. Пробуем обе, ничего не удаляя.
   body=$(jq -nc --arg uuid "$node_uuid" --arg p "$profile_uuid" --arg i "$inbound_uuid" '{uuid:$uuid,configProfile:{activeConfigProfileUuid:$p,activeInbounds:[$i]}}')
   resp=$(rm_api PATCH /api/nodes "$token" "$body" 2>/dev/null || true)
-  if jq -e '.response.uuid' >/dev/null 2>&1 <<<"$resp"; then return 0; fi
+  if rm_api_wait_node_assignment "$token" "$node_uuid" "$profile_uuid" "$inbound_uuid"; then return 0; fi
 
   body_path=$(jq -nc --arg p "$profile_uuid" --arg i "$inbound_uuid" '{configProfile:{activeConfigProfileUuid:$p,activeInbounds:[$i]}}')
   resp=$(rm_api PATCH "/api/nodes/${node_uuid}" "$token" "$body_path" 2>/dev/null || true)
-  if jq -e '.response.uuid' >/dev/null 2>&1 <<<"$resp"; then return 0; fi
-  printf '%s\n' "$resp" > "$RM_MANAGER_DIR/last-api-error-assign-node.json"
+  if rm_api_wait_node_assignment "$token" "$node_uuid" "$profile_uuid" "$inbound_uuid"; then return 0; fi
+  rm_api_save_redacted_response "$RM_MANAGER_DIR/last-api-error-assign-node.json" "$resp"
   return 1
 }
 
@@ -1275,16 +1329,27 @@ rm_api_add_active_inbound_preserve(){
   ')
   body=$(jq -nc --arg u "$node_uuid" --arg p "$profile_uuid" --argjson a "$arr" '{uuid:$u,configProfile:{activeConfigProfileUuid:$p,activeInbounds:$a}}')
   resp=$(rm_api PATCH /api/nodes "$token" "$body" 2>/dev/null || true)
-  if jq -e '.response.uuid // .uuid' >/dev/null 2>&1 <<<"$resp"; then return 0; fi
+  if rm_api_wait_node_assignment "$token" "$node_uuid" "$profile_uuid" "$inbound_uuid"; then return 0; fi
   body_path=$(jq -nc --arg p "$profile_uuid" --argjson a "$arr" '{configProfile:{activeConfigProfileUuid:$p,activeInbounds:$a}}')
   resp=$(rm_api PATCH "/api/nodes/${node_uuid}" "$token" "$body_path" 2>/dev/null || true)
-  if jq -e '.response.uuid // .uuid' >/dev/null 2>&1 <<<"$resp"; then return 0; fi
-  printf '%s\n' "$resp" > "$RM_MANAGER_DIR/last-api-error-cascade-node.json"
+  if rm_api_wait_node_assignment "$token" "$node_uuid" "$profile_uuid" "$inbound_uuid"; then return 0; fi
+  rm_api_save_redacted_response "$RM_MANAGER_DIR/last-api-error-cascade-node.json" "$resp"
   return 1
 }
 rm_cascade_bridge_inbound_json(){
   local tag="$1"
   jq -nc --arg tag "$tag" '{tag:$tag,port:8888,listen:"0.0.0.0",protocol:"vless",settings:{clients:[],decryption:"none"},sniffing:{enabled:true,destOverride:["http","tls","quic"]},streamSettings:{network:"tcp",security:"none"}}'
+}
+
+rm_bridge_inbound_is_compatible(){
+  local inbound="$1"
+  jq -e '
+    (.port == 8888)
+    and (.protocol == "vless")
+    and (.listen == "0.0.0.0")
+    and ((.streamSettings.network // "tcp") == "tcp")
+    and ((.streamSettings.security // "none") == "none")
+  ' >/dev/null 2>&1 <<<"$inbound"
 }
 
 rm_api_ensure_bridge_in_active_profile(){
@@ -1300,6 +1365,11 @@ rm_api_ensure_bridge_in_active_profile(){
   [[ -n "$config" && "$config" != null ]] || return 1
   existing=$(jq -c '[.inbounds[]? | select((.port==8888) or ((.tag//"")|startswith("BRIDGE_IN")))][0] // empty' <<<"$config")
   if [[ -n "$existing" ]]; then
+    if ! rm_bridge_inbound_is_compatible "$existing"; then
+      printf '%s\n' "$existing" | jq . > "$run_dir/incompatible-port-8888-inbound.json" 2>/dev/null || true
+      warn "В активном profile уже есть BRIDGE_IN*/порт 8888, но это не VLESS TCP :8888 на 0.0.0.0. Автоматически переиспользовать его опасно." >&2
+      return 5
+    fi
     bridge_tag=$(jq -r '.tag' <<<"$existing")
   else
     bridge=$(rm_cascade_bridge_inbound_json "$bridge_tag")
@@ -1372,52 +1442,463 @@ rm_cascade_relay_config_json(){
   '
 }
 
+rm_api_squad_doc(){
+  local token="$1" uuid="$2" r
+  r=$(rm_api GET "/api/internal-squads/${uuid}" "$token" 2>/dev/null || true)
+  jq -c '.response.internalSquad // .response // .internalSquad // empty' <<<"$r" 2>/dev/null || true
+}
+
+rm_squad_contains_inbounds(){
+  local squad="$1" inbound_a="$2" inbound_b="${3:-}"
+  jq -e --arg a "$inbound_a" --arg b "$inbound_b" '
+    ([.inbounds[]? | if type=="string" then . else .uuid end | select(type=="string" and length>0)] | unique) as $ids
+    | (($a|length)==0 or (($ids|index($a)) != null))
+    and (($b|length)==0 or (($ids|index($b)) != null))
+  ' >/dev/null 2>&1 <<<"$squad"
+}
+
+rm_api_wait_squad_inbounds(){
+  local token="$1" uuid="$2" inbound_a="$3" inbound_b="${4:-}" sq attempt
+  for attempt in 1 2 3; do
+    sq=$(rm_api_squad_doc "$token" "$uuid")
+    if [[ -n "$sq" ]] && rm_squad_contains_inbounds "$sq" "$inbound_a" "$inbound_b"; then
+      printf '%s' "$sq"
+      return 0
+    fi
+    (( attempt < 3 )) && sleep 1
+  done
+  return 1
+}
+
 rm_api_ensure_named_squad(){
-  local token="$1" name="$2" inbound_a="$3" inbound_b="${4:-}" squads sq uuid old arr body resp
+  local token="$1" name="$2" inbound_a="$3" inbound_b="${4:-}"
+  local squads sq summary uuid old arr body body_path resp="" endpoint
   squads=$(rm_internal_squads_json "$token")
   sq=$(jq -c --arg n "$name" '[.[]? | select(.name==$n)][0] // empty' <<<"$squads")
+  summary="$sq"
   uuid=$(jq -r '.uuid // empty' <<<"$sq" 2>/dev/null || true)
+
   if [[ -z "$uuid" ]]; then
-    arr=$(jq -nc --arg a "$inbound_a" --arg b "$inbound_b" '[ $a, $b ] | map(select(length>0)) | unique')
+    arr=$(jq -nc --arg a "$inbound_a" --arg b "$inbound_b" '[$a,$b] | map(select(length>0)) | unique')
     body=$(jq -nc --arg n "$name" --argjson a "$arr" '{name:$n,inbounds:$a}')
     resp=$(rm_api POST /api/internal-squads "$token" "$body" 2>/dev/null || true)
     uuid=$(jq -r '.response.uuid // .uuid // empty' <<<"$resp" 2>/dev/null || true)
-    [[ -n "$uuid" ]] || { printf '%s\n' "$resp" > "$RM_MANAGER_DIR/last-api-error-cascade-squad.json"; return 1; }
-    printf '%s' "$uuid"; return 0
+    if [[ -z "$uuid" ]]; then
+      rm_api_save_redacted_response "$RM_MANAGER_DIR/last-api-error-cascade-squad.json" "$resp"
+      return 1
+    fi
+    if rm_api_wait_squad_inbounds "$token" "$uuid" "$inbound_a" "$inbound_b" >/dev/null; then
+      printf '%s' "$uuid"
+      return 0
+    fi
+    sq=$(rm_api_squad_doc "$token" "$uuid")
+  else
+    # List endpoints have changed shape between releases. Always read the detail
+    # before merging, otherwise a summary object can make us delete old inbounds.
+    sq=$(rm_api_squad_doc "$token" "$uuid")
+    if [[ -z "$sq" ]]; then
+      if jq -e '.inbounds | type=="array"' >/dev/null 2>&1 <<<"$summary"; then
+        sq="$summary"
+      else
+        rm_api_save_redacted_response "$RM_MANAGER_DIR/last-api-error-cascade-squad.json" "$summary"
+        warn "Internal Squad '$name' найден только как summary без списка inbounds; безопасное слияние невозможно." >&2
+        return 1
+      fi
+    fi
+    if [[ -n "$sq" ]] && rm_squad_contains_inbounds "$sq" "$inbound_a" "$inbound_b"; then
+      printf '%s' "$uuid"
+      return 0
+    fi
   fi
-  old=$(jq -c '[.inbounds[]? | if type=="string" then . else .uuid end | select(.!=null and .!="")]' <<<"$sq" 2>/dev/null || echo '[]')
+
+  [[ -n "$sq" ]] || sq='{}'
+  old=$(jq -c '[.inbounds[]? | if type=="string" then . else .uuid end | select(type=="string" and length>0)]' <<<"$sq" 2>/dev/null || echo '[]')
   arr=$(jq -nc --argjson o "$old" --arg a "$inbound_a" --arg b "$inbound_b" '$o + [$a,$b] | map(select(length>0)) | unique')
   body=$(jq -nc --arg u "$uuid" --arg n "$name" --argjson a "$arr" '{uuid:$u,name:$n,inbounds:$a}')
-  resp=$(rm_api PATCH /api/internal-squads "$token" "$body" 2>/dev/null || true)
-  if jq -e '.response.uuid // .uuid' >/dev/null 2>&1 <<<"$resp"; then printf '%s' "$uuid"; return 0; fi
-  printf '%s\n' "$resp" > "$RM_MANAGER_DIR/last-api-error-cascade-squad.json"
+  body_path=$(jq -nc --arg n "$name" --argjson a "$arr" '{name:$n,inbounds:$a}')
+
+  for endpoint in root path; do
+    if [[ "$endpoint" == root ]]; then
+      resp=$(rm_api PATCH /api/internal-squads "$token" "$body" 2>/dev/null || true)
+    else
+      resp=$(rm_api PATCH "/api/internal-squads/${uuid}" "$token" "$body_path" 2>/dev/null || true)
+    fi
+    if rm_api_wait_squad_inbounds "$token" "$uuid" "$inbound_a" "$inbound_b" >/dev/null; then
+      printf '%s' "$uuid"
+      return 0
+    fi
+  done
+
+  rm_api_save_redacted_response "$RM_MANAGER_DIR/last-api-error-cascade-squad.json" "$resp"
+  return 1
+}
+
+rm_api_save_redacted_response(){
+  local out="$1" data="$2"
+  umask 077
+  if jq -e . >/dev/null 2>&1 <<<"$data"; then
+    jq '
+      walk(
+        if type=="object" then
+          with_entries(
+            if (.key | ascii_downcase | test("password|token|secret|subscriptionurl|vlessuuid"))
+            then .value="<redacted>"
+            else .
+            end
+          )
+        else . end
+      )
+    ' <<<"$data" > "$out" 2>/dev/null || printf '%s\n' '[response redaction failed]' > "$out"
+  else
+    printf '%s\n' "$data" > "$out"
+  fi
+  chmod 600 "$out"
+  umask 022
+}
+
+rm_api_user_doc(){
+  local token="$1" username="$2" r
+  r=$(rm_api GET "/api/users/by-username/${username}" "$token" 2>/dev/null || true)
+  jq -c '.response.user // .response // empty' <<<"$r" 2>/dev/null || true
+}
+
+rm_user_has_squad(){
+  local user="$1" squad_uuid="$2"
+  jq -e --arg s "$squad_uuid" '
+    [(.activeInternalSquads // [])[]? | if type=="string" then . else .uuid end]
+    | index($s) != null
+  ' >/dev/null 2>&1 <<<"$user"
+}
+
+rm_api_wait_bridge_user_state(){
+  local token="$1" username="$2" squad_uuid="$3" user user_uuid vless attempt
+  for attempt in 1 2 3; do
+    user=$(rm_api_user_doc "$token" "$username")
+    user_uuid=$(jq -r '.uuid // empty' <<<"$user" 2>/dev/null || true)
+    vless=$(jq -r '.vlessUuid // .vless_uuid // empty' <<<"$user" 2>/dev/null || true)
+    if [[ -n "$user_uuid" && -n "$vless" ]] && rm_user_has_squad "$user" "$squad_uuid"; then
+      jq -nc --arg u "$user_uuid" --arg v "$vless" '{userUuid:$u,vlessUuid:$v}'
+      return 0
+    fi
+    (( attempt < 3 )) && sleep 1
+  done
+  return 1
+}
+
+rm_api_attach_user_to_squad(){
+  local token="$1" user="$2" squad_uuid="$3" user_uuid old arr body resp="" state
+  user_uuid=$(jq -r '.uuid // empty' <<<"$user" 2>/dev/null || true)
+  [[ -n "$user_uuid" ]] || return 1
+  old=$(jq -c '[.activeInternalSquads[]? | if type=="string" then . else .uuid end | select(type=="string" and length>0)]' <<<"$user" 2>/dev/null || echo '[]')
+  arr=$(jq -nc --argjson o "$old" --arg s "$squad_uuid" '$o + [$s] | unique')
+  body=$(jq -nc --arg u "$user_uuid" --argjson a "$arr" '{uuid:$u,activeInternalSquads:$a}')
+  resp=$(rm_api PATCH /api/users "$token" "$body" 2>/dev/null || true)
+  if state=$(rm_api_wait_bridge_user_state "$token" "$(jq -r '.username' <<<"$user")" "$squad_uuid"); then
+    printf '%s' "$state"
+    return 0
+  fi
+
+  # Remnawave also exposes the squad-specific bulk endpoint. It is a reliable
+  # fallback when PATCH /users returns a shortened response or its cache lags.
+  body=$(jq -nc --arg u "$user_uuid" '{userUuids:[$u]}')
+  resp=$(rm_api POST "/api/internal-squads/${squad_uuid}/bulk-actions/add-users" "$token" "$body" 2>/dev/null || true)
+  if state=$(rm_api_wait_bridge_user_state "$token" "$(jq -r '.username' <<<"$user")" "$squad_uuid"); then
+    printf '%s' "$state"
+    return 0
+  fi
+  rm_api_save_redacted_response "$RM_MANAGER_DIR/last-api-error-cascade-user.json" "$resp"
   return 1
 }
 
 rm_api_ensure_bridge_user(){
-  local token="$1" username="$2" desired_uuid="$3" squad_uuid="$4" r user user_uuid vless old arr body resp expire
-  r=$(rm_api GET "/api/users/by-username/${username}" "$token" 2>/dev/null || true)
-  user=$(jq -c '.response.user // .response // empty' <<<"$r" 2>/dev/null || true)
-  user_uuid=$(jq -r '.uuid // empty' <<<"$user" 2>/dev/null || true)
-  if [[ -n "$user_uuid" ]]; then
-    vless=$(jq -r '.vlessUuid // .vless_uuid // empty' <<<"$user")
-    [[ -n "$vless" ]] || vless="$desired_uuid"
-    old=$(jq -c '[.activeInternalSquads[]? | if type=="string" then . else .uuid end | select(.!=null and .!="")]' <<<"$user" 2>/dev/null || echo '[]')
-    arr=$(jq -nc --argjson o "$old" --arg s "$squad_uuid" '$o + [$s] | unique')
-    body=$(jq -nc --arg u "$user_uuid" --argjson a "$arr" '{uuid:$u,activeInternalSquads:$a}')
-    resp=$(rm_api PATCH /api/users "$token" "$body" 2>/dev/null || true)
-    if jq -e '.response.uuid // .uuid' >/dev/null 2>&1 <<<"$resp"; then printf '%s' "$vless"; return 0; fi
-    printf '%s\n' "$resp" > "$RM_MANAGER_DIR/last-api-error-cascade-user.json"
+  local token="$1" username="$2" desired_uuid="$3" squad_uuid="$4"
+  local user vless body resp expire state attempt
+
+  user=$(rm_api_user_doc "$token" "$username")
+  vless=$(jq -r '.vlessUuid // .vless_uuid // empty' <<<"$user" 2>/dev/null || true)
+
+  if [[ -n "$vless" ]]; then
+    if rm_user_has_squad "$user" "$squad_uuid"; then
+      printf '%s' "$vless"
+      return 0
+    fi
+    if state=$(rm_api_attach_user_to_squad "$token" "$user" "$squad_uuid"); then
+      jq -r '.vlessUuid' <<<"$state"
+      return 0
+    fi
     return 2
   fi
+
   expire=$(date -u -d '+10 years' '+%Y-%m-%dT%H:%M:%S.000Z' 2>/dev/null || date -u '+%Y-%m-%dT%H:%M:%S.000Z')
-  body=$(jq -nc --arg n "$username" --arg e "$expire" --arg v "$desired_uuid" --arg s "$squad_uuid" '{username:$n,expireAt:$e,trafficLimitBytes:0,trafficLimitStrategy:"NO_RESET",vlessUuid:$v,activeInternalSquads:[$s]}')
+  body=$(jq -nc \
+    --arg n "$username" \
+    --arg e "$expire" \
+    --arg v "$desired_uuid" \
+    --arg s "$squad_uuid" \
+    '{username:$n,
+      expireAt:$e,
+      trafficLimitBytes:0,
+      trafficLimitStrategy:"NO_RESET",
+      vlessUuid:$v,
+      activeInternalSquads:[$s]}')
+
   resp=$(rm_api POST /api/users "$token" "$body" 2>/dev/null || true)
-  if jq -e '.response.uuid // .uuid' >/dev/null 2>&1 <<<"$resp"; then printf '%s' "$desired_uuid"; return 0; fi
-  printf '%s\n' "$resp" > "$RM_MANAGER_DIR/last-api-error-cascade-user.json"
+  if state=$(rm_api_wait_bridge_user_state "$token" "$username" "$squad_uuid"); then
+    jq -r '.vlessUuid' <<<"$state"
+    return 0
+  fi
+
+  # A successful create can return only id/shortUuid/vlessUuid. Read the user
+  # back and repair membership instead of treating the shortened body as failure.
+  for attempt in 1 2 3; do
+    user=$(rm_api_user_doc "$token" "$username")
+    if [[ -n "$user" ]] && state=$(rm_api_attach_user_to_squad "$token" "$user" "$squad_uuid"); then
+      jq -r '.vlessUuid' <<<"$state"
+      return 0
+    fi
+    (( attempt < 3 )) && sleep 1
+  done
+
+  rm_api_save_redacted_response "$RM_MANAGER_DIR/last-api-error-cascade-user.json" "$resp"
   return 1
 }
 
+rm_verify_cascade_api_postconditions(){
+  local token="$1" relay_uuid="$2" relay_profile_uuid="$3" relay_inbound_uuid="$4" squad_uuid="$5" exit_records="$6"
+  local squad profile expected e_count i e_uuid e_profile e_inbound username state
+
+  rm_api_wait_node_assignment "$token" "$relay_uuid" "$relay_profile_uuid" "$relay_inbound_uuid" || {
+    warn "Post-check: relay profile/inbound не подтверждены на relay-ноде."
+    return 1
+  }
+
+  squad=$(rm_api_squad_doc "$token" "$squad_uuid")
+  expected=$(jq -nc --arg r "$relay_inbound_uuid" --argjson exits "$exit_records" '[$r] + [$exits[]?.bridgeInboundUuid] | unique')
+  if ! jq -e --argjson expected "$expected" '
+      ([.inbounds[]? | if type=="string" then . else .uuid end] | unique) as $actual
+      | all($expected[]; . as $id | ($actual|index($id)) != null)
+    ' >/dev/null 2>&1 <<<"$squad"; then
+    warn "Post-check: PSV1-CASCADE не содержит все relay/bridge inbound UUID."
+    return 1
+  fi
+
+  profile=$(rm_api_profile_doc "$token" "$relay_profile_uuid" || true)
+  if ! jq -e --argjson exits "$exit_records" '
+      .config as $c
+      | all($exits[]; . as $e |
+          any($c.outbounds[]?;
+            .protocol=="vless"
+            and .settings.vnext[0].address==$e.ip
+            and .settings.vnext[0].port==8888
+            and .settings.vnext[0].users[0].id==$e.bridgeUuid))
+      and any($c.routing.rules[]?; .network=="tcp,udp" and ((.outboundTag // .balancerTag // "")|length)>0)
+    ' >/dev/null 2>&1 <<<"$profile"; then
+    warn "Post-check: relay profile не содержит полный VLESS_EXIT/маршрутизацию catch-all."
+    return 1
+  fi
+
+  e_count=$(jq 'length' <<<"$exit_records")
+  i=0
+  while (( i < e_count )); do
+    e_uuid=$(jq -r ".[$i].uuid" <<<"$exit_records")
+    e_profile=$(jq -r ".[$i].bridgeProfileUuid" <<<"$exit_records")
+    e_inbound=$(jq -r ".[$i].bridgeInboundUuid" <<<"$exit_records")
+    username=$(jq -r ".[$i].userName" <<<"$exit_records")
+    rm_api_wait_node_assignment "$token" "$e_uuid" "$e_profile" "$e_inbound" || {
+      warn "Post-check: exit $(jq -r ".[$i].name" <<<"$exit_records") не подтвердил BRIDGE_IN в Active Inbounds."
+      return 1
+    }
+    if ! state=$(rm_api_wait_bridge_user_state "$token" "$username" "$squad_uuid"); then
+      warn "Post-check: bridge-user '$username' не подтверждён в PSV1-CASCADE."
+      return 1
+    fi
+    if [[ "$(jq -r '.vlessUuid' <<<"$state")" != "$(jq -r ".[$i].bridgeUuid" <<<"$exit_records")" ]]; then
+      warn "Post-check: UUID bridge-user '$username' расходится с VLESS_EXIT."
+      return 1
+    fi
+    i=$((i+1))
+  done
+
+  return 0
+}
+
+rm_ensure_turboflare_cascade_nginx_bridge(){
+  local conf="/etc/nginx/sites-available/remnawave-panel.conf"
+  local enabled="/etc/nginx/sites-enabled/remnawave-panel.conf"
+  local backup="${conf}.before-psv1-cascade-$(date +%Y%m%d-%H%M%S)"
+  local nginx_dump="" sockets=""
+
+  command -v nginx >/dev/null 2>&1 || {
+    warn "TurboFlare cascade frontend: nginx не установлен локально."
+    return 1
+  }
+  [[ -f "$conf" && -e "$enabled" ]] || {
+    warn "TurboFlare cascade frontend: локальный remnawave-panel.conf не найден или не enabled."
+    return 1
+  }
+
+  nginx_dump=$(nginx -T 2>/dev/null || true)
+  if grep -Fq 'PSV1-CASCADE-TURBOFLARE BEGIN' <<<"$nginx_dump"; then
+    if grep -Fq 'proxy_pass http://127.0.0.1:7443' <<<"$nginx_dump"; then
+      ok "TurboFlare cascade frontend уже активен: /static/getFile/video/segment.ts -> 127.0.0.1:7443"
+      return 0
+    fi
+    warn "Найден marker TurboFlare cascade, но proxy_pass не ведёт на 127.0.0.1:7443. Автоматически поверх него не пишу."
+    return 1
+  fi
+
+  cp -a "$conf" "$backup"
+  if ! python3 - "$conf" "${PANEL_DOMAIN:-}" <<'PYNG'
+from pathlib import Path
+import re
+import sys
+
+path = Path(sys.argv[1])
+panel_domain = sys.argv[2]
+s = path.read_text(encoding='utf-8')
+
+marker = 'PSV1-CASCADE-TURBOFLARE BEGIN'
+if marker in s:
+    raise SystemExit(0)
+
+# Find complete top-level server blocks by brace depth.
+blocks = []
+pos = 0
+while True:
+    m = re.search(r'(?m)^\s*server\s*\{', s[pos:])
+    if not m:
+        break
+    start = pos + m.start()
+    brace = s.find('{', start)
+    depth = 0
+    i = brace
+    in_sq = in_dq = False
+    esc = False
+    while i < len(s):
+        ch = s[i]
+        if esc:
+            esc = False
+        elif ch == '\\':
+            esc = True
+        elif ch == "'" and not in_dq:
+            in_sq = not in_sq
+        elif ch == '"' and not in_sq:
+            in_dq = not in_dq
+        elif not in_sq and not in_dq:
+            if ch == '{':
+                depth += 1
+            elif ch == '}':
+                depth -= 1
+                if depth == 0:
+                    end = i + 1
+                    blocks.append((start, end, s[start:end]))
+                    pos = end
+                    break
+        i += 1
+    else:
+        raise SystemExit('[ERR] nginx parser: незакрытый server block')
+
+chosen = None
+for start, end, block in blocks:
+    if not re.search(r'(?m)^\s*listen\s+.*443.*;', block):
+        continue
+    if panel_domain and re.search(r'(?m)^\s*server_name\s+[^;]*\b' + re.escape(panel_domain) + r'\b[^;]*;', block):
+        chosen = (start, end, block)
+        break
+    if chosen is None and re.search(r'(?m)^\s*server_name\s+[^;]*\b_\b[^;]*;', block):
+        chosen = (start, end, block)
+
+if chosen is None:
+    raise SystemExit('[ERR] Не найден HTTPS server block панели (listen 443)')
+
+start, end, block = chosen
+m = re.search(r'(?m)^(\s*)location\s+/\s*\{', block)
+if not m:
+    raise SystemExit('[ERR] В HTTPS server block панели не найден location / {')
+indent = m.group(1)
+
+location = f"""{indent}# PSV1-CASCADE-TURBOFLARE BEGIN
+{indent}location ^~ /static/getFile/video/segment.ts {{
+{indent}    rewrite ^/static/getFile/video/segment\\.ts$ /static/getFile/video/segment.ts/ break;
+{indent}    proxy_pass http://127.0.0.1:7443;
+{indent}    proxy_http_version 1.1;
+{indent}    proxy_set_header Connection "";
+{indent}    proxy_set_header Host $host;
+{indent}    proxy_set_header X-Real-IP $remote_addr;
+{indent}    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+{indent}    proxy_set_header X-Forwarded-Proto https;
+{indent}    proxy_pass_request_headers on;
+{indent}    proxy_buffering off;
+{indent}    proxy_request_buffering off;
+{indent}    proxy_cache off;
+{indent}    proxy_max_temp_file_size 0;
+{indent}    gzip off;
+{indent}    client_max_body_size 0;
+{indent}    proxy_connect_timeout 10s;
+{indent}    proxy_read_timeout 1h;
+{indent}    proxy_send_timeout 1h;
+{indent}    send_timeout 1h;
+{indent}    proxy_socket_keepalive on;
+{indent}    add_header X-Accel-Buffering no always;
+{indent}    add_header Cache-Control "no-store, no-cache" always;
+{indent}    add_header CDN-Cache-Control "no-store" always;
+{indent}    add_header Pragma "no-cache" always;
+{indent}    add_header Expires "0" always;
+{indent}    add_header Accept-Ranges none always;
+{indent}}}
+{indent}# PSV1-CASCADE-TURBOFLARE END\n\n"""
+
+insert_at = start + m.start()
+s = s[:insert_at] + location + s[insert_at:]
+path.write_text(s, encoding='utf-8')
+PYNG
+  then
+    cp -a "$backup" "$conf"
+    warn "Не удалось добавить TurboFlare cascade location; конфиг восстановлен: $backup"
+    return 1
+  fi
+
+  if ! nginx -t; then
+    cp -a "$backup" "$conf"
+    nginx -t >/dev/null 2>&1 || true
+    warn "nginx -t не прошёл; конфиг восстановлен: $backup"
+    return 1
+  fi
+
+  if command -v systemctl >/dev/null 2>&1; then
+    if ! systemctl reload nginx; then
+      cp -a "$backup" "$conf"
+      systemctl reload nginx >/dev/null 2>&1 || true
+      warn "nginx reload не прошёл; конфиг восстановлен: $backup"
+      return 1
+    fi
+  elif ! nginx -s reload; then
+    cp -a "$backup" "$conf"
+    nginx -s reload >/dev/null 2>&1 || true
+    warn "nginx reload не прошёл; конфиг восстановлен: $backup"
+    return 1
+  fi
+
+  nginx_dump=$(nginx -T 2>/dev/null || true)
+  if grep -Fq 'PSV1-CASCADE-TURBOFLARE BEGIN' <<<"$nginx_dump" && \
+     grep -Fq 'proxy_pass http://127.0.0.1:7443' <<<"$nginx_dump"; then
+    ok "TurboFlare cascade frontend включён: path -> 127.0.0.1:7443"
+    auto_done "nginx: TurboFlare cascade path -> 127.0.0.1:7443"
+  else
+    cp -a "$backup" "$conf"
+    if command -v systemctl >/dev/null 2>&1; then systemctl reload nginx >/dev/null 2>&1 || true; else nginx -s reload >/dev/null 2>&1 || true; fi
+    warn "nginx reload выполнен, но cascade location не загрузился; конфиг восстановлен: $backup"
+    return 1
+  fi
+
+  sockets=$(ss -ltn 2>/dev/null || true)
+  if grep -qE '127\.0\.0\.1:7443\b' <<<"$sockets"; then
+    ok "Cascade XHTTP уже слушает 127.0.0.1:7443"
+  else
+    warn "127.0.0.1:7443 пока не слушается. После синхронизации relay-профиля проверь Active Inbounds."
+  fi
+  return 0
+}
 run_remna_cascade_manager(){
   local token nodes count relay relay_uuid relay_name relay_ip method pool_suffix relay_tag relay_config relay_profile_name relay_ids relay_profile_uuid relay_inbound_uuid relay_active squad_uuid host_uuid="" extra run_dir profile_doc existing_cfg desired_hash current_hash update_profile=no
   local exit_mode exit_mode_choice exits exit_count strategy_choice strategy first_exit first_exit_uuid first_exit_ip exit_keys exit_records='[]'
@@ -1539,10 +2020,19 @@ run_remna_cascade_manager(){
   CASCADE_METHOD="$method"; CASCADE_RELAY_NODE_UUID="$relay_uuid"; CASCADE_RELAY_IP="$relay_ip"; CASCADE=yes
   CASCADE_EXIT_MODE="$exit_mode"; CASCADE_EXIT_NODE_UUID="$first_exit_uuid"; CASCADE_EXIT_NODE_UUIDS="$exit_keys"; CASCADE_EXIT_IP="$first_exit_ip"; CASCADE_EXIT_IPS=$(jq -r 'map(.address)|join(",")' <<<"$exits"); CASCADE_STRATEGY="$strategy"
   rm_manager_collect_domains "$method"
+  if [[ "$method" == turboflare ]] && rm_turboflare_domain_conflicts; then
+    if rm_turboflare_parent_zone_allowed; then
+      warn "TurboFlare parent-zone override: CDN_DOMAIN='$CDN_DOMAIN' содержит PANEL_DOMAIN='$PANEL_DOMAIN' и/или ORIGIN_DOMAIN='${ORIGIN_DOMAIN:-}'."
+      warn "Продолжаю только потому, что PSV1_ALLOW_PARENT_CDN=1. Убедись, что A-записи panel/origin реально существуют на авторитетных NS TurboFlare."
+    else
+      danger "TurboFlare NS-конфликт: '$CDN_DOMAIN' является родительской DNS-зоной для панели и/или origin."
+      manual_do "Если это осознанная схема и DNS всей зоны уже обслуживает TurboFlare, перезапусти так: PSV1_ALLOW_PARENT_CDN=1 $INSTALL_PATH --cascade"
+      manual_do "По умолчанию API каскада не меняю."
+      return 0
+    fi
+  fi
   if [[ "$relay_on_panel" == yes && "$method" == turboflare && -z "${ORIGIN_DOMAIN:-}" ]]; then
-    danger "TurboFlare origin по голому IP:443 нельзя безопасно совместить с панелью на том же :443."
-    manual_do "Для relay на сервере панели задай отдельный origin-домен либо используй отдельный RU relay VPS. Каскад API пока не меняю."
-    return 0
+    warn "TurboFlare будет ходить на relay по IP:443. Добавлю точечный XHTTP location в HTTPS default_server панели; location / панели не изменится."
   fi
   save_state
 
@@ -1563,6 +2053,15 @@ run_remna_cascade_manager(){
   fi
   ask_yes_no _CASCADE_CONTINUE "Продолжить подготовку сущностей каскада в Remnawave API?" "yes"
   [[ "$_CASCADE_CONTINUE" == yes ]] || return 0
+
+  # For a shared panel+relay TurboFlare reaches IP:443 with the CDN Host header.
+  # Prepare and verify the local frontend before changing any Remnawave entity.
+  if [[ "$relay_on_panel" == yes && "$method" == turboflare ]]; then
+    if ! rm_ensure_turboflare_cascade_nginx_bridge; then
+      manual_do "Каскад в API ещё не менялся. Исправь nginx frontend или запусти cascade-nginx-fix.sh --panel-domain '$PANEL_DOMAIN' --apply, затем повтори --cascade."
+      return 0
+    fi
+  fi
 
   if [[ "$exit_mode" == single ]]; then
     # Совместимость с v1.2.0: для одиночного каскада сохраняем прежний suffix/profile name.
@@ -1599,7 +2098,8 @@ run_remna_cascade_manager(){
         if rm_api_assign_node "$token" "$e_uuid" "$exit_profile_uuid" "$bridge_inbound_uuid"; then
           auto_done "Exit '$e_name': создан/назначен bridge-only profile, BRIDGE_IN активирован."
         else
-          warn "Exit '$e_name': bridge profile создан, но нода не назначена автоматически."
+          warn "Exit '$e_name': bridge profile создан, но API не подтвердил его назначение/Active Inbound. Relay не переключаю."
+          return 0
         fi
       else
         warn "Exit '$e_name': не удалось создать bridge-only profile. Relay не переключаю."
@@ -1611,7 +2111,8 @@ run_remna_cascade_manager(){
         if rm_api_add_active_inbound_preserve "$token" "$e" "$exit_profile_uuid" "$bridge_inbound_uuid"; then
           auto_done "Exit '$e_name': BRIDGE_IN ($bridge_tag :8888) добавлен в активный profile/Active Inbounds без удаления старых inbound'ов."
         else
-          warn "Exit '$e_name': BRIDGE_IN создан, но Active Inbounds не обновлён автоматически."
+          warn "Exit '$e_name': BRIDGE_IN создан, но API не подтвердил Active Inbounds. Relay не переключаю."
+          return 0
         fi
       else
         warn "Exit '$e_name': не удалось безопасно добавить BRIDGE_IN. Останавливаюсь до переключения relay."
@@ -1697,9 +2198,10 @@ run_remna_cascade_manager(){
   while (( i < exit_count )); do
     bridge_inbound_uuid=$(jq -r ".[$i].bridgeInboundUuid" <<<"$exit_records")
     squad_uuid=$(rm_api_ensure_named_squad "$token" "PSV1-CASCADE" "$bridge_inbound_uuid" "$relay_inbound_uuid" || true)
+    [[ -n "$squad_uuid" ]] || { warn "PSV1-CASCADE не подтвердил полный набор inbound'ов. Relay не переключаю."; return 0; }
     i=$((i+1))
   done
-  [[ -n "$squad_uuid" ]] && auto_done "PSV1-CASCADE содержит relay inbound и все BRIDGE_IN." || warn "Cascade squad не удалось финализировать автоматически."
+  auto_done "PSV1-CASCADE содержит relay inbound и все BRIDGE_IN."
 
   relay_active=$(jq -r '.configProfile.activeConfigProfileUuid // empty' <<<"$relay")
   if [[ -n "$relay_active" && "$relay_active" != "00000000-0000-0000-0000-000000000000" && "$relay_active" != "$relay_profile_uuid" ]]; then
@@ -1713,7 +2215,8 @@ run_remna_cascade_manager(){
     if rm_api_assign_node "$token" "$relay_uuid" "$relay_profile_uuid" "$relay_inbound_uuid"; then
       auto_done "Relay: cascade profile назначен, XHTTP inbound :7443 активирован."
     else
-      warn "Relay profile создан, но Node assignment не прошёл."
+      warn "Relay profile создан, но API не подтвердил Node assignment/Active Inbound. Каскад не считаю готовым."
+      return 0
     fi
   else
     manual_do "Relay не переключён. После подготовки Caddy назначь profile '$relay_profile_name' и Active Inbound '$relay_tag'."
@@ -1789,7 +2292,20 @@ $relay_proxy_note
 5. Для пула: strategy=$strategy. Это балансировка соединений, а не суммирование пропускной способности одного потока.
 EOF
   chmod 600 "$run_dir"/*.txt "$run_dir"/*.json "$run_dir"/exit-*/*.json 2>/dev/null || true
-  CASCADE_STATUS=prepared; save_state
+  if [[ "$RM_CASCADE_ASSIGN_RELAY" == yes ]]; then
+    if rm_verify_cascade_api_postconditions "$token" "$relay_uuid" "$relay_profile_uuid" "$relay_inbound_uuid" "$squad_uuid" "$exit_records"; then
+      CASCADE_STATUS=api-verified
+      auto_done "API post-check: все 6 условий каскада подтверждены (relay/exit Active Inbounds, squad, bridge-users, UUID и routing)."
+    else
+      CASCADE_STATUS=failed-postcheck
+      save_state
+      warn "Каскад не прошёл обязательный API post-check и не помечен готовым. Диагностика: $run_dir"
+      return 0
+    fi
+  else
+    CASCADE_STATUS=prepared-not-assigned
+  fi
+  save_state
 
   echo
   ui_title "КАСКАД — ИТОГ"
@@ -1802,6 +2318,8 @@ EOF
   auto_done "На каждой exit подготовлен BRIDGE_IN :8888 и отдельный bridge-user."
   [[ -n "$squad_uuid" ]] && auto_done "Internal Squad: PSV1-CASCADE"
   [[ -n "$host_uuid" ]] && auto_done "Cascade Host: $CDN_DOMAIN"
+  manual_do "ВАЖНО: обычные пользователи НЕ добавляются в PSV1-CASCADE автоматически. Добавь нужных пользователей в этот Internal Squad, иначе Cascade Host не появится в их подписке."
+  [[ "$relay_on_panel" == yes && "$method" == turboflare ]] && auto_done "Локальный nginx frontend каскада проверен до изменений API."
   manual_do "Provider-side origin/DNS и reverse proxy relay требуют отдельного действия (отдельный relay: Caddy; relay на VPS панели: существующий nginx)."
   manual_do "Инструкция relay: $run_dir/RELAY-STEPS.txt"
   manual_do "Все exit:        $run_dir/EXIT-STEPS.txt"
@@ -1832,16 +2350,35 @@ EOF
 }
 
 run_cascade_manager(){
+  local entered_url=""
   load_state || true
+
   if rm_panel_detected >/dev/null 2>&1; then
     run_remna_cascade_manager
-  elif [[ "${PANEL_KIND:-}" == 3xui ]] || command -v x-ui >/dev/null 2>&1 || [[ -d /etc/x-ui ]]; then
-    run_3xui_cascade_manager
-  else
-    die "Не вижу локальную центральную Remnawave или 3x-ui. Для Remnawave запускай --cascade на сервере панели."
+    return 0
   fi
-}
 
+  if [[ "${PANEL_KIND:-}" == 3xui ]] || command -v x-ui >/dev/null 2>&1 || [[ -d /etc/x-ui ]]; then
+    run_3xui_cascade_manager
+    return 0
+  fi
+
+  warn "Remnawave API автоматически не найден. Это не означает, что панель не работает."
+  read -r -p "URL центральной Remnawave (пример https://panel.example.com; Enter = отмена): " entered_url
+  entered_url="${entered_url%/}"
+  [[ -n "$entered_url" ]] || {
+    manual_do "Запуск с URL без вопроса: RM_API_BASE=https://panel.example.com $INSTALL_PATH --cascade"
+    return 0
+  }
+
+  if rm_try_api_base "$entered_url"; then
+    ok "Remnawave API найден вручную: ${RM_API_BASE}"
+    run_remna_cascade_manager
+    return 0
+  fi
+
+  die "URL '$entered_url' не отвечает как Remnawave API. Ничего в панели не изменено."
+}
 
 run_remna_panel_manager(){
   local token="" token_mode=api nodes node node_uuid node_name node_ip connected method safe suffix tag inbound config extra profile_name ids profile_uuid inbound_uuid active_profile assign_ok=no host_uuid="" squad_ok=no run_dir summary technew=""
@@ -2470,6 +3007,10 @@ collect_config(){
   show_config
   read -r -p "Нажми Enter, чтобы начать..." _
 }
+
+if [[ "${PSV1_SOURCE_ONLY:-0}" == 1 ]]; then
+  return 0 2>/dev/null || exit 0
+fi
 
 case "${1:-}" in
   --node-credentials)
