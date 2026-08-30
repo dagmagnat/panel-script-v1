@@ -11,7 +11,7 @@ IFS=$'\n\t'
 # This installer deliberately keeps each CDN preset separate. Do not mix fields
 # between providers: path/padding/uplink settings are provider-specific.
 
-INSTALLER_VERSION="1.2.9"
+INSTALLER_VERSION="1.3.0"
 STATE_SCHEMA_CURRENT="1"
 PRESET="${INSTALLER_PRESET:-}"
 
@@ -3073,11 +3073,242 @@ collect_config(){
   read -r -p "Нажми Enter, чтобы начать..." _
 }
 
+panel_cert_patch_nginx_config(){
+  local conf="$1" domain="$2" cert_path="$3" key_path="$4"
+  [[ -f "$conf" ]] || { warn "nginx-конфиг не найден: $conf"; return 1; }
+  valid_domain "$domain" || { warn "Некорректный домен панели: $domain"; return 1; }
+
+  # Меняем сертификат только в одном HTTPS server{} с точным server_name.
+  # При неоднозначной конфигурации безопаснее остановиться, чем затронуть
+  # соседний origin/CDN-vhost на тех же 80/443.
+  "${PANEL_CERT_PYTHON:-python3}" - "$conf" "$domain" "$cert_path" "$key_path" <<'PY'
+import os
+import pathlib
+import re
+import sys
+
+path = pathlib.Path(sys.argv[1])
+domain, cert_path, key_path = sys.argv[2:]
+text = path.read_text(encoding="utf-8")
+
+def server_blocks(source):
+    blocks = []
+    for match in re.finditer(r"\bserver\s*\{", source):
+        brace = source.find("{", match.start())
+        depth, quote, escaped, comment = 0, None, False, False
+        for pos in range(brace, len(source)):
+            ch = source[pos]
+            if comment:
+                if ch == "\n":
+                    comment = False
+                continue
+            if quote:
+                if escaped:
+                    escaped = False
+                elif ch == "\\":
+                    escaped = True
+                elif ch == quote:
+                    quote = None
+                continue
+            if ch == "#":
+                comment = True
+            elif ch in ("'", '"'):
+                quote = ch
+            elif ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    blocks.append((match.start(), pos + 1, source[match.start():pos + 1]))
+                    break
+    return blocks
+
+targets = []
+for start, end, block in server_blocks(text):
+    names = []
+    for value in re.findall(r"(?m)^\s*server_name\s+([^;]+);", block):
+        names.extend(value.split())
+    has_tls_listener = bool(re.search(r"(?m)^\s*listen\s+[^;]*(?:443|ssl)[^;]*;", block))
+    if domain in names and has_tls_listener:
+        targets.append((start, end, block))
+
+if len(targets) != 1:
+    print(f"Ожидался один HTTPS server для {domain}, найдено: {len(targets)}", file=sys.stderr)
+    sys.exit(2)
+
+start, end, block = targets[0]
+cert_re = re.compile(r"(?m)^([ \t]*)ssl_certificate[ \t]+(?!key\b)[^;\n]+;")
+key_re = re.compile(r"(?m)^([ \t]*)ssl_certificate_key[ \t]+[^;\n]+;")
+if len(cert_re.findall(block)) != 1 or len(key_re.findall(block)) != 1:
+    print("В целевом server{} должна быть ровно одна пара ssl_certificate/ssl_certificate_key", file=sys.stderr)
+    sys.exit(3)
+
+block = cert_re.sub(lambda m: f"{m.group(1)}ssl_certificate {cert_path};", block, count=1)
+block = key_re.sub(lambda m: f"{m.group(1)}ssl_certificate_key {key_path};", block, count=1)
+updated = text[:start] + block + text[end:]
+tmp = path.with_name(path.name + ".psv1-cert.tmp")
+tmp.write_text(updated, encoding="utf-8")
+os.chmod(tmp, path.stat().st_mode)
+os.replace(tmp, path)
+PY
+}
+
+panel_cert_find_active_config(){
+  local domain="$1" entry real escaped_domain found=""
+  local -a roots=(/etc/nginx/sites-enabled /etc/nginx/conf.d)
+  escaped_domain="${domain//./\\.}"
+
+  for root in "${roots[@]}"; do
+    [[ -d "$root" ]] || continue
+    while IFS= read -r -d '' entry; do
+      real=$(readlink -f "$entry" 2>/dev/null || true)
+      [[ -f "$real" ]] || continue
+      grep -Eq "^[[:space:]]*server_name[[:space:]][^;]*${escaped_domain}([[:space:];]|$)" "$real" || continue
+      grep -Eq '^[[:space:]]*ssl_certificate[[:space:]]+' "$real" || continue
+      if [[ -n "$found" && "$found" != "$real" ]]; then
+        warn "Домен $domain найден более чем в одном активном nginx-конфиге."
+        return 2
+      fi
+      found="$real"
+    done < <(find "$root" -maxdepth 1 \( -type f -o -type l \) -print0 2>/dev/null)
+  done
+  [[ -n "$found" ]] || return 1
+  printf '%s\n' "$found"
+}
+
+panel_cert_public_ipv4(){
+  local ip=""
+  ip=$(curl -4fsS --connect-timeout 4 --max-time 8 https://api.ipify.org 2>/dev/null || true)
+  if ! valid_ipv4 "$ip"; then
+    ip=$(curl -4fsS --connect-timeout 4 --max-time 8 https://ifconfig.me/ip 2>/dev/null || true)
+  fi
+  valid_ipv4 "$ip" && printf '%s\n' "$ip"
+}
+
+run_panel_certificate(){
+  local requested_domain="${1:-}" domain="" public_ip="" dns_ips="" conf=""
+  local token="" expected="" local_answer="" public_answer="" cert_name=""
+  local live_dir="" backup="" hook="/etc/letsencrypt/renewal-hooks/deploy/panel-script-v1-nginx-reload"
+
+  ui_title "TLS-СЕРТИФИКАТ ПАНЕЛИ БЕЗ ОСТАНОВКИ СЕРВИСОВ"
+  if [[ -n "$requested_domain" ]]; then
+    valid_domain "$requested_domain" || die "Некорректный домен: $requested_domain"
+    domain="${requested_domain,,}"
+  elif [[ -n "${PANEL_DOMAIN:-}" ]] && valid_domain "$PANEL_DOMAIN"; then
+    domain="${PANEL_DOMAIN,,}"
+  else
+    ask_domain domain "HTTPS-домен Remnawave-панели" "" "panel.example.com"
+  fi
+
+  command -v nginx >/dev/null 2>&1 || die "nginx не найден. Эта команда рассчитана на уже работающую панель за nginx."
+  nginx -t >/dev/null || die "Текущая конфигурация nginx уже содержит ошибку; сертификат не выпускаю."
+  systemctl is-active --quiet nginx || die "nginx не активен. Команда не будет запускать отдельный listener на 80/443."
+
+  conf=$(panel_cert_find_active_config "$domain") || die "Не найден единственный активный HTTPS-vhost с server_name $domain. Ничего не изменено."
+  public_ip=$(panel_cert_public_ipv4 || true)
+  dns_ips=$(getent ahostsv4 "$domain" 2>/dev/null | awk '{print $1}' | sort -u || true)
+  [[ -n "$dns_ips" ]] || die "DNS A-запись $domain не разрешается в IPv4."
+  if [[ -n "$public_ip" ]] && ! grep -Fxq "$public_ip" <<<"$dns_ips"; then
+    die "DNS $domain указывает на $(tr '\n' ' ' <<<"$dns_ips"), а публичный IP этого VPS — $public_ip. Сертификат не запрашивался."
+  fi
+
+  install -d -m 0755 "$ACME_ROOT" "$ACME_ROOT/.well-known" "$ACME_ROOT/.well-known/acme-challenge"
+  token="psv1-$(openssl rand -hex 12)"
+  expected="panel-script-v1:${token}"
+  printf '%s' "$expected" > "$ACME_ROOT/.well-known/acme-challenge/$token"
+  chmod 0644 "$ACME_ROOT/.well-known/acme-challenge/$token"
+
+  local_answer=$(curl --noproxy '*' -fsS --connect-timeout 3 --max-time 8 \
+    -H "Host: $domain" "http://127.0.0.1/.well-known/acme-challenge/$token" 2>/dev/null || true)
+  public_answer=$(curl --noproxy '*' -fsS --connect-timeout 5 --max-time 15 \
+    "http://$domain/.well-known/acme-challenge/$token" 2>/dev/null || true)
+  rm -f "$ACME_ROOT/.well-known/acme-challenge/$token"
+
+  if [[ "$local_answer" != "$expected" || "$public_answer" != "$expected" ]]; then
+    warn "HTTP-01 webroot не отдал проверочный файл (локально: ${local_answer:-нет ответа}; снаружи: ${public_answer:-нет ответа})."
+    manual_do "В port 80 server{} для $domain добавь: location ^~ /.well-known/acme-challenge/ { root $ACME_ROOT; default_type text/plain; }"
+    die "Certbot не запускался; nginx, Docker и панель не изменены."
+  fi
+  auto_done "HTTP-01 проверен локально и через публичный домен; nginx остаётся запущенным."
+
+  if ! command -v certbot >/dev/null 2>&1; then
+    info "Устанавливаю только пакет certbot; nginx и Docker не останавливаются."
+    apt-get update
+    DEBIAN_FRONTEND=noninteractive apt-get install -y certbot
+  fi
+
+  cert_name="psv1-panel-${domain//./-}"
+  local -a certbot_args=(certonly --webroot -w "$ACME_ROOT" -d "$domain" \
+    --cert-name "$cert_name" --non-interactive --agree-tos --keep-until-expiring)
+  if [[ -n "${LE_EMAIL:-}" ]]; then
+    certbot_args+=(--email "$LE_EMAIL" --no-eff-email)
+  else
+    certbot_args+=(--register-unsafely-without-email)
+  fi
+  certbot "${certbot_args[@]}" || die "Let's Encrypt не выпустил сертификат. nginx и его конфигурация не изменялись."
+
+  live_dir="/etc/letsencrypt/live/$cert_name"
+  [[ -s "$live_dir/fullchain.pem" && -s "$live_dir/privkey.pem" ]] || die "Certbot завершился без ожидаемых файлов в $live_dir."
+  openssl x509 -in "$live_dir/cert.pem" -noout -checkhost "$domain" >/dev/null 2>&1 \
+    || die "Полученный сертификат не содержит домен $domain; nginx не изменён."
+  openssl x509 -in "$live_dir/cert.pem" -noout -checkend 86400 >/dev/null 2>&1 \
+    || die "Полученный сертификат уже недействителен или истекает менее чем через сутки."
+
+  install -d -m 0700 "$BACKUP_DIR"
+  backup="$BACKUP_DIR/$(basename "$conf").before-panel-cert-$(date +%Y%m%d-%H%M%S)"
+  cp -a "$conf" "$backup"
+  if ! panel_cert_patch_nginx_config "$conf" "$domain" "$live_dir/fullchain.pem" "$live_dir/privkey.pem"; then
+    cp -a "$backup" "$conf"
+    die "Не удалось однозначно изменить vhost. Восстановлен исходный конфиг: $backup"
+  fi
+  if ! nginx -t; then
+    cp -a "$backup" "$conf"
+    nginx -t >/dev/null 2>&1 || true
+    die "Новый nginx-конфиг не прошёл проверку; автоматически восстановлен $backup"
+  fi
+  if ! systemctl reload nginx; then
+    cp -a "$backup" "$conf"
+    nginx -t >/dev/null 2>&1 && systemctl reload nginx || true
+    die "Мягкий reload не удался; исходный конфиг восстановлен из $backup"
+  fi
+
+  if ! curl --noproxy '*' --resolve "$domain:443:127.0.0.1" -sS --connect-timeout 4 --max-time 12 \
+    -o /dev/null "https://$domain/api/auth/status"; then
+    cp -a "$backup" "$conf"
+    nginx -t >/dev/null 2>&1 && systemctl reload nginx || true
+    die "TLS-проверка нового сертификата не прошла; исходный vhost восстановлен из $backup"
+  fi
+
+  install -d -m 0755 "$(dirname "$hook")"
+  cat > "$hook" <<'HOOK'
+#!/usr/bin/env bash
+set -e
+nginx -t
+systemctl reload nginx
+HOOK
+  chmod 0755 "$hook"
+  if systemctl list-unit-files certbot.timer --no-legend 2>/dev/null | grep -q '^certbot.timer'; then
+    systemctl enable --now certbot.timer >/dev/null
+  fi
+
+  PANEL_DOMAIN="$domain"
+  save_state
+  ok "Действующий сертификат установлен для https://$domain"
+  auto_done "Выпуск: Certbot webroot; переключение: graceful reload nginx. Порты не освобождались, Docker/Remnawave/ноды не перезапускались."
+  check_do "Проверка без -k: curl -I https://$domain/"
+  check_do "Резервная копия прежнего nginx-vhost: $backup"
+}
+
 if [[ "${PSV1_SOURCE_ONLY:-0}" == 1 ]]; then
   return 0 2>/dev/null || exit 0
 fi
 
 case "${1:-}" in
+  --panel-cert)
+    load_state || true
+    run_panel_certificate "${2:-}"
+    exit 0
+    ;;
   --node-credentials)
     load_state || die "Нет сохранённой конфигурации ноды: $STATE_FILE"
     [[ "${PANEL_KIND:-}" == remna && ( "${REMNA_ROLE:-}" == node || "${REMNA_ROLE:-}" == both ) ]] || die "Сохранённая задача не является Remnawave-нodedой."
@@ -3134,6 +3365,7 @@ ${PROJECT_NAME} ${INSTALLER_VERSION}
 Статус: $INSTALL_PATH --status
 Обновить Node Port/SECRET_KEY: $INSTALL_PATH --node-credentials
 Управление существующей Remnawave: $INSTALL_PATH --manage-remna
+Сертификат панели без остановки сервисов: $INSTALL_PATH --panel-cert panel.example.com
 Каскад (один exit или пул exit-нод): $INSTALL_PATH --cascade
 Проверка Remnawave: $INSTALL_PATH --check-remna
 Сброс ответов: $INSTALL_PATH --reset

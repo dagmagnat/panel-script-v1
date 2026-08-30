@@ -1,0 +1,25 @@
+panel-script-v1 v1.3.0
+
+Обновление существующего установщика на сервере панели:
+
+  cp /root/panel-script-v1.sh /root/panel-script-v1.sh.before-v1.3.0
+  cp install.sh /root/panel-script-v1.sh
+  sed -i 's/\r$//' /root/panel-script-v1.sh
+  chmod 700 /root/panel-script-v1.sh
+  bash -n /root/panel-script-v1.sh
+  /root/panel-script-v1.sh --version
+
+Ожидается:
+
+  panel-script-v1 1.3.0
+
+Выпустить действующий сертификат панели без остановки nginx/Docker:
+
+  /root/panel-script-v1.sh --panel-cert pnl.amoredd.ru
+
+После успешного завершения проверить без параметра -k:
+
+  curl -I https://pnl.amoredd.ru/
+
+Команда использует только Certbot webroot и graceful reload nginx. Конфигурация
+каскада, Remnawave, remnanode и Docker-контейнеры не перезапускаются.

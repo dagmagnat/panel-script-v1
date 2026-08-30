@@ -1,4 +1,4 @@
-# Отчёт по исправлению каскада — v1.2.9
+# Отчёт по исправлению проекта — v1.3.0
 
 ## Что было сломано
 
@@ -13,10 +13,11 @@
 9. Endpoint `bulk-actions/add-users` был ошибочно использован как выборочный fallback, хотя он добавляет в squad всех пользователей.
 10. После добавления relay inbound Remnawave 3.3.0 мог временно или фактически вернуть bridge-user без `PSV1-CASCADE`, хотя первоначальная привязка уже подтверждалась.
 11. Живой ответ 3.3.0 содержит numeric `id`, но `uuid: null`; post-check ошибочно требовал непустой user UUID и отклонял реально корректное членство.
+12. Панель продолжала обслуживать публичный домен self-signed сертификатом `CN=cdn-origin`, из-за чего нода отклоняла HTTPS API панели.
 
 ## Что изменено
 
-- исправления предыдущих версий встроены в полный `install.sh` v1.2.9;
+- исправления предыдущих версий встроены в полный `install.sh` v1.3.0;
 - bridge-user и его squad membership подтверждаются повторным `GET`, с fallback через Internal Squad bulk-action;
 - squad сливается только после чтения detail endpoint и проверяется повторно;
 - exit/relay assignment подтверждается read-after-write;
@@ -32,6 +33,7 @@
 - post-check выполняет одну безопасную попытку восстановления членства и сохраняет фактическое состояние при отказе.
 - user UUID больше не считается обязательным в 3.3.0: подтверждение строится на чтении по username, VLESS UUID и squad membership;
 - исправлен JSON диагностического снимка пользователя.
+- добавлен `--panel-cert DOMAIN`: Certbot webroot без остановки nginx/Docker, точечная замена сертификата, graceful reload, TLS-проверка и автоматический откат.
 
 ## Проверено локально
 
@@ -40,6 +42,8 @@ bash -n install.sh                         PASS
 bash -n cascade-nginx-fix.sh               PASS
 bash -n tests/cascade-tests.sh              PASS
 bash tests/cascade-tests.sh                 17 checks PASS
+bash -n tests/panel-cert-tests.sh           PASS
+bash tests/panel-cert-tests.sh              3 checks PASS
 ```
 
 Живой end-to-end тест требует доступа к вашей Remnawave, relay, exit и CDN и в локальной среде не выполнялся. После установки успешная автоматическая конфигурация должна завершиться статусом `api-verified`; сетевое плечо relay → exit дополнительно проверяется командой из созданного `VERIFY.txt`.

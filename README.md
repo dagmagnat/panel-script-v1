@@ -4,7 +4,7 @@
 
 Цель проекта — максимально автоматизировать установку, но при этом явно показывать пользователю, что скрипт сделал сам и какие действия нужно выполнить вручную в кабинете CDN/DNS.
 
-> Текущая версия README рассчитана на `panel-script-v1 1.2.9`. В архиве уже лежит полный готовый `install.sh`; применять старые hotfix-файлы поверх него не нужно.
+> Текущая версия README рассчитана на `panel-script-v1 1.3.0`. В архиве уже лежит полный готовый `install.sh`; применять старые hotfix-файлы поверх него не нужно.
 
 ## Что поддерживается
 
@@ -87,6 +87,7 @@ chmod 700 /root/panel-script-v1.sh
 ```bash
 /root/panel-script-v1.sh                 # обычный запуск / продолжение
 /root/panel-script-v1.sh --manage-remna  # управление существующей Remnawave
+/root/panel-script-v1.sh --panel-cert pnl.example.com  # сертификат панели без остановки сервисов
 /root/panel-script-v1.sh --cascade       # каскад: один exit или пул нескольких exit-нод
 /root/panel-script-v1.sh --check-remna   # проверка Remnawave
 /root/panel-script-v1.sh --status        # сохранённый статус и результат
@@ -98,6 +99,31 @@ chmod 700 /root/panel-script-v1.sh
 ```
 
 `--reset` **не удаляет** установленную панель, Docker, nginx, ноду или другие программы.
+
+## Сертификат уже работающей панели
+
+Если панель или нода сообщает о self-signed certificate, на сервере центральной
+панели выполни:
+
+```bash
+/root/panel-script-v1.sh --panel-cert pnl.example.com
+```
+
+Команда не использует `certbot --standalone`, не останавливает nginx и не
+перезапускает Docker/Remnawave. Она:
+
+1. проверяет DNS A-запись и единственный активный HTTPS-vhost нужного домена;
+2. кладёт временный файл в `/var/www/certbot` и проверяет HTTP-01 локально и
+   через публичный домен;
+3. выпускает сертификат командой `certbot certonly --webroot`;
+4. сохраняет точную резервную копию nginx-vhost;
+5. заменяет только `ssl_certificate`/`ssl_certificate_key`, выполняет
+   `nginx -t` и graceful reload;
+6. проверяет TLS без `-k` и устанавливает deploy-hook для будущих продлений.
+
+При неоднозначном vhost, недоступном challenge, несовпадении DNS или ошибке
+проверки команда прекращает работу. Если конфиг уже был переключён, он
+автоматически восстанавливается из резервной копии.
 
 ## Как выглядит работа скрипта
 
@@ -211,6 +237,7 @@ VLESS UUID и членство в squad считаются достаточны�
 ```bash
 bash -n install.sh
 bash -n cascade-nginx-fix.sh
+bash tests/panel-cert-tests.sh
 bash tests/cascade-tests.sh
 ```
 

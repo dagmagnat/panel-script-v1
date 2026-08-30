@@ -1,4 +1,4 @@
-panel-script-v1 v1.2.9 — БЫСТРЫЙ СТАРТ
+panel-script-v1 v1.3.0 — БЫСТРЫЙ СТАРТ
 ======================================
 
 Новый VPS:
@@ -9,6 +9,10 @@ panel-script-v1 v1.2.9 — БЫСТРЫЙ СТАРТ
 Существующая Remnawave:
 
   ./install.sh --manage-remna
+
+Заменить self-signed сертификат панели без остановки nginx/Docker:
+
+  ./install.sh --panel-cert pnl.example.com
 
 Каскад Remnawave (запускать на сервере центральной панели):
 
@@ -29,6 +33,7 @@ failed-postcheck означает, что одно из обязательных
 
   bash -n install.sh
   bash -n cascade-nginx-fix.sh
+  bash tests/panel-cert-tests.sh
   bash tests/cascade-tests.sh
 
 Версия:
