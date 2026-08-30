@@ -11,7 +11,7 @@ IFS=$'\n\t'
 # This installer deliberately keeps each CDN preset separate. Do not mix fields
 # between providers: path/padding/uplink settings are provider-specific.
 
-INSTALLER_VERSION="1.3.0"
+INSTALLER_VERSION="1.3.1"
 STATE_SCHEMA_CURRENT="1"
 PRESET="${INSTALLER_PRESET:-}"
 
@@ -3185,6 +3185,31 @@ panel_cert_public_ipv4(){
   valid_ipv4 "$ip" && printf '%s\n' "$ip"
 }
 
+panel_cert_served_fingerprint(){
+  local domain="$1"
+  openssl s_client -connect 127.0.0.1:443 -servername "$domain" </dev/null 2>/dev/null \
+    | openssl x509 -noout -fingerprint -sha256 2>/dev/null \
+    | sed 's/^sha256 Fingerprint=//; s/^SHA256 Fingerprint=//' \
+    | tr -d ':[:space:]' \
+    | tr '[:lower:]' '[:upper:]'
+}
+
+panel_cert_wait_until_loaded(){
+  local domain="$1" cert_file="$2" tries="${3:-20}" expected="" actual="" i
+  expected=$(openssl x509 -in "$cert_file" -noout -fingerprint -sha256 2>/dev/null \
+    | sed 's/^sha256 Fingerprint=//; s/^SHA256 Fingerprint=//' \
+    | tr -d ':[:space:]' \
+    | tr '[:lower:]' '[:upper:]')
+  [[ -n "$expected" ]] || return 1
+  for ((i=1; i<=tries; i++)); do
+    actual=$(panel_cert_served_fingerprint "$domain" || true)
+    [[ -n "$actual" && "$actual" == "$expected" ]] && return 0
+    sleep 1
+  done
+  warn "nginx всё ещё отдаёт другой сертификат (ожидался fingerprint $expected, получен ${actual:-нет})."
+  return 1
+}
+
 run_panel_certificate(){
   local requested_domain="${1:-}" domain="" public_ip="" dns_ips="" conf=""
   local token="" expected="" local_answer="" public_answer="" cert_name=""
@@ -3270,6 +3295,16 @@ run_panel_certificate(){
     cp -a "$backup" "$conf"
     nginx -t >/dev/null 2>&1 && systemctl reload nginx || true
     die "Мягкий reload не удался; исходный конфиг восстановлен из $backup"
+  fi
+
+  # systemctl reload отправляет master-процессу HUP и может вернуться раньше,
+  # чем старые workers перестанут принимать новые соединения. Проверяем именно
+  # fingerprint выпущенного сертификата с повторами, а не делаем мгновенный
+  # curl, который способен попасть в старый worker и вызвать ложный откат.
+  if ! panel_cert_wait_until_loaded "$domain" "$live_dir/cert.pem" 20; then
+    cp -a "$backup" "$conf"
+    nginx -t >/dev/null 2>&1 && systemctl reload nginx || true
+    die "nginx не загрузил выпущенный сертификат за 20 секунд; исходный vhost восстановлен из $backup"
   fi
 
   if ! curl --noproxy '*' --resolve "$domain:443:127.0.0.1" -sS --connect-timeout 4 --max-time 12 \

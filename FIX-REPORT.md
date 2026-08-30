@@ -1,4 +1,4 @@
-# Отчёт по исправлению проекта — v1.3.0
+# Отчёт по исправлению проекта — v1.3.1
 
 ## Что было сломано
 
@@ -17,7 +17,7 @@
 
 ## Что изменено
 
-- исправления предыдущих версий встроены в полный `install.sh` v1.3.0;
+- исправления предыдущих версий встроены в полный `install.sh` v1.3.1;
 - bridge-user и его squad membership подтверждаются повторным `GET`, с fallback через Internal Squad bulk-action;
 - squad сливается только после чтения detail endpoint и проверяется повторно;
 - exit/relay assignment подтверждается read-after-write;
@@ -34,6 +34,7 @@
 - user UUID больше не считается обязательным в 3.3.0: подтверждение строится на чтении по username, VLESS UUID и squad membership;
 - исправлен JSON диагностического снимка пользователя.
 - добавлен `--panel-cert DOMAIN`: Certbot webroot без остановки nginx/Docker, точечная замена сертификата, graceful reload, TLS-проверка и автоматический откат.
+- после reload проверяется fingerprint с ожиданием до 20 секунд, поэтому соединение со старым worker больше не вызывает ложный откат.
 
 ## Проверено локально
 
@@ -43,7 +44,7 @@ bash -n cascade-nginx-fix.sh               PASS
 bash -n tests/cascade-tests.sh              PASS
 bash tests/cascade-tests.sh                 17 checks PASS
 bash -n tests/panel-cert-tests.sh           PASS
-bash tests/panel-cert-tests.sh              3 checks PASS
+bash tests/panel-cert-tests.sh              4 checks PASS
 ```
 
 Живой end-to-end тест требует доступа к вашей Remnawave, relay, exit и CDN и в локальной среде не выполнялся. После установки успешная автоматическая конфигурация должна завершиться статусом `api-verified`; сетевое плечо relay → exit дополнительно проверяется командой из созданного `VERIFY.txt`.

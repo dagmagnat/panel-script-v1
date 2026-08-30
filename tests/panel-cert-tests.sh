@@ -66,4 +66,24 @@ fi
 cmp -s "$CONF" "$CONF.before" || fail "ambiguous config was modified"
 pass "ambiguous HTTPS vhosts are rejected without changes"
 
+openssl req -x509 -newkey rsa:2048 -nodes -days 1 -subj '//CN=pnl.amoredd.ru' \
+  -keyout "$TEST_TMP/test.key" -out "$TEST_TMP/test.crt" >/dev/null 2>&1
+EXPECTED_FP=$(openssl x509 -in "$TEST_TMP/test.crt" -noout -fingerprint -sha256 \
+  | sed 's/^sha256 Fingerprint=//; s/^SHA256 Fingerprint=//' \
+  | tr -d ':[:space:]' | tr '[:lower:]' '[:upper:]')
+MOCK_COUNT_FILE="$TEST_TMP/fingerprint-count"
+printf '0\n' > "$MOCK_COUNT_FILE"
+sleep(){ :; }
+panel_cert_served_fingerprint(){
+  local count
+  count=$(cat "$MOCK_COUNT_FILE")
+  count=$((count + 1))
+  printf '%s\n' "$count" > "$MOCK_COUNT_FILE"
+  if (( count < 3 )); then printf 'OLD-FINGERPRINT\n'; else printf '%s\n' "$EXPECTED_FP"; fi
+}
+panel_cert_wait_until_loaded pnl.amoredd.ru "$TEST_TMP/test.crt" 5 \
+  || fail "fingerprint wait did not accept a later matching worker"
+[[ "$(cat "$MOCK_COUNT_FILE")" == 3 ]] || fail "fingerprint wait did not retry"
+pass "certificate verification waits for the new nginx worker"
+
 echo "All panel certificate tests passed."
