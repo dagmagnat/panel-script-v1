@@ -116,16 +116,16 @@ rm_api(){
       mv "$NODE_FILE.next" "$NODE_FILE"
       echo '{"response":{"eventSent":true}}'
       ;;
-    postcheck:GET:/api/nodes/relay-node|postcheck-repair:GET:/api/nodes/relay-node)
+    postcheck:GET:/api/nodes/relay-node|postcheck-repair:GET:/api/nodes/relay-node|postcheck-id-only:GET:/api/nodes/relay-node)
       echo '{"response":{"uuid":"relay-node","name":"RU","address":"198.51.100.2","configProfile":{"activeConfigProfileUuid":"relay-profile","activeInbounds":[{"uuid":"relay-inbound"}]}}}'
       ;;
-    postcheck:GET:/api/nodes/exit-node|postcheck-repair:GET:/api/nodes/exit-node)
+    postcheck:GET:/api/nodes/exit-node|postcheck-repair:GET:/api/nodes/exit-node|postcheck-id-only:GET:/api/nodes/exit-node)
       echo '{"response":{"uuid":"exit-node","name":"NL","address":"203.0.113.10","configProfile":{"activeConfigProfileUuid":"exit-profile","activeInbounds":[{"uuid":"bridge-inbound"}]}}}'
       ;;
-    postcheck:GET:/api/internal-squads/squad-1|postcheck-repair:GET:/api/internal-squads/squad-1)
+    postcheck:GET:/api/internal-squads/squad-1|postcheck-repair:GET:/api/internal-squads/squad-1|postcheck-id-only:GET:/api/internal-squads/squad-1)
       echo '{"response":{"uuid":"squad-1","name":"PSV1-CASCADE","inbounds":[{"uuid":"relay-inbound"},{"uuid":"bridge-inbound"}]}}'
       ;;
-    postcheck:GET:/api/config-profiles/relay-profile|postcheck-repair:GET:/api/config-profiles/relay-profile)
+    postcheck:GET:/api/config-profiles/relay-profile|postcheck-repair:GET:/api/config-profiles/relay-profile|postcheck-id-only:GET:/api/config-profiles/relay-profile)
       echo '{"response":{"uuid":"relay-profile","name":"cascade","config":{"inbounds":[],"outbounds":[{"tag":"VLESS_EXIT","protocol":"vless","settings":{"vnext":[{"address":"203.0.113.10","port":8888,"users":[{"id":"55555555-5555-4555-8555-555555555555"}]}]}}],"routing":{"rules":[{"type":"field","network":"tcp,udp","outboundTag":"VLESS_EXIT"}]}}}}'
       ;;
     postcheck:GET:/api/users/by-username/bridge_postcheck)
@@ -139,6 +139,12 @@ rm_api(){
       jq --argjson b "$body" '.activeInternalSquads=($b.activeInternalSquads | map({uuid:.,name:"PSV1-CASCADE"}))' "$USER_FILE" > "$USER_FILE.next"
       mv "$USER_FILE.next" "$USER_FILE"
       echo '{"response":{"eventSent":true}}'
+      ;;
+    postcheck-id-only:GET:/api/users/by-username/bridge_postcheck)
+      echo '{"response":{"id":2,"uuid":null,"username":"bridge_postcheck","status":"ACTIVE","vlessUuid":"55555555-5555-4555-8555-555555555555","activeInternalSquads":[{"uuid":"squad-1","name":"PSV1-CASCADE"}]}}'
+      ;;
+    postcheck-id-only:PATCH:/api/users|postcheck-id-only:POST:/api/internal-squads/squad-1/bulk-actions/add-many-users)
+      fail "id-only valid user must not trigger membership repair"
       ;;
     *) echo '{}' ;;
   esac
@@ -222,6 +228,14 @@ test_api_postcheck_repairs_membership(){
   assert_jq "$(cat "$USER_FILE")" 'any(.activeInternalSquads[]; .uuid=="squad-1")' "post-check: missing membership is repaired and re-read"
 }
 
+test_api_postcheck_accepts_33_id_only_user(){
+  local exits
+  TEST_SCENARIO=postcheck-id-only
+  exits='[{"uuid":"exit-node","name":"NL","ip":"203.0.113.10","suffix":"post","bridgeTag":"BRIDGE_IN-post","bridgeInboundUuid":"bridge-inbound","bridgeProfileUuid":"exit-profile","bridgeUuid":"55555555-5555-4555-8555-555555555555","userName":"bridge_postcheck"}]'
+  rm_verify_cascade_api_postconditions token relay-node relay-profile relay-inbound squad-1 "$exits" || fail "post-check: Remnawave 3.3 id-only user rejected"
+  pass "post-check: Remnawave 3.3 user with id and uuid=null is accepted"
+}
+
 test_relay_profiles
 test_bridge_user_short_create_response
 test_bridge_user_short_patch_response
@@ -232,4 +246,5 @@ test_node_assignment_uses_read_after_write
 test_incompatible_bridge_is_rejected
 test_api_postconditions
 test_api_postcheck_repairs_membership
+test_api_postcheck_accepts_33_id_only_user
 echo "All cascade tests passed."

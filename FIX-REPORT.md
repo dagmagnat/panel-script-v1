@@ -1,4 +1,4 @@
-# Отчёт по исправлению каскада — v1.2.8
+# Отчёт по исправлению каскада — v1.2.9
 
 ## Что было сломано
 
@@ -12,10 +12,11 @@
 8. В Remnawave 3.3.0 `PATCH /api/users` не принимает UUID пользователя как идентификатор; из-за этого уже созданный bridge-user не удавалось привязать к squad.
 9. Endpoint `bulk-actions/add-users` был ошибочно использован как выборочный fallback, хотя он добавляет в squad всех пользователей.
 10. После добавления relay inbound Remnawave 3.3.0 мог временно или фактически вернуть bridge-user без `PSV1-CASCADE`, хотя первоначальная привязка уже подтверждалась.
+11. Живой ответ 3.3.0 содержит numeric `id`, но `uuid: null`; post-check ошибочно требовал непустой user UUID и отклонял реально корректное членство.
 
 ## Что изменено
 
-- исправления предыдущих версий встроены в полный `install.sh` v1.2.8;
+- исправления предыдущих версий встроены в полный `install.sh` v1.2.9;
 - bridge-user и его squad membership подтверждаются повторным `GET`, с fallback через Internal Squad bulk-action;
 - squad сливается только после чтения detail endpoint и проверяется повторно;
 - exit/relay assignment подтверждается read-after-write;
@@ -29,6 +30,8 @@
 - при несовместимости полного create-запроса выполняется минимальное создание с серверным VLESS UUID.
 - после финального обновления squad bridge-user подтверждается повторно;
 - post-check выполняет одну безопасную попытку восстановления членства и сохраняет фактическое состояние при отказе.
+- user UUID больше не считается обязательным в 3.3.0: подтверждение строится на чтении по username, VLESS UUID и squad membership;
+- исправлен JSON диагностического снимка пользователя.
 
 ## Проверено локально
 
@@ -36,7 +39,7 @@
 bash -n install.sh                         PASS
 bash -n cascade-nginx-fix.sh               PASS
 bash -n tests/cascade-tests.sh              PASS
-bash tests/cascade-tests.sh                 16 checks PASS
+bash tests/cascade-tests.sh                 17 checks PASS
 ```
 
 Живой end-to-end тест требует доступа к вашей Remnawave, relay, exit и CDN и в локальной среде не выполнялся. После установки успешная автоматическая конфигурация должна завершиться статусом `api-verified`; сетевое плечо relay → exit дополнительно проверяется командой из созданного `VERIFY.txt`.

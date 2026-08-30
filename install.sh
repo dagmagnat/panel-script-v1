@@ -11,7 +11,7 @@ IFS=$'\n\t'
 # This installer deliberately keeps each CDN preset separate. Do not mix fields
 # between providers: path/padding/uplink settings are provider-specific.
 
-INSTALLER_VERSION="1.2.8"
+INSTALLER_VERSION="1.2.9"
 STATE_SCHEMA_CURRENT="1"
 PRESET="${INSTALLER_PRESET:-}"
 
@@ -1571,15 +1571,20 @@ rm_user_has_squad(){
 }
 
 rm_api_wait_bridge_user_state(){
-  local token="$1" username="$2" squad_uuid="$3" user user_uuid vless attempt
+  local token="$1" username="$2" squad_uuid="$3" user user_uuid user_id vless attempt
   # Node/squad events in Remnawave 3.3.0 can briefly make a freshly updated
   # user read stale while Xray configs are being regenerated.
   for attempt in 1 2 3 4 5 6 7 8; do
     user=$(rm_api_user_doc "$token" "$username")
     user_uuid=$(jq -r '.uuid // empty' <<<"$user" 2>/dev/null || true)
+    user_id=$(jq -r '.id // empty' <<<"$user" 2>/dev/null || true)
     vless=$(jq -r '.vlessUuid // .vless_uuid // empty' <<<"$user" 2>/dev/null || true)
-    if [[ -n "$user_uuid" && -n "$vless" ]] && rm_user_has_squad "$user" "$squad_uuid"; then
-      jq -nc --arg u "$user_uuid" --arg v "$vless" '{userUuid:$u,vlessUuid:$v}'
+    # Remnawave 3.3.0 identifies users by numeric id/username and can return
+    # uuid:null. The successful by-username read already proves identity; the
+    # cascade requires only the actual VLESS UUID and squad membership.
+    if [[ -n "$vless" ]] && rm_user_has_squad "$user" "$squad_uuid"; then
+      jq -nc --arg u "$user_uuid" --arg i "$user_id" --arg v "$vless" \
+        '{userUuid:(if ($u|length)>0 then $u else null end),userId:(if ($i|length)>0 then $i else null end),vlessUuid:$v}'
       return 0
     fi
     (( attempt < 8 )) && sleep 1
@@ -1746,7 +1751,8 @@ rm_verify_cascade_api_postconditions(){
       if [[ -n "$user" ]] && state=$(rm_api_attach_user_to_squad "$token" "$user" "$squad_uuid"); then
         warn "Post-check: повторно закрепил bridge-user '$username' в PSV1-CASCADE после синхронизации нод."
       else
-        rm_api_save_redacted_response "$RM_MANAGER_DIR/last-api-error-cascade-user-postcheck.json" "${user:-{}}"
+        [[ -n "$user" ]] || user='{}'
+        rm_api_save_redacted_response "$RM_MANAGER_DIR/last-api-error-cascade-user-postcheck.json" "$user"
         warn "Post-check: bridge-user '$username' не подтверждён в PSV1-CASCADE."
         warn "Фактическое состояние пользователя: $RM_MANAGER_DIR/last-api-error-cascade-user-postcheck.json"
         return 1

@@ -1,0 +1,22 @@
+panel-script-v1 v1.2.9
+
+Обновление существующего установщика на сервере панели:
+
+  cp /root/panel-script-v1.sh /root/panel-script-v1.sh.before-v1.2.9
+  cp install.sh /root/panel-script-v1.sh
+  sed -i 's/\r$//' /root/panel-script-v1.sh
+  chmod 700 /root/panel-script-v1.sh
+  bash -n /root/panel-script-v1.sh
+  /root/panel-script-v1.sh --version
+
+Ожидается:
+
+  panel-script-v1 1.2.9
+
+Затем повторить:
+
+  /root/panel-script-v1.sh --cascade
+
+Выбрать те же RUS relay, SWE exit, TurboFlare и домены. Фактический пользователь
+bridge_995cb9 уже ACTIVE и состоит в PSV1-CASCADE. Версия 1.2.9 корректно
+принимает ответ Remnawave 3.3.0 с id=2 и uuid=null.
