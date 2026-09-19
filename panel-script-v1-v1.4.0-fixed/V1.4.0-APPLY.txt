@@ -1,0 +1,28 @@
+panel-script-v1 v1.4.0
+
+Обновить файл на CDN/relay-нoде и проверить версию:
+
+  sed -i 's/\r$//' /root/panel-script-v1.sh
+  chmod 700 /root/panel-script-v1.sh
+  bash -n /root/panel-script-v1.sh
+  /root/panel-script-v1.sh --version
+
+Ожидается:
+
+  panel-script-v1 1.4.0
+
+Интерактивный выбор frontend:
+
+  /root/panel-script-v1.sh --frontend
+
+Или включить SFTPGo явно:
+
+  /root/panel-script-v1.sh --frontend sftpgo cloud.aer01.ru
+
+Вернуть заглушку без удаления данных SFTPGo:
+
+  /root/panel-script-v1.sh --frontend placeholder
+
+Начальные пароли после установки:
+
+  cat /opt/psv1-sftpgo/credentials.txt
