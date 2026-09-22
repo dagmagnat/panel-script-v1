@@ -22,19 +22,45 @@ assert_jq(){
 }
 
 test_relay_profiles(){
-  local single pool cfg
+  local single pool cfg first_tag second merged
   single='[{"uuid":"exit-1","name":"NL","ip":"203.0.113.10","suffix":"aaa111","bridgeTag":"BRIDGE_IN-aaa111","bridgeInboundUuid":"in-1","bridgeProfileUuid":"profile-1","bridgeUuid":"11111111-1111-4111-8111-111111111111","userName":"bridge_aaa111"}]'
   cfg=$(rm_cascade_relay_config_json turboflare relay-tag "$single" roundRobin)
-  assert_jq "$cfg" '.inbounds[0].port==7443 and .inbounds[0].listen=="127.0.0.1"' "single: relay inbound is local :7443"
-  assert_jq "$cfg" '[.outbounds[] | select(.protocol=="vless")] | length==1' "single: exactly one VLESS_EXIT"
-  assert_jq "$cfg" 'any(.routing.rules[]; .network=="tcp,udp" and .outboundTag=="VLESS_EXIT")' "single: catch-all routes to VLESS_EXIT"
+  assert_jq "$cfg" '.inbounds[0].port==7443 and .inbounds[0].listen=="127.0.0.1"' "single: TurboFlare relay inbound is local :7443"
+  assert_jq "$cfg" '[.outbounds[] | select(.protocol=="vless")] | length==1' "single: exactly one namespaced VLESS exit"
+  assert_jq "$cfg" 'any(.routing.rules[]; .network=="tcp,udp" and (.inboundTag|index("relay-tag"))!=null and (.outboundTag|startswith("PSV1_")))' "single: catch-all is constrained by inboundTag"
   assert_jq "$cfg" '(.routing.balancers // []) | length==0' "single: no balancer"
 
   pool=$(jq -nc --argjson one "$single" '$one + [{uuid:"exit-2",name:"DE",ip:"203.0.113.11",suffix:"bbb222",bridgeTag:"BRIDGE_IN-bbb222",bridgeInboundUuid:"in-2",bridgeProfileUuid:"profile-2",bridgeUuid:"22222222-2222-4222-8222-222222222222",userName:"bridge_bbb222"}]')
   cfg=$(rm_cascade_relay_config_json vk relay-tag "$pool" random)
   assert_jq "$cfg" '[.outbounds[] | select(.protocol=="vless")] | length==2' "pool: both VLESS_EXIT outbounds exist"
-  assert_jq "$cfg" '.routing.balancers[0].tag=="EXIT_POOL" and .routing.balancers[0].strategy.type=="random"' "pool: requested balancer strategy"
-  assert_jq "$cfg" 'any(.routing.rules[]; .network=="tcp,udp" and .balancerTag=="EXIT_POOL")' "pool: catch-all routes to EXIT_POOL"
+  assert_jq "$cfg" '.inbounds[0].port==7446' "pool: VK gets its own relay port"
+  assert_jq "$cfg" '.routing.balancers[0].tag|startswith("PSV1_")' "pool: balancer tag is namespaced"
+  assert_jq "$cfg" '.routing.balancers[0].strategy.type=="random"' "pool: requested balancer strategy"
+  assert_jq "$cfg" 'any(.routing.rules[]; .network=="tcp,udp" and (.inboundTag|index("relay-tag"))!=null and (.balancerTag|startswith("PSV1_")))' "pool: catch-all routes only this inbound to its pool"
+
+  first_tag=turbo-route
+  second=vk-route
+  cfg=$(rm_cascade_relay_config_json turboflare "$first_tag" "$single" roundRobin)
+  merged=$(rm_profile_merge_cascade_route_json "$cfg" "$(rm_cascade_relay_config_json vk "$second" "$pool" random)" "$second")
+  assert_jq "$merged" '[.inbounds[].tag] | sort == ["turbo-route","vk-route"]' "multi-route: both CDN inbounds are preserved"
+  assert_jq "$merged" 'any(.routing.rules[]; .network=="tcp,udp" and (.inboundTag|index("turbo-route"))!=null)' "multi-route: TurboFlare keeps its route"
+  assert_jq "$merged" 'any(.routing.rules[]; .network=="tcp,udp" and (.inboundTag|index("vk-route"))!=null)' "multi-route: VK has an independent route"
+  if rm_profile_merge_cascade_route_json "$(jq -c '.inbounds += [{tag:"foreign",port:7446}]' <<<"$cfg")" "$(rm_cascade_relay_config_json vk "$second" "$pool" random)" "$second" >/dev/null 2>&1; then
+    fail "multi-route: conflicting relay port was accepted"
+  fi
+  pass "multi-route: conflicting relay port is rejected"
+}
+
+test_profile_inbound_merge(){
+  local base add merged
+  base='{"inbounds":[{"tag":"existing","port":9000}],"outbounds":[{"tag":"DIRECT","protocol":"freedom"}],"routing":{"rules":[]}}'
+  add=$(rm_method_inbound_json yandex yandex-new)
+  merged=$(rm_profile_merge_inbound_json "$base" "$add")
+  assert_jq "$merged" '[.inbounds[].tag] | sort == ["existing","yandex-new"]' "profile merge: old and new provider inbound coexist"
+  if rm_profile_merge_inbound_json "$base" "$(jq -c '.port=9000' <<<"$add")" >/dev/null 2>&1; then
+    fail "profile merge: conflicting port was accepted"
+  fi
+  pass "profile merge: conflicting port is rejected"
 }
 
 TEST_SCENARIO=""
@@ -236,7 +262,23 @@ test_api_postcheck_accepts_33_id_only_user(){
   pass "post-check: Remnawave 3.3 user with id and uuid=null is accepted"
 }
 
+test_node_only_discards_legacy_cdn_state(){
+  PANEL_KIND=remna
+  REMNA_ROLE=node
+  METHOD=turboflare
+  ORIGIN_DOMAIN=origin.example.net
+  CDN_DOMAIN=cdn.example.net
+  LE_EMAIL=admin@example.net
+  ENABLE_UFW=yes
+  CASCADE=yes
+  normalize_remna_node_install || fail "node-only: legacy CDN state was not detected"
+  [[ "$METHOD" == none && -z "$ORIGIN_DOMAIN" && -z "$CDN_DOMAIN" ]] || fail "node-only: provider state was not cleared"
+  [[ -z "$LE_EMAIL" && "$ENABLE_UFW" == no && "$CASCADE" == no ]] || fail "node-only: nginx/ACME/firewall state was not disabled"
+  pass "node-only: installs only remnanode and preserves ports 80/443"
+}
+
 test_relay_profiles
+test_profile_inbound_merge
 test_bridge_user_short_create_response
 test_bridge_user_short_patch_response
 test_bridge_user_selective_bulk_fallback
@@ -247,4 +289,5 @@ test_incompatible_bridge_is_rejected
 test_api_postconditions
 test_api_postcheck_repairs_membership
 test_api_postcheck_accepts_33_id_only_user
+test_node_only_discards_legacy_cdn_state
 echo "All cascade tests passed."

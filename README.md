@@ -4,7 +4,7 @@
 
 Цель проекта — максимально автоматизировать установку, но при этом явно показывать пользователю, что скрипт сделал сам и какие действия нужно выполнить вручную в кабинете CDN/DNS.
 
-> Текущая версия README рассчитана на `panel-script-v1 1.4.1`. В архиве уже лежит полный готовый `install.sh`; применять старые hotfix-файлы поверх него не нужно.
+> Текущая версия README рассчитана на `panel-script-v1 1.4.0`. В архиве уже лежит полный готовый `install.sh`; применять старые hotfix-файлы поверх него не нужно.
 
 ## Что поддерживается
 
@@ -19,7 +19,7 @@
 | Selectel | `10088` |
 | TurboFlare | `10089` |
 
-Remnawave поддерживает схему **центральная панель + несколько удалённых нод**. Для каждой ноды рекомендуется использовать один CDN-метод.
+Remnawave поддерживает схему **центральная панель + несколько удалённых нод**. Одна Node может держать несколько CDN-методов в одном активном Config Profile. Для каждого метода нужны свой порт и свой origin-vhost; при каскаде — свой `inboundTag` и свои outbound/balancer.
 
 ### 3x-ui
 
@@ -88,9 +88,7 @@ chmod 700 /root/panel-script-v1.sh
 /root/panel-script-v1.sh                 # обычный запуск / продолжение
 /root/panel-script-v1.sh --manage-remna  # управление существующей Remnawave
 /root/panel-script-v1.sh --panel-cert pnl.example.com  # сертификат панели без остановки сервисов
-/root/panel-script-v1.sh --frontend    # заглушка или SFTPGo на обычных URL CDN
 /root/panel-script-v1.sh --cascade       # каскад: один exit или пул нескольких exit-нод
-/root/panel-script-v1.sh --cascade-relay-nginx  # переключить nginx relay с базового inbound на :7443
 /root/panel-script-v1.sh --check-remna   # проверка Remnawave
 /root/panel-script-v1.sh --status        # сохранённый статус и результат
 /root/panel-script-v1.sh --version       # версия
@@ -98,46 +96,10 @@ chmod 700 /root/panel-script-v1.sh
 /root/panel-script-v1.sh --update        # обновить install.sh из GitHub
 /root/panel-script-v1.sh --reset         # сбросить только ответы/прогресс установщика
 /root/panel-script-v1.sh --node-credentials  # изменить Node Port / SECRET_KEY
+/root/panel-script-v1.sh --node-caddy-route turboflare file.example.ru 7443  # добавить XHTTP path, сохранив SFTPGo на /
 ```
 
 `--reset` **не удаляет** установленную панель, Docker, nginx, ноду или другие программы.
-
-## Заглушка или настоящий SFTPGo
-
-При установке отдельной Remnawave CDN-ноды мастер предлагает, что показывать
-на обычных URL:
-
-```text
-1 — статическая страница-заглушка
-2 — SFTPGo: файловый менеджер
-```
-
-Для уже установленной ноды выбор можно изменить без переустановки:
-
-```bash
-/root/panel-script-v1.sh --frontend
-# либо явно:
-/root/panel-script-v1.sh --frontend sftpgo cloud.example.com
-/root/panel-script-v1.sh --frontend placeholder
-```
-
-SFTPGo запускается отдельным контейнером `psv1-sftpgo` только на
-`127.0.0.1:18080`. Второй Caddy/nginx не устанавливается, порты `80/443` не
-занимаются. В существующем `cdn-origin.conf` меняются только два fallback
-`location /`; XHTTP location и upstream остаются без изменений. До и после
-reload скрипт сравнивает HTTP-код XHTTP и автоматически откатывает nginx при
-отличии или ошибке.
-
-Данные сохраняются в `/opt/psv1-sftpgo/storage`, состояние — в
-`/opt/psv1-sftpgo/state`, начальные пароли — в
-`/opt/psv1-sftpgo/credentials.txt`. Возврат к заглушке останавливает контейнер,
-но не удаляет данные.
-
-Если публичный домен проходит через CDN, для SFTPGo необходимо полностью
-отключить кеш, передавать `Cookie`/`Authorization` и разрешить методы
-`POST`, `PUT`, `PATCH`, `DELETE`, `OPTIONS`. Без этого вход и файловые операции
-не будут работать. Для административного интерфейса безопаснее отдельный прямой
-домен без CDN.
 
 ## Сертификат уже работающей панели
 
@@ -180,21 +142,36 @@ fingerprint именно нового сертификата. Это исклю�
 
 Если API панели не позволяет выполнить отдельный шаг автоматически, скрипт не должен молча пропускать его: в конце создаётся инструкция с точными действиями для пользователя.
 
-## Remnawave Node без CDN для каскада
+## Remnawave Node: сначала только Node
 
-Если нужно добавить на уже работающий сервер панели только `remnanode` для роли relay/exit, CDN-метод выбирать **не нужно**. В меню есть отдельный безопасный пункт:
+Пункт `установить только Node` теперь всегда ставит только `remnanode`. Он не спрашивает CDN-метод, домены и Let's Encrypt, не ставит nginx, не занимает `80/443` и не меняет уже работающий Caddy/SFTPGo.
 
 ```text
-2 — добавить remnanode на ЭТОТ VPS без CDN (для relay/exit каскада)
+3 — установить только Node (без CDN/nginx/Host)
 ```
 
-Либо в полном мастере: `Метод / назначение ноды -> 7 — БЕЗ CDN — только нода для каскада`. В этом режиме не создаются CDN Host/origin и не переписывается nginx панели. После подключения ноды каскад настраивается на сервере центральной панели командой `--cascade`.
+После привязки Node и статуса Online запусти на сервере центральной панели `--manage-remna` для CDN-профиля/Host или `--cascade` для relay/exit. Ноду переустанавливать не нужно.
+
+Старое незавершённое состояние `REMNA_ROLE=node` + CDN при повторном запуске автоматически переводится в node-only. Это не удаляет уже установленные программы.
+
+### Два домена CDN: публичный и origin
+
+- `CDN_DOMAIN` — адрес, который открывает клиент. Он ведёт на edge CDN.
+- `ORIGIN_DOMAIN` — прямой домен источника. Он ведёт на VPS, и его имя передаётся CDN как Origin Host и SNI.
+
+Пример со скриншота Yandex: `cloud.aer01.ru` — публичный CDN-домен, `file.aer01.ru` — origin Host/SNI. Если `https://file.aer01.ru/` открывает SFTPGo, то при отключённом кэше и правильных Host/SNI `https://cloud.aer01.ru/` должен показать тот же SFTPGo. Если видна заглушка, CDN обращается не к тому vhost: проверь Origin Host/SNI, а не переустанавливай Node.
+
+Для TurboFlare делегированный домен — public/CDN, а `file.example.ru` — прямой домен проверки origin. В кабинете TurboFlare оставь Address=`IP_VPS:443` и HTTPS=`ON`: если форма не принимает домен, заменять IP не нужно. Origin-vhost на `:443` должен отдавать SFTPGo/заглушку на `/` и XHTTP только на специальном path.
+
+Если SFTPGo уже работает через `/opt/e-cloudfiles/Caddyfile`, мастер создаёт готовую команду `APPLY-ON-NODE.sh` или `APPLY-ON-RELAY.sh`. Она вызывает `--node-caddy-route`, создаёт backup, вставляет только provider path перед общим `reverse_proxy sftpgo:8080`, проверяет Caddy и делает reload. Поэтому корень сайта продолжает открывать SFTPGo.
+
+Для нескольких CDN на одной ноде заведи отдельный origin-vhost/домен на каждый метод. Это обязательно для Beeline + TurboFlare: у них одинаковый XHTTP path, и один Host не может одновременно направлять его на два разных порта/exit. `--node-caddy-route` поэтому меняет только vhost с точным доменом и отказывается трогать чужой/default vhost.
 
 ### Панель и relay на одном VPS
 
 Начиная с 1.2.3 такой сценарий защищён отдельным safe mode. Если на VPS уже обнаружена Remnawave panel, node-задача **не имеет права** очищать `sites-enabled`, включать self-signed bootstrap вместо панели, менять UFW или перезаписывать `/opt/remnawave/.env`. Переустановка существующей панели из нового мастера блокируется.
 
-Если эта же нода потом выбрана как relay в `--cascade`, не запускай отдельный Caddy на `80/443`: эти порты уже занимает nginx панели. Для обычных CDN нужен отдельный домен/`server_name`, который в существующем nginx проксирует нужный path на relay Xray `127.0.0.1:7443`. Начиная с v1.2.6 TurboFlare поддерживает и origin=`IP:443`: перед изменениями Remnawave мастер добавляет и проверяет только XHTTP-location в HTTPS `default_server` панели, не меняя `location /`.
+Если эта же нода потом выбрана как relay в `--cascade`, не запускай отдельный Caddy на `80/443`: эти порты уже занимает nginx панели. Для обычных CDN нужен отдельный домен/`server_name`, который в существующем nginx проксирует нужный path на method-specific relay port `127.0.0.1:7443–7448`. Начиная с v1.2.6 TurboFlare поддерживает и origin=`IP:443`: перед изменениями Remnawave мастер добавляет и проверяет только XHTTP-location в HTTPS `default_server` панели, не меняя `location /`.
 
 Все основные нумерованные меню имеют `0 — назад`/`0 — выйти`, чтобы можно было вернуться при ошибочном выборе до изменений сервера.
 
@@ -216,13 +193,13 @@ Xray JSON / шаблон подписки, если выбран
 External Squad, если он нужен выбранной схеме
 ```
 
-Существующие профили, Hosts и Squads не должны удаляться без явного подтверждения пользователя.
+Существующие профили, Hosts и Squads не должны удаляться без явного подтверждения пользователя. Начиная с 1.4.0 новый CDN inbound добавляется в уже активный Config Profile ноды. Скрипт не заменяет активный профиль ради второго метода; перед merge сохраняет JSON-backup и останавливается при конфликте порта.
 
 Пользователи автоматически не переносятся между Internal Squads без подтверждения.
 
 ## Каскад
 
-При установке любого CDN скрипт спрашивает, нужен ли каскад. Если выбрать `нет`, его можно включить позже без переустановки панели и базового CDN:
+Каскад настраивается после установки и привязки чистых Node. Его можно добавить или повторно изменить без переустановки панели/ноды:
 
 ```bash
 /root/panel-script-v1.sh --cascade
@@ -248,22 +225,9 @@ External Squad, если он нужен выбранной схеме
                                   └─ exit #3 :8888
 ```
 
-На каждой выбранной exit-ноде мастер добавляет/reuse `BRIDGE_IN :8888` в **активном** Config Profile и Active Inbounds, не удаляя существующие inbound. Для каждого exit создаётся отдельный bridge-user/VLESS UUID. На relay создаётся отдельный cascade Config Profile с CDN inbound `127.0.0.1:7443`. Для одной exit используется `VLESS_EXIT`; для нескольких — отдельные `VLESS_EXIT_*` и `routing.balancers` с `balancerTag=EXIT_POOL`.
+На каждой выбранной exit-ноде мастер добавляет/reuse `BRIDGE_IN :8888` в **активном** Config Profile и Active Inbounds, не удаляя существующие inbound. Для каждого exit создаётся отдельный bridge-user/VLESS UUID. На relay маршрут также объединяется с уже активным Config Profile. Порты разделены: TurboFlare `7443`, Beeline `7444`, Yandex `7445`, VK `7446`, Timeweb `7447`, Selectel `7448`. Каждое правило routing ограничено своим `inboundTag`, а outbound/balancer имеют уникальные имена. Поэтому один RU relay может направлять, например, Yandex в Germany, а TurboFlare в Netherlands, если хватает CPU/RAM/канала.
 
-Если relay ранее был установлен этим проектом как обычная CDN-нода, его nginx
-всё ещё может смотреть на базовый inbound метода (для Yandex это `:4443`). После
-создания каскада выполни **на relay**:
-
-```bash
-/root/panel-script-v1.sh --cascade-relay-nginx
-```
-
-Команда сначала требует рабочий ответ `400` непосредственно от
-`127.0.0.1:7443` на path выбранного CDN, затем меняет только единственный
-`upstream xray_xhttp`, выполняет `nginx -t`, graceful reload и проверку того же
-path через HTTPS. При любой ошибке исходный конфиг восстанавливается. Если
-`7443` уже был выставлен вручную, конфиг повторно не переписывается, но HTTPS
-проверка всё равно выполняется.
+Для reverse proxy на хосте relay inbound слушает `127.0.0.1`. Если Caddy/SFTPGo запущен в Docker, контейнер не видит host-loopback; в мастере нужно ввести Docker gateway этой сети, например `172.18.0.1`. Команда `--node-caddy-route` определяет этот gateway через `docker inspect` и направляет Caddy на него.
 
 Записи через API проверяются повторным чтением. Короткий успешный ответ `POST/PATCH` сам по себе не считается доказательством: мастер перечитывает Node, Internal Squad и bridge-user, при необходимости использует squad bulk-action и только затем собирает `VLESS_EXIT`. Это важно для Remnawave 3.3.0, где ответы создания пользователя могут отличаться по набору полей.
 
@@ -282,7 +246,7 @@ VLESS UUID и членство в squad считаются достаточны�
 
 Балансируется выбор outbound для **новых соединений**. Это не bonding: один TCP-поток не складывает скорость нескольких VPS.
 
-Существующий активный Profile relay не заменяется молча: перед переключением требуется отдельное подтверждение. Provider-side DNS/origin, Caddy на relay и firewall/SG для `8888` выводятся как `[ВРУЧНУЮ]`. Сначала базовый CDN рекомендуется довести до `origin=400` и `CDN=400`, затем включать каскад.
+Существующий активный Profile relay не заменяется: мастер показывает merge, сохраняет backup и требует подтверждение. Provider-side DNS/origin и firewall/SG для `8888` остаются явными шагами. Для Caddy/SFTPGo генерируется `APPLY-ON-RELAY.sh`, который не меняет `location /`. Сначала базовый CDN рекомендуется довести до `origin=400` и `CDN=400`, затем включать каскад.
 
 Файлы каскада сохраняются в отдельном каталоге: `relay-profile.json`, `selected-exits.json`, `exit-pool.json`, `RELAY-STEPS.txt`, `EXIT-STEPS.txt`, `VERIFY.txt`, `MANUAL-ACTIONS.txt`.
 
@@ -296,7 +260,6 @@ VLESS UUID и членство в squad считаются достаточны�
 bash -n install.sh
 bash -n cascade-nginx-fix.sh
 bash tests/panel-cert-tests.sh
-bash tests/frontend-tests.sh
 bash tests/cascade-tests.sh
 ```
 

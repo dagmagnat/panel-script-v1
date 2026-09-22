@@ -11,7 +11,7 @@ IFS=$'\n\t'
 # This installer deliberately keeps each CDN preset separate. Do not mix fields
 # between providers: path/padding/uplink settings are provider-specific.
 
-INSTALLER_VERSION="1.4.1"
+INSTALLER_VERSION="1.4.0"
 STATE_SCHEMA_CURRENT="1"
 PRESET="${INSTALLER_PRESET:-}"
 
@@ -37,9 +37,6 @@ BACKUP_DIR="$STATE_DIR/backups"
 WEBROOT="/var/www/cdn-placeholder"
 ACME_ROOT="/var/www/certbot"
 SELF_CERT_DIR="/etc/nginx/cdn-installer-selfsigned"
-SFTPGO_APP_DIR="/opt/psv1-sftpgo"
-SFTPGO_IMAGE="drakkan/sftpgo:v2.7.5"
-SFTPGO_LOCAL_PORT="18080"
 
 # Preserve unfinished state from pre-GitHub v0.9 if it exists.
 if [[ "${PSV1_SOURCE_ONLY:-0}" != 1 ]]; then
@@ -137,7 +134,7 @@ save_state(){
   umask 077
   {
     printf 'STATE_SCHEMA=%q\n' "$STATE_SCHEMA_CURRENT"
-    for k in PANEL_KIND REMNA_ROLE METHOD REMNA_VERSION REMNA_NODE_PORT REMNA_EXISTING_PANEL_SIDE_BY_SIDE XUI_VERSION UPGRADE_XUI_XRAY XUI_EXISTING PANEL_DOMAIN ORIGIN_DOMAIN CDN_DOMAIN USE_CLOUDFLARE ENABLE_UFW ENABLE_BBR CASCADE CASCADE_METHOD CASCADE_RELAY_NODE_UUID CASCADE_EXIT_MODE CASCADE_EXIT_NODE_UUID CASCADE_EXIT_NODE_UUIDS CASCADE_RELAY_IP CASCADE_EXIT_IP CASCADE_EXIT_IPS CASCADE_STRATEGY CASCADE_BRIDGE_UUID CASCADE_STATUS COVER_SERVICE SFTPGO_PUBLIC_DOMAIN LE_EMAIL PANEL_IP REMNA_SECRET_KEY XUI_USER XUI_PASS XUI_PANEL_PORT XUI_PATH; do
+    for k in PANEL_KIND REMNA_ROLE METHOD REMNA_VERSION REMNA_NODE_PORT REMNA_EXISTING_PANEL_SIDE_BY_SIDE XUI_VERSION UPGRADE_XUI_XRAY XUI_EXISTING PANEL_DOMAIN ORIGIN_DOMAIN CDN_DOMAIN USE_CLOUDFLARE ENABLE_UFW ENABLE_BBR CASCADE CASCADE_METHOD CASCADE_RELAY_NODE_UUID CASCADE_EXIT_MODE CASCADE_EXIT_NODE_UUID CASCADE_EXIT_NODE_UUIDS CASCADE_RELAY_IP CASCADE_EXIT_IP CASCADE_EXIT_IPS CASCADE_STRATEGY CASCADE_BRIDGE_UUID CASCADE_STATUS LE_EMAIL PANEL_IP REMNA_SECRET_KEY XUI_USER XUI_PASS XUI_PANEL_PORT XUI_PATH; do
       printf '%s=%q\n' "$k" "${!k:-}"
     done
   } > "$t"
@@ -175,6 +172,25 @@ is_side_by_side_remna_node(){
 
 is_bare_remna_node(){
   [[ "${PANEL_KIND:-}" == remna && "${REMNA_ROLE:-}" == node && "${METHOD:-none}" == none ]]
+}
+
+# A Remnawave node is only the runtime connected to the central panel. CDN
+# profiles, Hosts and cascade routing are configured afterwards from that
+# panel. Keeping provider state in the node installer used to start nginx on
+# 80/443 and could replace an existing Caddy/SFTPGo origin with a placeholder.
+normalize_remna_node_install(){
+  [[ "${PANEL_KIND:-}" == remna && "${REMNA_ROLE:-}" == node ]] || return 1
+  local changed=no
+  if [[ "${METHOD:-none}" != none || -n "${ORIGIN_DOMAIN:-}" || -n "${CDN_DOMAIN:-}" ]]; then
+    changed=yes
+  fi
+  METHOD=none
+  ORIGIN_DOMAIN=""
+  CDN_DOMAIN=""
+  LE_EMAIL=""
+  ENABLE_UFW=no
+  CASCADE=no
+  [[ "$changed" == yes ]]
 }
 
 nginx_foreign_enabled_sites(){
@@ -658,12 +674,12 @@ rm_method_host_extra_json(){
 rm_method_meta(){
   local method="$1" key="$2"
   case "$method:$key" in
-    vk:path) echo '/content/media/stream/' ;; vk:alpn) echo 'h2' ;; vk:fp) echo 'firefox' ;;
-    yandex:path) echo '/uploadfiles/' ;; yandex:alpn) echo 'h3,h2,http/1.1' ;; yandex:fp) echo 'random' ;;
-    beeline:path) echo '/static/getFile/video/segment.ts' ;; beeline:alpn) echo 'h2' ;; beeline:fp) echo 'firefox' ;;
-    timeweb:path) echo '/content/media/stream.m3u8' ;; timeweb:alpn) echo 'h2,http/1.1' ;; timeweb:fp) echo 'random' ;;
-    selectel:path) echo '/api/uploadFile/' ;; selectel:alpn) echo 'h2' ;; selectel:fp) echo 'random' ;;
-    turboflare:path) echo '/static/getFile/video/segment.ts' ;; turboflare:alpn) echo 'h2,http/1.1' ;; turboflare:fp) echo 'firefox' ;;
+    vk:path) echo '/content/media/stream/' ;; vk:port) echo 10085 ;; vk:alpn) echo 'h2' ;; vk:fp) echo 'firefox' ;;
+    yandex:path) echo '/uploadfiles/' ;; yandex:port) echo 4443 ;; yandex:alpn) echo 'h3,h2,http/1.1' ;; yandex:fp) echo 'random' ;;
+    beeline:path) echo '/static/getFile/video/segment.ts' ;; beeline:port) echo 10086 ;; beeline:alpn) echo 'h2' ;; beeline:fp) echo 'firefox' ;;
+    timeweb:path) echo '/content/media/stream.m3u8' ;; timeweb:port) echo 10087 ;; timeweb:alpn) echo 'h2,http/1.1' ;; timeweb:fp) echo 'random' ;;
+    selectel:path) echo '/api/uploadFile/' ;; selectel:port) echo 10088 ;; selectel:alpn) echo 'h2' ;; selectel:fp) echo 'random' ;;
+    turboflare:path) echo '/static/getFile/video/segment.ts' ;; turboflare:port) echo 10089 ;; turboflare:alpn) echo 'h2,http/1.1' ;; turboflare:fp) echo 'firefox' ;;
   esac
 }
 
@@ -682,6 +698,18 @@ rm_manager_choose_method(){
     read -r -p "Выбор [6]: " a; a="${a:-6}"
     case "$a" in 1) echo vk; return ;; 2) echo yandex; return ;; 3) echo beeline; return ;; 4) echo timeweb; return ;; 5) echo selectel; return ;; 6) echo turboflare; return ;; 0) return 1 ;; esac
   done
+}
+
+rm_manager_choose_proxy_listen_ip(){
+  local value=""
+  echo >&2
+  echo "Где работает reverse proxy этой Node?" >&2
+  echo "  Enter / 127.0.0.1 — nginx/Caddy запущен на самом хосте." >&2
+  echo "  Docker gateway (например 172.18.0.1) — Caddy/SFTPGo запущен в Docker." >&2
+  read -r -p "Listen IP XHTTP [127.0.0.1]: " value
+  value="${value:-127.0.0.1}"
+  valid_ipv4 "$value" || { warn "Нужен IPv4 listen-адрес." >&2; return 1; }
+  printf '%s' "$value"
 }
 
 rm_domain_is_same_or_child(){
@@ -943,6 +971,11 @@ show_provider_preflight(){
       ;;
     turboflare)
       user_prepare "TurboFlare -> Сайты -> ${CDN_DOMAIN}: Address/Origin = ${node_ip}:443, HTTPS к источнику ON, stale cache OFF."
+      if [[ -n "${ORIGIN_DOMAIN:-}" ]]; then
+        user_prepare "${ORIGIN_DOMAIN} — прямой домен проверки/сайта. В поле TurboFlare всё равно оставь ${node_ip}:443: этот кабинет принимает только IP."
+      else
+        user_prepare "Origin-vhost на :443 должен принимать Host делегированного домена ${CDN_DOMAIN} и показывать cover/SFTPGo на корне."
+      fi
       user_prepare "До переключения старого рабочего ресурса сначала проверь direct origin на новой ноде: ожидается HTTP 400."
       user_prepare "Финальные NS домена ${CDN_DOMAIN}: ns1-c.trbcdn.net / ns2-c.trbcdn.net / ns3-c.trbcdn.net."
       user_prepare "После делегирования ${CDN_DOMAIN} должен резолвиться в edge TurboFlare, НЕ в ${node_ip}."
@@ -987,6 +1020,9 @@ rm_manager_provider_steps(){
         echo "TurboFlare → Сайты → ${CDN_DOMAIN} → Редактирование:"
         echo "  Адрес: ${node_ip}:443"
         echo "  HTTPS к источнику: ВКЛ"
+        echo "  Кабинет TurboFlare принимает IP: не заменяй его origin-доменом."
+        echo "  Origin-vhost должен принимать Host ${CDN_DOMAIN} и отдавать cover/SFTPGo на /."
+        [[ -n "${ORIGIN_DOMAIN:-}" ]] && echo "  Прямая проверка cover: https://${ORIGIN_DOMAIN}/"
         echo "  Устаревший кэш при недоступности источника: ВЫКЛ"
         echo "  Кэш XHTTP: ВЫКЛ; query-параметры учитывать."
         echo "  NS у регистратора: ns1-c.trbcdn.net / ns2-c.trbcdn.net / ns3-c.trbcdn.net"
@@ -1019,6 +1055,117 @@ rm_manager_provider_steps(){
     echo "Ожидаемый код после активного inbound: 400."
   } > "$f"
   chmod 600 "$f"
+}
+
+# Add or update one managed XHTTP route in an existing Caddy/SFTPGo origin.
+# The root reverse_proxy remains untouched, therefore both the direct origin
+# domain and a CDN domain keep opening the same SFTPGo cover page.
+run_node_caddy_route(){
+  local method="${1:-}" domain="${2:-}" target_port="${3:-}" caddyfile="${4:-/opt/e-cloudfiles/Caddyfile}"
+  local container="${PSV1_CADDY_CONTAINER:-e-cloudfiles-caddy-1}" path gateway backup safe python_bin
+  case "$method" in vk|yandex|beeline|timeweb|selectel|turboflare) ;; *) die "Метод для --node-caddy-route: vk|yandex|beeline|timeweb|selectel|turboflare" ;; esac
+  valid_domain "$domain" || die "Некорректный домен origin/cover: $domain"
+  [[ "$target_port" =~ ^[0-9]+$ ]] && (( target_port >= 1 && target_port <= 65535 )) || die "Некорректный локальный порт XHTTP."
+  [[ -f "$caddyfile" ]] || die "Caddyfile не найден: $caddyfile"
+  command -v docker >/dev/null 2>&1 || die "Docker не найден."
+  python_bin="${PSV1_PYTHON:-$(command -v python3 2>/dev/null || command -v python 2>/dev/null || true)}"
+  [[ -n "$python_bin" ]] || die "Python 3 не найден."
+  docker inspect "$container" >/dev/null 2>&1 || die "Контейнер Caddy не найден: $container"
+  path=$(rm_method_meta "$method" path)
+  gateway=$(docker inspect "$container" --format '{{range .NetworkSettings.Networks}}{{println .Gateway}}{{end}}' 2>/dev/null | awk 'NF{print;exit}')
+  valid_ipv4 "$gateway" || die "Не удалось определить Docker gateway контейнера $container."
+  safe=$(tr -cd 'a-z0-9-' <<<"${method,,}")
+  backup="${caddyfile}.before-psv1-$(date +%Y%m%d-%H%M%S)"
+  cp -p "$caddyfile" "$backup"
+
+  if ! "$python_bin" - "$caddyfile" "$domain" "$method" "$safe" "$path" "$gateway" "$target_port" <<'PY'
+import pathlib
+import re
+import sys
+
+filename, domain, method, safe, route_path, gateway, port = sys.argv[1:]
+p = pathlib.Path(filename)
+text = p.read_text(encoding="utf-8")
+begin = f"# PSV1-{method.upper()}-ROUTE BEGIN"
+end = f"# PSV1-{method.upper()}-ROUTE END"
+matcher = f"psv1_{safe.replace('-', '_')}"
+block = (
+    f"    {begin}\n"
+    f"    @{matcher} path {route_path}\n"
+    f"    reverse_proxy @{matcher} {gateway}:{port}\n"
+    f"    {end}\n"
+)
+
+if begin in text:
+    pattern = re.compile(r"(?ms)^[ \t]*" + re.escape(begin) + r"\n.*?^[ \t]*" + re.escape(end) + r"\n?")
+    updated, count = pattern.subn(block, text, count=1)
+    if count != 1:
+        raise SystemExit("existing PSV1 route marker is malformed")
+else:
+    # Edit only the site block that explicitly serves this origin domain. A
+    # fallback to another SFTPGo vhost is unsafe when several providers share a
+    # node (Beeline and TurboFlare even use the same path).
+    candidates = []
+    for m in re.finditer(r"(?m)^[^#\n][^\n]*\{\s*$", text):
+        start = m.start()
+        brace = text.find("{", start)
+        depth = 0
+        quote = None
+        escaped = False
+        for pos in range(brace, len(text)):
+            ch = text[pos]
+            if quote:
+                if escaped:
+                    escaped = False
+                elif ch == "\\":
+                    escaped = True
+                elif ch == quote:
+                    quote = None
+                continue
+            if ch in ('"', "'"):
+                quote = ch
+            elif ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    candidates.append((start, pos + 1, text[start:pos + 1]))
+                    break
+    selected = None
+    for item in candidates:
+        header = item[2].split("{", 1)[0]
+        if domain in header:
+            selected = item
+            break
+    if selected is None:
+        raise SystemExit(f"no exact Caddy site block for {domain}; create a separate vhost for this provider first")
+    start, stop, site = selected
+    generic = re.search(r"(?m)^([ \t]*)reverse_proxy\s+sftpgo(?::\d+)?(?:\s*\{)?", site)
+    if not generic:
+        raise SystemExit(f"vhost {domain} is not an SFTPGo reverse_proxy; refusing an ambiguous edit")
+    insert_at = start + generic.start()
+    updated = text[:insert_at] + block + text[insert_at:]
+
+p.write_text(updated, encoding="utf-8")
+PY
+  then
+    cp -p "$backup" "$caddyfile"
+    die "Caddyfile не изменён: не найден безопасный exact vhost SFTPGo для $domain. Backup: $backup"
+  fi
+
+  if ! docker exec "$container" caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile; then
+    cp -p "$backup" "$caddyfile"
+    die "Caddy не принял маршрут; исходный файл восстановлен: $backup"
+  fi
+  if ! docker exec "$container" caddy reload --config /etc/caddy/Caddyfile --adapter caddyfile; then
+    cp -p "$backup" "$caddyfile"
+    docker exec "$container" caddy reload --config /etc/caddy/Caddyfile --adapter caddyfile >/dev/null 2>&1 || true
+    die "Caddy reload не удался; исходный файл восстановлен: $backup"
+  fi
+  auto_done "Caddy/SFTPGo: $domain$path -> ${gateway}:${target_port}; location / не изменён."
+  check_do "curl --noproxy '*' --resolve ${domain}:443:127.0.0.1 -i https://${domain}${path}  # ожидается HTTP 400"
+  check_do "curl --noproxy '*' --resolve ${domain}:443:127.0.0.1 -I https://${domain}/  # должен остаться SFTPGo/cover"
+  echo "Backup: $backup"
 }
 
 
@@ -1316,6 +1463,28 @@ rm_api_patch_profile_config(){
   return 1
 }
 
+rm_profile_merge_inbound_json(){
+  local config="$1" inbound="$2" tag port conflict
+  tag=$(jq -r '.tag' <<<"$inbound")
+  port=$(jq -r '.port' <<<"$inbound")
+  conflict=$(jq -r --arg t "$tag" --argjson p "$port" '
+    [.inbounds[]? | select((.port == $p) and ((.tag // "") != $t)) | (.tag // "<без tag>")][0] // empty
+  ' <<<"$config")
+  if [[ -n "$conflict" ]]; then
+    warn "Порт $port уже занят inbound '$conflict'. Профиль не изменён." >&2
+    return 2
+  fi
+  jq -c --argjson add "$inbound" --arg t "$tag" '
+    .inbounds = (((.inbounds // []) | map(select((.tag // "") != $t))) + [$add])
+  ' <<<"$config"
+}
+
+rm_profile_inbound_uuid_by_tag(){
+  local token="$1" profile_uuid="$2" tag="$3" inbounds
+  inbounds=$(rm_api_profile_inbounds "$token" "$profile_uuid")
+  jq -r --arg t "$tag" '[.[]? | select((.tag // "") == $t) | .uuid][0] // empty' <<<"$inbounds"
+}
+
 rm_api_add_active_inbound_preserve(){
   local token="$1" node_json="$2" profile_uuid="$3" inbound_uuid="$4" node_uuid profile_inbounds arr body resp body_path
   node_uuid=$(jq -r '.uuid' <<<"$node_json")
@@ -1394,31 +1563,47 @@ rm_api_create_bridge_only_profile(){
   printf '%s' "$ids"
 }
 
+rm_method_relay_port(){
+  case "$1" in
+    turboflare) echo 7443 ;;
+    beeline) echo 7444 ;;
+    yandex) echo 7445 ;;
+    vk) echo 7446 ;;
+    timeweb) echo 7447 ;;
+    selectel) echo 7448 ;;
+    *) return 1 ;;
+  esac
+}
+
 rm_cascade_relay_config_json(){
-  local method="$1" tag="$2" exits_json="$3" strategy="${4:-roundRobin}" inbound
+  local method="$1" tag="$2" exits_json="$3" strategy="${4:-roundRobin}" listen_ip="${5:-127.0.0.1}" inbound relay_port route_key out_prefix pool_tag
+  relay_port=$(rm_method_relay_port "$method") || return 1
+  route_key=$(printf '%s' "$tag" | sha256sum | cut -c1-8)
+  out_prefix="PSV1_${route_key}_EXIT"
+  pool_tag="PSV1_${route_key}_POOL"
   inbound=$(rm_method_inbound_json "$method" "$tag")
-  inbound=$(jq -c --arg t "$tag" '.tag=$t | .port=7443 | .listen="127.0.0.1"' <<<"$inbound")
-  jq -nc --argjson inb "$inbound" --argjson exits "$exits_json" --arg strategy "$strategy" '
+  inbound=$(jq -c --arg t "$tag" --argjson p "$relay_port" --arg l "$listen_ip" '.tag=$t | .port=$p | .listen=$l' <<<"$inbound")
+  jq -nc --argjson inb "$inbound" --argjson exits "$exits_json" --arg strategy "$strategy" --arg routeTag "$tag" --arg outPrefix "$out_prefix" --arg poolTag "$pool_tag" '
     ($exits|length) as $n
     | ($n == 1) as $single
     | ($exits | map({
-        tag:(if $single then "VLESS_EXIT" else ("VLESS_EXIT_" + .suffix) end),
+        tag:(if $single then $outPrefix else ($outPrefix + "_" + .suffix) end),
         protocol:"vless",
         settings:{vnext:[{address:.ip,port:8888,users:[{id:.bridgeUuid,encryption:"none"}]}]},
         streamSettings:{network:"tcp",security:"none",sockopt:{tcpKeepAliveInterval:30,tcpNoDelay:true}},
         mux:{enabled:true,concurrency:8,xudpConcurrency:16,xudpProxyUDP443:"reject"}
       })) as $proxyOutbounds
     | (if $single
-       then {type:"field",ip:["149.154.160.0/20","91.108.4.0/22","91.108.8.0/22","91.108.12.0/22","91.108.16.0/22","91.108.20.0/22","91.108.56.0/22"],outboundTag:"VLESS_EXIT"}
-       else {type:"field",ip:["149.154.160.0/20","91.108.4.0/22","91.108.8.0/22","91.108.12.0/22","91.108.16.0/22","91.108.20.0/22","91.108.56.0/22"],balancerTag:"EXIT_POOL"}
+       then {type:"field",inboundTag:[$routeTag],ip:["149.154.160.0/20","91.108.4.0/22","91.108.8.0/22","91.108.12.0/22","91.108.16.0/22","91.108.20.0/22","91.108.56.0/22"],outboundTag:$outPrefix}
+       else {type:"field",inboundTag:[$routeTag],ip:["149.154.160.0/20","91.108.4.0/22","91.108.8.0/22","91.108.12.0/22","91.108.16.0/22","91.108.20.0/22","91.108.56.0/22"],balancerTag:$poolTag}
        end) as $telegramIpRule
     | (if $single
-       then {type:"field",domain:["domain:telegram.org","domain:t.me","domain:telegra.ph"],outboundTag:"VLESS_EXIT"}
-       else {type:"field",domain:["domain:telegram.org","domain:t.me","domain:telegra.ph"],balancerTag:"EXIT_POOL"}
+       then {type:"field",inboundTag:[$routeTag],domain:["domain:telegram.org","domain:t.me","domain:telegra.ph"],outboundTag:$outPrefix}
+       else {type:"field",inboundTag:[$routeTag],domain:["domain:telegram.org","domain:t.me","domain:telegra.ph"],balancerTag:$poolTag}
        end) as $telegramDomainRule
     | (if $single
-       then {type:"field",network:"tcp,udp",outboundTag:"VLESS_EXIT"}
-       else {type:"field",network:"tcp,udp",balancerTag:"EXIT_POOL"}
+       then {type:"field",inboundTag:[$routeTag],network:"tcp,udp",outboundTag:$outPrefix}
+       else {type:"field",inboundTag:[$routeTag],network:"tcp,udp",balancerTag:$poolTag}
        end) as $catchAll
     | {
         log:{loglevel:"warning"},
@@ -1429,20 +1614,52 @@ rm_cascade_relay_config_json(){
         ]),
         routing:(
           {domainStrategy:"IPIfNonMatch",rules:[
-            {type:"field",ip:["geoip:private"],outboundTag:"BLOCK"},
-            {type:"field",domain:["geosite:private"],outboundTag:"BLOCK"},
-            {type:"field",protocol:["bittorrent"],outboundTag:"BLOCK"},
-            {type:"field",ip:["1.1.1.1","1.0.0.1","8.8.8.8","8.8.4.4"],outboundTag:"DIRECT"},
+            {type:"field",inboundTag:[$routeTag],ip:["geoip:private"],outboundTag:"BLOCK"},
+            {type:"field",inboundTag:[$routeTag],domain:["geosite:private"],outboundTag:"BLOCK"},
+            {type:"field",inboundTag:[$routeTag],protocol:["bittorrent"],outboundTag:"BLOCK"},
+            {type:"field",inboundTag:[$routeTag],ip:["1.1.1.1","1.0.0.1","8.8.8.8","8.8.4.4"],outboundTag:"DIRECT"},
             $telegramIpRule,
             $telegramDomainRule,
-            {type:"field",ip:["geoip:ru"],outboundTag:"DIRECT"},
-            {type:"field",domain:["geosite:category-ru"],outboundTag:"DIRECT"},
+            {type:"field",inboundTag:[$routeTag],ip:["geoip:ru"],outboundTag:"DIRECT"},
+            {type:"field",inboundTag:[$routeTag],domain:["geosite:category-ru"],outboundTag:"DIRECT"},
             $catchAll
           ]}
-          + (if $single then {} else {balancers:[{tag:"EXIT_POOL",selector:["VLESS_EXIT_"],strategy:{type:$strategy}}]} end)
+          + (if $single then {} else {balancers:[{tag:$poolTag,selector:[($outPrefix + "_")],strategy:{type:$strategy}}]} end)
         )
       }
   '
+}
+
+rm_profile_merge_cascade_route_json(){
+  local current="$1" route="$2" relay_tag="$3" route_key out_prefix pool_tag relay_port conflict
+  route_key=$(printf '%s' "$relay_tag" | sha256sum | cut -c1-8)
+  out_prefix="PSV1_${route_key}_EXIT"
+  pool_tag="PSV1_${route_key}_POOL"
+  relay_port=$(jq -r '.inbounds[0].port' <<<"$route")
+  conflict=$(jq -r --arg t "$relay_tag" --argjson p "$relay_port" '[.inbounds[]? | select((.port==$p) and ((.tag//"")!=$t)) | (.tag//"<без tag>")][0] // empty' <<<"$current")
+  if [[ -n "$conflict" ]]; then
+    warn "Cascade порт $relay_port уже занят inbound '$conflict'; Active Profile не изменён." >&2
+    return 2
+  fi
+  jq -c --argjson add "$route" --arg inbound "$relay_tag" --arg outPrefix "$out_prefix" --arg poolTag "$pool_tag" '
+    . as $old
+    | .inbounds = (((.inbounds // []) | map(select((.tag // "") != $inbound))) + $add.inbounds)
+    | .outbounds = (
+        ((.outbounds // []) | map(select(((.tag // "") | startswith($outPrefix)) | not)))
+        | . as $kept
+        | reduce ($add.outbounds[]?) as $o ($kept;
+            if any(.[]?; (.tag // "") == ($o.tag // "")) then . else . + [$o] end)
+      )
+    | .routing = ((.routing // {}) + {domainStrategy:($add.routing.domainStrategy // .routing.domainStrategy // "IPIfNonMatch")})
+    | .routing.rules = (
+        $add.routing.rules
+        + ((.routing.rules // []) | map(select((((.inboundTag // []) | index($inbound)) != null) | not)))
+      )
+    | .routing.balancers = (
+        ((.routing.balancers // []) | map(select((.tag // "") != $poolTag)))
+        + ($add.routing.balancers // [])
+      )
+  ' <<<"$current"
 }
 
 rm_api_squad_doc(){
@@ -1704,6 +1921,7 @@ rm_api_ensure_bridge_user(){
 
 rm_verify_cascade_api_postconditions(){
   local token="$1" relay_uuid="$2" relay_profile_uuid="$3" relay_inbound_uuid="$4" squad_uuid="$5" exit_records="$6"
+  local relay_tag="${7:-}"
   local squad profile expected e_count i e_uuid e_profile e_inbound username state user
 
   rm_api_wait_node_assignment "$token" "$relay_uuid" "$relay_profile_uuid" "$relay_inbound_uuid" || {
@@ -1722,7 +1940,7 @@ rm_verify_cascade_api_postconditions(){
   fi
 
   profile=$(rm_api_profile_doc "$token" "$relay_profile_uuid" || true)
-  if ! jq -e --argjson exits "$exit_records" '
+  if ! jq -e --argjson exits "$exit_records" --arg relayTag "$relay_tag" '
       .config as $c
       | all($exits[]; . as $e |
           any($c.outbounds[]?;
@@ -1730,7 +1948,10 @@ rm_verify_cascade_api_postconditions(){
             and .settings.vnext[0].address==$e.ip
             and .settings.vnext[0].port==8888
             and .settings.vnext[0].users[0].id==$e.bridgeUuid))
-      and any($c.routing.rules[]?; .network=="tcp,udp" and ((.outboundTag // .balancerTag // "")|length)>0)
+      and any($c.routing.rules[]?;
+        .network=="tcp,udp"
+        and ((.outboundTag // .balancerTag // "")|length)>0
+        and ($relayTag=="" or (((.inboundTag // []) | index($relayTag)) != null)))
     ' >/dev/null 2>&1 <<<"$profile"; then
     warn "Post-check: relay profile не содержит полный VLESS_EXIT/маршрутизацию catch-all."
     return 1
@@ -1949,9 +2170,9 @@ PYNG
   return 0
 }
 run_remna_cascade_manager(){
-  local token nodes count relay relay_uuid relay_name relay_ip method pool_suffix relay_tag relay_config relay_profile_name relay_ids relay_profile_uuid relay_inbound_uuid relay_active squad_uuid host_uuid="" extra run_dir profile_doc existing_cfg desired_hash current_hash update_profile=no
+  local token nodes count relay relay_uuid relay_name relay_ip method pool_suffix relay_tag relay_config relay_profile_name relay_ids relay_profile_uuid relay_inbound_uuid relay_active squad_uuid host_uuid="" extra run_dir profile_doc existing_cfg merged_cfg desired_hash current_hash update_profile=no relay_port
   local exit_mode exit_mode_choice exits exit_count strategy_choice strategy first_exit first_exit_uuid first_exit_ip exit_keys exit_records='[]'
-  local panel_public_ip="" relay_addr_ip="" relay_on_panel=no relay_proxy_note=""
+  local panel_public_ip="" relay_addr_ip="" relay_on_panel=no relay_proxy_note="" relay_listen_ip="127.0.0.1"
   local i e e_uuid e_name e_ip e_suffix bridge_tag bridge_uuid bridge_info exit_profile_uuid bridge_inbound_uuid exit_profile_name exit_dir record user_name b inbs
 
   echo
@@ -1993,7 +2214,7 @@ run_remna_cascade_manager(){
     if local_remna_panel_present && [[ -n "$panel_public_ip" && "$relay_addr_ip" == "$panel_public_ip" ]]; then
       relay_on_panel=yes
       danger "Выбранный relay находится на ЭТОМ ЖЕ VPS, где работает Remnawave-панель."
-      manual_do "Не запускай отдельный Caddy на :80/:443 — он конфликтует с nginx панели. Для origin используй отдельный server_name в существующем nginx -> 127.0.0.1:7443."
+      manual_do "Не запускай отдельный Caddy на :80/:443 — он конфликтует с nginx панели. Для origin используй отдельный server_name в существующем nginx -> method-specific relay port 7443–7448."
     fi
 
     while true; do
@@ -2066,6 +2287,18 @@ run_remna_cascade_manager(){
   exit_keys=$(jq -r 'map(.uuid)|join(",")' <<<"$exits")
 
   method=$(rm_manager_choose_method) || return 0
+  relay_port=$(rm_method_relay_port "$method") || die "Неизвестный relay-порт для $method"
+  if [[ "$relay_on_panel" == yes ]]; then
+    relay_listen_ip="127.0.0.1"
+  else
+    echo
+    echo "Адрес listen для XHTTP inbound на relay:"
+    echo "  127.0.0.1 — reverse proxy работает на хосте (nginx/Caddy без Docker)."
+    echo "  172.18.0.1 — пример Docker gateway для Caddy/SFTPGo в container; точный gateway покажет docker inspect."
+    read -r -p "Listen IP [127.0.0.1]: " relay_listen_ip
+    relay_listen_ip="${relay_listen_ip:-127.0.0.1}"
+    valid_ipv4 "$relay_listen_ip" || die "Нужен IPv4 listen-адрес."
+  fi
   CASCADE_METHOD="$method"; CASCADE_RELAY_NODE_UUID="$relay_uuid"; CASCADE_RELAY_IP="$relay_ip"; CASCADE=yes
   CASCADE_EXIT_MODE="$exit_mode"; CASCADE_EXIT_NODE_UUID="$first_exit_uuid"; CASCADE_EXIT_NODE_UUIDS="$exit_keys"; CASCADE_EXIT_IP="$first_exit_ip"; CASCADE_EXIT_IPS=$(jq -r 'map(.address)|join(",")' <<<"$exits"); CASCADE_STRATEGY="$strategy"
   rm_manager_collect_domains "$method"
@@ -2096,9 +2329,9 @@ run_remna_cascade_manager(){
   done
   [[ "$exit_mode" == pool ]] && user_prepare "EXIT_POOL: $exit_count нод, strategy=$strategy. Балансируются НОВЫЕ соединения; один TCP-поток не суммирует скорость нескольких VPS."
   manual_do "DNS/origin CDN должен в итоге указывать на RELAY $relay_ip. Пока не меняй, если текущий direct-метод нужен рабочим."
-  manual_do "На relay CDN XHTTP-inbound будет слушать 127.0.0.1:7443. На каждой exit BRIDGE_IN будет слушать TCP 8888."
+  manual_do "На relay inbound $(method_title "$method") будет слушать 127.0.0.1:${relay_port}. На каждой exit BRIDGE_IN будет слушать TCP 8888."
   if [[ "$relay_on_panel" == yes ]]; then
-    manual_do "Relay совмещён с панелью: существующий nginx панели сохраняется; нужен отдельный origin-vhost/server_name, проксирующий CDN path на 127.0.0.1:7443."
+    manual_do "Relay совмещён с панелью: существующий nginx панели сохраняется; нужен отдельный origin-vhost/server_name, проксирующий CDN path на 127.0.0.1:${relay_port}."
   fi
   ask_yes_no _CASCADE_CONTINUE "Продолжить подготовку сущностей каскада в Remnawave API?" "yes"
   [[ "$_CASCADE_CONTINUE" == yes ]] || return 0
@@ -2204,35 +2437,32 @@ run_remna_cascade_manager(){
   chmod 600 "$run_dir/exit-pool.json"
   CASCADE_BRIDGE_UUID=$(jq -r '.[0].bridgeUuid' <<<"$exit_records")
 
-  # 3) Создать/обновить relay profile. Для >1 exit финальные правила используют balancerTag=EXIT_POOL.
-  relay_config=$(rm_cascade_relay_config_json "$method" "$relay_tag" "$exit_records" "$strategy")
+  # 3) Merge this provider route into the relay Active Profile. Every routing
+  # rule is constrained by inboundTag, so another CDN on the same RU relay can
+  # use a different exit without replacing this route.
+  relay_config=$(rm_cascade_relay_config_json "$method" "$relay_tag" "$exit_records" "$strategy" "$relay_listen_ip")
   printf '%s\n' "$relay_config" | jq . > "$run_dir/relay-profile.json"
-  if relay_ids=$(rm_api_existing_profile "$token" "$relay_profile_name" 2>/dev/null); then
-    relay_profile_uuid=$(jq -r '.profileUuid' <<<"$relay_ids"); relay_inbound_uuid=$(jq -r '.inboundUuid' <<<"$relay_ids")
+  relay_active=$(jq -r '.configProfile.activeConfigProfileUuid // empty' <<<"$relay")
+  if [[ -n "$relay_active" && "$relay_active" != "00000000-0000-0000-0000-000000000000" ]]; then
+    relay_profile_uuid="$relay_active"
     profile_doc=$(rm_api_profile_doc "$token" "$relay_profile_uuid" || true)
     existing_cfg=$(jq -c '.config // empty' <<<"$profile_doc" 2>/dev/null || true)
-    if [[ -n "$existing_cfg" ]]; then
-      desired_hash=$(printf '%s' "$relay_config" | jq -cS . | sha256sum | awk '{print $1}')
-      current_hash=$(printf '%s' "$existing_cfg" | jq -cS . | sha256sum | awk '{print $1}')
-      if [[ "$desired_hash" != "$current_hash" ]]; then
-        danger "Существующий cascade profile отличается: изменился список exit, UUID или стратегия."
-        ask_yes_no update_profile "Обновить ТОЛЬКО этот cascade profile, сохранив backup?" "no"
-        if [[ "$update_profile" == yes ]]; then
-          printf '%s\n' "$profile_doc" | jq . > "$run_dir/relay-profile-before-update.json"
-          if rm_api_patch_profile_config "$token" "$relay_profile_uuid" "$relay_config"; then
-            inbs=$(rm_api_profile_inbounds "$token" "$relay_profile_uuid")
-            relay_inbound_uuid=$(jq -r --arg t "$relay_tag" '[.[]? | select(.tag==$t) | .uuid][0] // empty' <<<"$inbs")
-            auto_done "Relay cascade profile обновлён."
-          else
-            warn "Relay profile не обновлён; assignment не меняю."; return 0
-          fi
-        else
-          manual_do "Существующий cascade profile оставлен без изменений. Повтори --cascade и подтверди обновление, когда будешь готов."
-          return 0
-        fi
-      fi
+    [[ -n "$existing_cfg" ]] || { warn "Active Profile relay не прочитан; каскад не изменяю."; return 0; }
+    relay_profile_name=$(jq -r '.name // "active-profile"' <<<"$profile_doc")
+    printf '%s\n' "$profile_doc" | jq . > "$run_dir/relay-profile-before-update.json"
+    merged_cfg=$(rm_profile_merge_cascade_route_json "$existing_cfg" "$relay_config" "$relay_tag") || { warn "Не удалось объединить cascade route."; return 0; }
+    printf '%s\n' "$merged_cfg" | jq . > "$run_dir/relay-profile-after-merge.json"
+    desired_hash=$(printf '%s' "$merged_cfg" | jq -cS . | sha256sum | awk '{print $1}')
+    current_hash=$(printf '%s' "$existing_cfg" | jq -cS . | sha256sum | awk '{print $1}')
+    if [[ "$desired_hash" != "$current_hash" ]]; then
+      danger "В Active Profile '$relay_profile_name' будет merged маршрут '$relay_tag'. Другие CDN-маршруты и inbound сохраняются."
+      ask_yes_no update_profile "Применить merge с backup старого profile?" "yes"
+      [[ "$update_profile" == yes ]] || { manual_do "Merge отменён: $run_dir/relay-profile-after-merge.json"; return 0; }
+      rm_api_patch_profile_config "$token" "$relay_profile_uuid" "$merged_cfg" || { warn "Relay profile не обновлён."; return 0; }
     fi
-    auto_done "Relay cascade profile найден: $relay_profile_name"
+    relay_inbound_uuid=$(rm_profile_inbound_uuid_by_tag "$token" "$relay_profile_uuid" "$relay_tag")
+    [[ -n "$relay_inbound_uuid" ]] || { warn "Relay inbound не найден после merge."; return 0; }
+    auto_done "Cascade route merged в Active Profile: $relay_profile_name"
   else
     if relay_ids=$(rm_api_create_profile "$token" "$relay_profile_name" "$relay_config"); then
       relay_profile_uuid=$(jq -r '.profileUuid' <<<"$relay_ids"); relay_inbound_uuid=$(jq -r '.inboundUuid' <<<"$relay_ids")
@@ -2271,23 +2501,20 @@ run_remna_cascade_manager(){
     i=$((i+1))
   done
 
-  relay_active=$(jq -r '.configProfile.activeConfigProfileUuid // empty' <<<"$relay")
-  if [[ -n "$relay_active" && "$relay_active" != "00000000-0000-0000-0000-000000000000" && "$relay_active" != "$relay_profile_uuid" ]]; then
-    danger "Relay сейчас работает на другом profile UUID=$relay_active. Переключение изменит маршрутизацию этой ноды."
-    manual_do "Backup текущего node JSON сохранён: $run_dir/relay-node-before.json"
-    ask_yes_no RM_CASCADE_ASSIGN_RELAY "Назначить relay cascade profile '$relay_profile_name' сейчас?" "no"
-  else
-    RM_CASCADE_ASSIGN_RELAY=yes
-  fi
-  if [[ "$RM_CASCADE_ASSIGN_RELAY" == yes ]]; then
-    if rm_api_assign_node "$token" "$relay_uuid" "$relay_profile_uuid" "$relay_inbound_uuid"; then
-      auto_done "Relay: cascade profile назначен, XHTTP inbound :7443 активирован."
+  if [[ -n "$relay_active" && "$relay_active" != "00000000-0000-0000-0000-000000000000" ]]; then
+    if rm_api_add_active_inbound_preserve "$token" "$relay" "$relay_profile_uuid" "$relay_inbound_uuid"; then
+      auto_done "Relay: Active Profile сохранён, XHTTP inbound :${relay_port} добавлен к старым Active Inbounds."
     else
-      warn "Relay profile создан, но API не подтвердил Node assignment/Active Inbound. Каскад не считаю готовым."
+      warn "API не подтвердил Active Inbound '$relay_tag'. Каскад не считаю готовым."
       return 0
     fi
   else
-    manual_do "Relay не переключён. После подготовки Caddy назначь profile '$relay_profile_name' и Active Inbound '$relay_tag'."
+    if rm_api_assign_node "$token" "$relay_uuid" "$relay_profile_uuid" "$relay_inbound_uuid"; then
+      auto_done "Relay: общий cascade profile назначен, XHTTP inbound :${relay_port} активирован."
+    else
+      warn "API не подтвердил Node assignment/Active Inbound."
+      return 0
+    fi
   fi
 
   if [[ -n "$CDN_DOMAIN" ]]; then
@@ -2300,18 +2527,22 @@ run_remna_cascade_manager(){
   fi
 
   if [[ "$relay_on_panel" == yes ]]; then
-    relay_proxy_note="3. Relay находится на VPS панели: НЕ запускать Caddy на :80/:443. Сохрани nginx панели и добавь отдельный origin server_name -> 127.0.0.1:7443."
+    relay_proxy_note="3. Relay находится на VPS панели: НЕ запускать Caddy на :80/:443. Сохрани nginx панели и добавь отдельный origin server_name -> 127.0.0.1:${relay_port}."
   else
-    relay_proxy_note="3. Если relay установлен panel-script-v1 и использует nginx, на relay выполни: /root/panel-script-v1.sh --cascade-relay-nginx. Команда безопасно переключит XHTTP upstream на 127.0.0.1:7443."
+    relay_proxy_note="3. По присланному мануалу отдельный relay использует Caddy, не nginx; точный Caddyfile установщик не выдумывает."
   fi
   cat > "$run_dir/RELAY-STEPS.txt" <<EOF
 RELAY ($relay_name / $relay_ip)
 1. CDN/origin должен смотреть на $relay_ip.
-2. Remnawave relay inbound: 127.0.0.1:7443, tag=$relay_tag.
+2. Remnawave relay inbound: ${relay_listen_ip}:${relay_port}, tag=$relay_tag.
 $relay_proxy_note
 4. Node management port разрешай только от IP панели.
 5. Режим exit: $exit_mode; strategy=$strategy; exits=$exit_count.
+6. Для уже работающего Caddy/SFTPGo на relay:
+   $INSTALL_PATH --node-caddy-route '$method' '${ORIGIN_DOMAIN:-$CDN_DOMAIN}' '${relay_port}'
 EOF
+  printf '%s\n' "$INSTALL_PATH --node-caddy-route '$method' '${ORIGIN_DOMAIN:-$CDN_DOMAIN}' '${relay_port}'" > "$run_dir/APPLY-ON-RELAY.sh"
+  chmod 700 "$run_dir/APPLY-ON-RELAY.sh"
 
   : > "$run_dir/EXIT-STEPS.txt"
   : > "$run_dir/VERIFY.txt"
@@ -2347,9 +2578,9 @@ curl -sk https://${CDN_DOMAIN:-CDN_DOMAIN}$(rm_method_meta "$method" path) -o /d
 # зарубежные -> один из выбранных exit; при roundRobin/random IP может меняться между НОВЫМИ соединениями.
 EOF
   if [[ "$relay_on_panel" == yes ]]; then
-    relay_proxy_note="1. Relay на VPS панели: НЕ запускать Caddy на :80/:443; добавить отдельный nginx origin server_name -> 127.0.0.1:7443, не меняя panel vhost/сертификат."
+    relay_proxy_note="1. Relay на VPS панели: НЕ запускать Caddy на :80/:443; добавить отдельный nginx origin server_name -> 127.0.0.1:${relay_port}, не меняя panel vhost/сертификат."
   else
-    relay_proxy_note="1. Relay: если origin nginx создан panel-script-v1, выполнить /root/panel-script-v1.sh --cascade-relay-nginx; для другого reverse proxy вручную направить CDN path на 127.0.0.1:7443."
+    relay_proxy_note="1. Relay: настроить Caddy -> 127.0.0.1:${relay_port} по path выбранного CDN."
   fi
   cat > "$run_dir/MANUAL-ACTIONS.txt" <<EOF
 [ВРУЧНУЮ] Перед финальным переключением
@@ -2361,7 +2592,7 @@ $relay_proxy_note
 EOF
   chmod 600 "$run_dir"/*.txt "$run_dir"/*.json "$run_dir"/exit-*/*.json 2>/dev/null || true
   if [[ "$RM_CASCADE_ASSIGN_RELAY" == yes ]]; then
-    if rm_verify_cascade_api_postconditions "$token" "$relay_uuid" "$relay_profile_uuid" "$relay_inbound_uuid" "$squad_uuid" "$exit_records"; then
+    if rm_verify_cascade_api_postconditions "$token" "$relay_uuid" "$relay_profile_uuid" "$relay_inbound_uuid" "$squad_uuid" "$exit_records" "$relay_tag"; then
       CASCADE_STATUS=api-verified
       auto_done "API post-check: все 6 условий каскада подтверждены (relay/exit Active Inbounds, squad, bridge-users, UUID и routing)."
     else
@@ -2379,7 +2610,7 @@ EOF
   ui_title "КАСКАД — ИТОГ"
   auto_done "Relay cascade profile: $relay_profile_name"
   if [[ "$exit_mode" == pool ]]; then
-    auto_done "EXIT_POOL: $exit_count exit-нод, strategy=$strategy, balancerTag=EXIT_POOL."
+    auto_done "EXIT_POOL: $exit_count exit-нод, strategy=$strategy, маршрут изолирован tag '$relay_tag'."
   else
     auto_done "Одиночный exit: $(jq -r '.[0].name' <<<"$exit_records") ($(jq -r '.[0].ip' <<<"$exit_records"))."
   fi
@@ -2450,6 +2681,7 @@ run_cascade_manager(){
 
 run_remna_panel_manager(){
   local token="" token_mode=api nodes node node_uuid node_name node_ip connected method safe suffix tag inbound config extra profile_name ids profile_uuid inbound_uuid active_profile assign_ok=no host_uuid="" squad_ok=no run_dir summary technew=""
+  local profile_doc existing_cfg merged_cfg merge_confirm node_listen_ip
   echo
   echo "=== Remnawave: добавить CDN-метод в существующую панель ==="
   echo "Этот режим НЕ переустанавливает панель и НЕ удаляет существующие профили/хосты."
@@ -2553,6 +2785,7 @@ run_remna_panel_manager(){
   fi
 
   method=$(rm_manager_choose_method) || exit 0
+  node_listen_ip=$(rm_manager_choose_proxy_listen_ip) || return 0
   rm_manager_collect_domains "$method"
   ask_yes_no USE_CLOUDFLARE "Использовать Cloudflare для DNS-записей там, где это применимо?" "${USE_CLOUDFLARE:-yes}"
   save_state
@@ -2562,14 +2795,15 @@ run_remna_panel_manager(){
   safe=$(tr '[:upper:]' '[:lower:]' <<<"$node_name" | tr -cd 'a-z0-9_-'); [[ -n "$safe" ]] || safe="node"
   suffix=$(printf '%s' "$node_uuid" | sha256sum | cut -c1-6)
   tag="psv1-${method}-${suffix}"
-  # Remnawave API limits Config Profile names to 30 characters.
-  # Build a readable but always-valid name instead of letting POST /api/config-profiles fail.
-  profile_prefix="psv1-${method}-"
+  # A node can have one active Config Profile but many active inbounds. Keep a
+  # node-specific shared profile and merge every provider into it.
+  profile_prefix="psv1-shared-"
   max_safe=$((30 - ${#profile_prefix} - 1 - ${#suffix}))
   (( max_safe < 1 )) && max_safe=1
   safe="${safe:0:max_safe}"
   profile_name="${profile_prefix}${safe}-${suffix}"
   inbound=$(rm_method_inbound_json "$method" "$tag")
+  inbound=$(jq -c --arg l "$node_listen_ip" '.listen=$l' <<<"$inbound")
   config=$(rm_profile_config_json "$inbound" "$method")
   extra=$(rm_method_host_extra_json "$method" "$inbound")
   run_dir="$RM_MANAGER_DIR/${profile_name}"
@@ -2587,18 +2821,18 @@ Security: TLS
 Inbound tag: $tag
 EOF
   rm_manager_provider_steps "$method" "$node_ip" "$run_dir/provider-steps.txt"
+  printf '%s\n' "$INSTALL_PATH --node-caddy-route '$method' '${ORIGIN_DOMAIN:-$CDN_DOMAIN}' '$(rm_method_meta "$method" port)'" > "$run_dir/APPLY-ON-NODE.sh"
+  chmod 700 "$run_dir/APPLY-ON-NODE.sh"
 
   cat > "$run_dir/NEXT-STEPS.txt" <<EOF
 ПАНЕЛЬ REMNAWAVE — обязательная цепочка для $(method_title "$method")
 ================================================================
-1. Config Profiles → Create profile
-   Имя: $profile_name
-   Вставить содержимое: $run_dir/profile.json
-   Внутри уже зашит Xray inbound '$tag' с нужным XHTTP preset.
+1. Config Profiles
+   Если у Node уже есть Active Profile, добавить в него inbound '$tag' из $run_dir/profile.json.
+   Не удалять другие inbounds/outbounds/routing. Если Active Profile нет — создать: $profile_name.
 
-2. Nodes → '$node_name' → Change Profile
-   Выбрать: $profile_name
-   В Active inbounds ОБЯЗАТЕЛЬНО включить '$tag'.
+2. Nodes → '$node_name'
+   Оставить текущий Active Profile и в Active inbounds включить '$tag'.
    Без этой галочки Xray на ноде не поднимет CDN-порт.
 
 3. Internal Squads
@@ -2625,6 +2859,10 @@ EOF
 8. CDN-провайдер
    Выполнить: $run_dir/provider-steps.txt
 
+9. Caddy/SFTPGo на Node (только если origin уже работает через e-cloudfiles Caddy)
+   Запустить на выбранной Node: $INSTALL_PATH --node-caddy-route '$method' '${ORIGIN_DOMAIN:-$CDN_DOMAIN}' '$(rm_method_meta "$method" port)'
+   Команда добавит только XHTTP path; корень / останется SFTPGo.
+
 Проверка цепочки после активации:
   профиль содержит inbound → профиль назначен ноде → inbound Active → inbound в Internal Squad → пользователь в этом Squad → Host привязан к inbound.
 Ничего существующего удалять не нужно.
@@ -2636,42 +2874,48 @@ EOF
     return 0
   fi
 
-  # Reuse the profile created by a previous run, otherwise create a new one.
-  if ids=$(rm_api_existing_profile "$token" "$profile_name" 2>/dev/null); then
-    profile_uuid=$(jq -r '.profileUuid' <<<"$ids"); inbound_uuid=$(jq -r '.inboundUuid' <<<"$ids")
-    ok "Профиль $profile_name уже существует — использую его, не перезаписываю."
+  active_profile=$(jq -r '.configProfile.activeConfigProfileUuid // empty' <<<"$node")
+  if [[ -n "$active_profile" && "$active_profile" != "00000000-0000-0000-0000-000000000000" ]]; then
+    profile_uuid="$active_profile"
+    profile_doc=$(rm_api_profile_doc "$token" "$profile_uuid" || true)
+    existing_cfg=$(jq -c '.config // empty' <<<"$profile_doc" 2>/dev/null || true)
+    profile_name=$(jq -r '.name // "active-profile"' <<<"$profile_doc" 2>/dev/null || echo active-profile)
+    [[ -n "$existing_cfg" ]] || { warn "Не удалось прочитать Active Profile; ноду не изменяю."; return 0; }
+    printf '%s\n' "$profile_doc" | jq . > "$run_dir/profile-before-merge.json"
+    if ! merged_cfg=$(rm_profile_merge_inbound_json "$existing_cfg" "$inbound"); then
+      warn "CDN не добавлен/не обновлён: конфликт порта или JSON."
+      return 0
+    fi
+    printf '%s\n' "$merged_cfg" | jq . > "$run_dir/profile-after-merge.json"
+    if [[ "$(jq -cS . <<<"$existing_cfg")" != "$(jq -cS . <<<"$merged_cfg")" ]]; then
+      danger "В Active Profile '$profile_name' будет добавлен/обновлён только inbound '$tag'; остальной JSON сохраняется."
+      ask_yes_no merge_confirm "Выполнить merge в текущий Active Profile?" "yes"
+      [[ "$merge_confirm" == yes ]] || { manual_do "Merge отменён; файл готов: $run_dir/profile-after-merge.json"; return 0; }
+      if ! rm_api_patch_profile_config "$token" "$profile_uuid" "$merged_cfg"; then
+        warn "API не принял merged profile. Исходный backup: $run_dir/profile-before-merge.json"
+        return 0
+      fi
+      auto_done "Inbound '$tag' добавлен/обновлён без удаления старых методов."
+    else
+      ok "Inbound '$tag' уже актуален в Active Profile '$profile_name'."
+    fi
+    inbound_uuid=$(rm_profile_inbound_uuid_by_tag "$token" "$profile_uuid" "$tag")
+    [[ -n "$inbound_uuid" ]] || { warn "Inbound '$tag' не найден после merge; Active Inbounds не меняю."; return 0; }
+    if rm_api_add_active_inbound_preserve "$token" "$node" "$profile_uuid" "$inbound_uuid"; then
+      assign_ok=yes
+      ok "Active Profile сохранён; inbound '$tag' активирован вместе с прежними."
+    else
+      warn "Profile обновлён, но Active Inbounds API не подтвердил. Включи '$tag' вручную."
+    fi
   else
     if ids=$(rm_api_create_profile "$token" "$profile_name" "$config"); then
       profile_uuid=$(jq -r '.profileUuid' <<<"$ids"); inbound_uuid=$(jq -r '.inboundUuid' <<<"$ids")
-      ok "Создан новый Config Profile: $profile_name"
+      if rm_api_assign_node "$token" "$node_uuid" "$profile_uuid" "$inbound_uuid"; then assign_ok=yes; fi
+      ok "Создан первый общий Config Profile: $profile_name"
     else
-      warn "API не создал профиль. Ничего существующего не изменено."
-      [[ -s "$RM_MANAGER_DIR/last-api-error-create-profile-http.txt" ]] && { echo "Диагностика создания профиля:"; cat "$RM_MANAGER_DIR/last-api-error-create-profile-http.txt"; }
-      if [[ -s "$RM_MANAGER_DIR/last-api-error-create-profile.json" ]]; then
-        echo "Ответ API:"
-        jq . "$RM_MANAGER_DIR/last-api-error-create-profile.json" 2>/dev/null || cat "$RM_MANAGER_DIR/last-api-error-create-profile.json"
-      fi
-      echo "Полная пошаговая инструкция: $run_dir/NEXT-STEPS.txt"
-      cat "$run_dir/NEXT-STEPS.txt"
+      warn "API не создал общий профиль. Ничего существующего не изменено."
       return 0
     fi
-  fi
-
-  active_profile=$(jq -r '.configProfile.activeConfigProfileUuid // empty' <<<"$node")
-  if [[ -n "$active_profile" && "$active_profile" != "$profile_uuid" ]]; then
-    warn "У выбранной ноды уже есть другой активный профиль ($active_profile)."
-    warn "Чтобы не выключить действующий метод на ЭТОЙ же ноде, автоматическую замену не делаю без подтверждения."
-    ask_yes_no RM_REPLACE_PROFILE "Заменить профиль именно у этой ноды на $profile_name?" "no"
-  else RM_REPLACE_PROFILE=yes; fi
-  if [[ "$RM_REPLACE_PROFILE" == yes ]]; then
-    if rm_api_assign_node "$token" "$node_uuid" "$profile_uuid" "$inbound_uuid"; then
-      assign_ok=yes; ok "Профиль назначен ноде; inbound активирован."
-    else
-      warn "Автопривязка ноды через API не прошла. Профиль создан, но ноду не трогал дальше."
-      warn "В панели: Nodes → $node_name → Change Profile → $profile_name → включить inbound $tag."
-    fi
-  else
-    warn "Профиль ноды не менялся. Назначь $profile_name вручную, когда будешь готов."
   fi
 
   if rm_api_add_to_squad "$token" "$inbound_uuid"; then squad_ok=yes; ok "Inbound добавлен в выбранный Internal Squad без удаления старых inbound'ов."; else warn "Squad автоматически не изменён. Добавь inbound '$tag' в нужный Internal Squad вручную."; fi
@@ -2793,7 +3037,6 @@ show_config(){
   if [[ "${METHOD:-none}" != none ]]; then
     echo "CDN-домен       : ${CDN_DOMAIN:-будет введён позже}"
     echo "Origin-домен    : ${ORIGIN_DOMAIN:-не используется / IP}"
-    echo "Обычные URL     : ${COVER_SERVICE:-placeholder}${SFTPGO_PUBLIC_DOMAIN:+ / $SFTPGO_PUBLIC_DOMAIN}"
   fi
   echo "Домен панели    : ${PANEL_DOMAIN:-нет}"
   [[ "${METHOD:-none}" != none ]] && echo "Cloudflare DNS  : ${USE_CLOUDFLARE:-yes}"
@@ -2846,7 +3089,7 @@ choose_remna_role(){
   echo "Что сделать с Remnawave?"
   echo "  1 — установить новую центральную панель"
   echo "  2 — панель УЖЕ установлена: добавить/настроить CDN-метод для ноды"
-  echo "  3 — установить только ноду на этом VPS"
+  echo "  3 — установить только Node (без CDN/nginx/Host)"
   echo "  4 — установить панель + ноду на одном VPS"
   echo "  5 — проверить существующую панель"
   echo "  0 — назад"
@@ -2855,7 +3098,7 @@ choose_remna_role(){
     case "$a" in
       1) REMNA_ROLE=panel; return 0 ;;
       2) exec "$0" --manage-remna ;;
-      3) REMNA_ROLE=node; return 0 ;;
+      3) REMNA_ROLE=node; METHOD=none; return 0 ;;
       4) REMNA_ROLE=both; return 0 ;;
       5) exec "$0" --check-remna ;;
       0) return 1 ;;
@@ -2894,14 +3137,14 @@ choose_method(){
       case "$a" in 1) METHOD=vk; return 0 ;; 2) METHOD=yandex; return 0 ;; 3) METHOD=turboflare; return 0 ;; 0) return 1 ;; esac
     done
   else
-    echo "Метод / назначение ноды:"
+    echo "CDN-метод для panel+node:"
     echo "  1 — VK Cloud"
     echo "  2 — Yandex Cloud"
     echo "  3 — Beeline / CDNvideo"
     echo "  4 — Timeweb"
     echo "  5 — Selectel"
     echo "  6 — TurboFlare"
-    if [[ "${REMNA_ROLE:-}" == node || "${REMNA_ROLE:-}" == both ]]; then
+    if [[ "${REMNA_ROLE:-}" == both ]]; then
       echo "  7 — БЕЗ CDN — только нода для каскада (relay/exit)"
     fi
     echo "  0 — назад"
@@ -2919,35 +3162,11 @@ choose_method(){
         4) METHOD=timeweb; return 0 ;;
         5) METHOD=selectel; return 0 ;;
         6) METHOD=turboflare; return 0 ;;
-        7) if [[ "${REMNA_ROLE:-}" == node || "${REMNA_ROLE:-}" == both ]]; then METHOD=none; return 0; fi ;;
+        7) if [[ "${REMNA_ROLE:-}" == both ]]; then METHOD=none; return 0; fi ;;
         0) return 1 ;;
       esac
     done
   fi
-}
-
-choose_cover_service(){
-  local a="" current="${COVER_SERVICE:-placeholder}"
-  echo
-  echo "Что показывать на обычных URL CDN/origin (XHTTP-путь сохраняется отдельно)?"
-  echo "  1 — статическая страница-заглушка"
-  echo "  2 — SFTPGo: файловый менеджер на локальном :${SFTPGO_LOCAL_PORT}"
-  echo "  0 — назад"
-  while true; do
-    read -r -p "Выбор [$([[ "$current" == sftpgo ]] && echo 2 || echo 1)]: " a
-    a="${a:-$([[ "$current" == sftpgo ]] && echo 2 || echo 1)}"
-    case "$a" in
-      1) COVER_SERVICE=placeholder; SFTPGO_PUBLIC_DOMAIN=""; return 0 ;;
-      2)
-        COVER_SERVICE=sftpgo
-        ask_domain SFTPGO_PUBLIC_DOMAIN "Публичный домен, на котором будет открываться SFTPGo" "${SFTPGO_PUBLIC_DOMAIN:-${CDN_DOMAIN:-}}" "files.example.net"
-        danger "Через CDN SFTPGo требует POST/PUT/PATCH/DELETE, Cookies/Authorization и полностью отключённый кеш."
-        return 0
-        ;;
-      0) return 1 ;;
-      *) warn "Выбери 1, 2 или 0." ;;
-    esac
-  done
 }
 
 
@@ -2972,7 +3191,15 @@ collect_config(){
             echo "Для panel+node выбери Node Port сейчас, а в окне создания ноды укажи ТО ЖЕ значение."
             ask_port REMNA_NODE_PORT "Node Port" "${REMNA_NODE_PORT:-2222}"
           fi
-          if [[ "$REMNA_ROLE" == panel ]]; then METHOD=none; _stage=done; else _stage=remna_method; fi
+          if [[ "$REMNA_ROLE" == panel ]]; then
+            METHOD=none
+            _stage=done
+          elif [[ "$REMNA_ROLE" == node ]]; then
+            normalize_remna_node_install || true
+            _stage=done
+          else
+            _stage=remna_method
+          fi
         else
           _stage=remna_role
         fi
@@ -3021,7 +3248,7 @@ collect_config(){
       ;;
     turboflare)
       ask_domain CDN_DOMAIN "Отдельный домен, делегированный/подключаемый к TurboFlare" "$CDN_DOMAIN" "media-example.org"
-      ask_optional_domain ORIGIN_DOMAIN "Отдельный origin-домен (не обязателен: рабочий вариант TurboFlare может использовать IP:443)" "$ORIGIN_DOMAIN" "origin.example.net"
+      ask_optional_domain ORIGIN_DOMAIN "Origin-домен для Host/SNI (настоятельно рекомендуется; Enter только если провайдер умеет IP:443 без Host override)" "$ORIGIN_DOMAIN" "origin.example.net"
       ;;
     vk)
       ask_domain ORIGIN_DOMAIN "Origin-домен, который прямо указывает на эту ноду" "$ORIGIN_DOMAIN" "origin.example.net"
@@ -3047,12 +3274,6 @@ collect_config(){
       ;;
   esac
 
-  if [[ "$PANEL_KIND" == remna && "$REMNA_ROLE" == node && "$METHOD" != none && "${REMNA_EXISTING_PANEL_SIDE_BY_SIDE:-no}" != yes ]]; then
-    choose_cover_service || { COVER_SERVICE=placeholder; SFTPGO_PUBLIC_DOMAIN=""; }
-  else
-    COVER_SERVICE="${COVER_SERVICE:-placeholder}"
-  fi
-
   if [[ "$METHOD" != none ]]; then
     ask_yes_no USE_CLOUDFLARE "Использовать Cloudflare для DNS-записей там, где это применимо?" "${USE_CLOUDFLARE:-yes}"
   else
@@ -3063,7 +3284,7 @@ collect_config(){
     LE_EMAIL=""
     ENABLE_UFW=no
     ask_yes_no ENABLE_BBR "Включить BBR + базовый TCP-тюнинг? (рекомендуется)" "yes"
-    CASCADE=yes
+    CASCADE=no
     if is_side_by_side_remna_node; then
       REMNA_EXISTING_PANEL_SIDE_BY_SIDE=yes
       info "На этом VPS уже есть Remnawave-панель. Служебная нода не будет переписывать nginx/ACME/UFW панели."
@@ -3091,9 +3312,9 @@ collect_config(){
   if [[ "$PANEL_KIND" == remna && "$REMNA_ROLE" == node ]]; then
     if [[ "$METHOD" == none ]]; then
       echo
-      user_prepare "Это служебная Remnawave Node без CDN. Она нужна как relay или exit для --cascade."
+      user_prepare "Сейчас устанавливается только Remnawave Node: без CDN, nginx, доменов и Host."
       user_prepare "Сначала создай эту Node в панели. Для сервера панели + ноды на одном VPS используй публичный IP этого VPS и свободный Node Port."
-      manual_do "CDN-метод, origin-домен и Host сейчас НЕ создаются — их подготовит мастер --cascade на центральной панели."
+      manual_do "После статуса Online запусти на центральной панели --manage-remna для CDN или --cascade для relay/exit."
     fi
     read -r -p "IP сервера панели Remnawave: " PANEL_IP
     while ! valid_ipv4 "$PANEL_IP"; do read -r -p "Нужен IPv4 панели: " PANEL_IP; done
@@ -3105,418 +3326,6 @@ collect_config(){
   save_state
   show_config
   read -r -p "Нажми Enter, чтобы начать..." _
-}
-
-cover_patch_nginx_config(){
-  local conf="$1" mode="$2"
-  [[ -f "$conf" ]] || { warn "nginx-конфиг не найден: $conf"; return 1; }
-  [[ "$mode" == placeholder || "$mode" == sftpgo ]] || return 1
-
-  "${PANEL_CERT_PYTHON:-python3}" - "$conf" "$mode" <<'PY'
-import os
-import pathlib
-import re
-import sys
-
-path = pathlib.Path(sys.argv[1])
-mode = sys.argv[2]
-text = path.read_text(encoding="utf-8")
-
-static_re = re.compile(
-    r"(?m)^(?P<indent>[ \t]*)location / \{ root /var/www/cdn-placeholder; "
-    r"index index\.html; try_files \$uri \$uri/ /index\.html; \}$"
-)
-managed_re = re.compile(
-    r"(?ms)^(?P<indent>[ \t]*)# panel-script-v1 cover-service begin\n"
-    r".*?^(?P=indent)# panel-script-v1 cover-service end$"
-)
-
-def sftp_block(indent):
-    rows = [
-        "# panel-script-v1 cover-service begin",
-        "location = / { return 302 /web/client/; }",
-        "location / {",
-        "    proxy_pass http://127.0.0.1:18080;",
-        "    proxy_http_version 1.1;",
-        "    proxy_set_header Host $host;",
-        "    proxy_set_header X-Real-IP $remote_addr;",
-        "    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;",
-        "    proxy_set_header X-Forwarded-Proto $scheme;",
-        "    proxy_set_header Upgrade $http_upgrade;",
-        '    proxy_set_header Connection "upgrade";',
-        "    proxy_request_buffering off;",
-        "    proxy_buffering off;",
-        "    proxy_read_timeout 1h;",
-        "    proxy_send_timeout 1h;",
-        "    client_max_body_size 0;",
-        '    add_header Cache-Control "no-store, private" always;',
-        "}",
-        "# panel-script-v1 cover-service end",
-    ]
-    return "\n".join(indent + row for row in rows)
-
-managed = list(managed_re.finditer(text))
-static = list(static_re.finditer(text))
-if mode == "sftpgo":
-    if managed:
-        if len(managed) != 2:
-            print(f"Ожидалось 2 управляемых fallback-блока, найдено {len(managed)}", file=sys.stderr)
-            sys.exit(2)
-        updated = managed_re.sub(lambda m: sftp_block(m.group("indent")), text)
-    else:
-        if len(static) != 2:
-            print(f"Ожидалось 2 стандартных fallback location, найдено {len(static)}", file=sys.stderr)
-            sys.exit(3)
-        updated = static_re.sub(lambda m: sftp_block(m.group("indent")), text)
-else:
-    if managed:
-        if len(managed) != 2:
-            print(f"Ожидалось 2 управляемых fallback-блока, найдено {len(managed)}", file=sys.stderr)
-            sys.exit(4)
-        updated = managed_re.sub(
-            lambda m: m.group("indent") +
-            "location / { root /var/www/cdn-placeholder; index index.html; try_files $uri $uri/ /index.html; }",
-            text,
-        )
-    elif len(static) == 2:
-        updated = text
-    else:
-        print("Конфигурация не похожа на управляемый cdn-origin.conf; ничего не изменено", file=sys.stderr)
-        sys.exit(5)
-
-tmp = path.with_name(path.name + ".psv1-cover.tmp")
-tmp.write_text(updated, encoding="utf-8")
-os.chmod(tmp, path.stat().st_mode)
-os.replace(tmp, path)
-PY
-}
-
-relay_patch_nginx_upstream(){
-  local conf="$1" target_port="${2:-7443}"
-  [[ -f "$conf" && "$target_port" =~ ^[0-9]+$ ]] || return 1
-  "${PANEL_CERT_PYTHON:-python3}" - "$conf" "$target_port" <<'PY'
-import os
-import pathlib
-import re
-import sys
-
-path = pathlib.Path(sys.argv[1])
-target = sys.argv[2]
-text = path.read_text(encoding="utf-8")
-pattern = re.compile(
-    r"(upstream\s+xray_xhttp\s*\{\s*server\s+127\.0\.0\.1:)([0-9]+)(\s*;)",
-    re.MULTILINE,
-)
-matches = list(pattern.finditer(text))
-if len(matches) != 1:
-    print(f"Ожидался один upstream xray_xhttp, найдено: {len(matches)}", file=sys.stderr)
-    sys.exit(2)
-updated = pattern.sub(lambda m: m.group(1) + target + m.group(3), text, count=1)
-tmp = path.with_name(path.name + ".psv1-relay.tmp")
-tmp.write_text(updated, encoding="utf-8")
-os.chmod(tmp, path.stat().st_mode)
-os.replace(tmp, path)
-PY
-}
-
-run_cascade_relay_nginx(){
-  local enabled conf backup path direct_code proxy_code current_port
-  load_state || true
-  [[ "${METHOD:-none}" != none ]] || die "В состоянии ноды не найден CDN-метод."
-  path=$(method_server_path)
-  enabled="/etc/nginx/sites-enabled/cdn-origin.conf"
-  [[ -e "$enabled" ]] || die "Не найден активный $enabled. Команда рассчитана на origin, созданный panel-script-v1."
-  conf=$(readlink -f "$enabled" 2>/dev/null || true)
-  [[ -f "$conf" && "$conf" == /etc/nginx/* ]] || die "Небезопасная или неизвестная цель nginx: ${conf:-нет}."
-
-  direct_code=$(curl -sS --max-time 8 -o /dev/null -w '%{http_code}' \
-    "http://127.0.0.1:7443${path}" 2>/dev/null || true)
-  [[ "$direct_code" == 400 ]] \
-    || die "Cascade inbound 127.0.0.1:7443${path} ответил HTTP ${direct_code:-000}, ожидался 400. nginx не изменён."
-
-  current_port=$("${PANEL_CERT_PYTHON:-python3}" - "$conf" <<'PY'
-import pathlib, re, sys
-text = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8")
-m = re.findall(r"upstream\s+xray_xhttp\s*\{\s*server\s+127\.0\.0\.1:([0-9]+)\s*;", text, re.M)
-print(m[0] if len(m) == 1 else "")
-PY
-  )
-  [[ -n "$current_port" ]] || die "Не удалось однозначно найти upstream xray_xhttp в $conf."
-  if [[ "$current_port" == 7443 ]]; then
-    proxy_code=$(curl -sk --max-time 10 --resolve "psv1-relay.invalid:443:127.0.0.1" \
-      -o /dev/null -w '%{http_code}' "https://psv1-relay.invalid${path}" 2>/dev/null || true)
-    [[ "$proxy_code" == 400 ]] \
-      || die "nginx уже настроен на :7443, но cascade path через HTTPS ответил HTTP ${proxy_code:-000}, ожидался 400. Конфиг не изменён."
-    ok "nginx уже направляет XHTTP на cascade inbound 127.0.0.1:7443; проверка через HTTPS успешна."
-    return 0
-  fi
-
-  backup="$BACKUP_DIR/$(basename "$conf").before-relay-7443-$(date +%Y%m%d-%H%M%S)"
-  install -d -m 0700 "$BACKUP_DIR"
-  cp -a "$conf" "$backup"
-  if ! relay_patch_nginx_upstream "$conf" 7443; then
-    cp -a "$backup" "$conf"
-    die "Не удалось изменить единственный xray_xhttp upstream; восстановлен $backup"
-  fi
-  if ! nginx -t || ! systemctl reload nginx; then
-    cp -a "$backup" "$conf"
-    nginx -t >/dev/null 2>&1 && systemctl reload nginx || true
-    die "nginx не принял upstream :7443; восстановлен $backup"
-  fi
-  proxy_code=""
-  for _ in {1..15}; do
-    proxy_code=$(curl -sk --max-time 10 --resolve "psv1-relay.invalid:443:127.0.0.1" \
-      -o /dev/null -w '%{http_code}' "https://psv1-relay.invalid${path}" 2>/dev/null || true)
-    [[ "$proxy_code" == 400 ]] && break
-    sleep 1
-  done
-  if [[ "$proxy_code" != 400 ]]; then
-    cp -a "$backup" "$conf"
-    nginx -t >/dev/null 2>&1 && systemctl reload nginx || true
-    die "Через nginx cascade path ответил HTTP ${proxy_code:-000}, ожидался 400; выполнен откат: $backup"
-  fi
-  ok "Relay nginx переключён: 127.0.0.1:${current_port} -> 127.0.0.1:7443; XHTTP отвечает 400."
-  check_do "Backup прежнего nginx-конфига: $backup"
-}
-
-cover_ensure_docker(){
-  if command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1; then
-    systemctl enable --now docker >/dev/null 2>&1 || true
-    return 0
-  fi
-  info "Устанавливаю Docker для локального SFTPGo backend."
-  curl -fsSL https://get.docker.com | sh
-  docker compose version >/dev/null 2>&1 || apt-get install -y docker-compose-plugin
-  systemctl enable --now docker
-}
-
-cover_sftpgo_bootstrap_users(){
-  local app_dir="$1" admin_password="$2" owner_password="$3" reader_password="$4"
-  (
-    set -Eeuo pipefail
-    local scratch token username
-    scratch=$(mktemp -d)
-    trap 'rm -rf -- "$scratch"' EXIT
-    chmod 700 "$scratch"
-    printf 'user = "admin:%s"\n' "$admin_password" > "$scratch/admin.curl"
-    token=""
-    for _ in {1..60}; do
-      if curl --silent --fail --connect-timeout 2 --max-time 5 --config "$scratch/admin.curl" \
-        "http://127.0.0.1:${SFTPGO_LOCAL_PORT}/api/v2/token" > "$scratch/token.json"; then
-        token=$(jq -er '.access_token' "$scratch/token.json")
-        break
-      fi
-      sleep 2
-    done
-    [[ -n "$token" ]] || return 1
-    printf 'header = "Authorization: Bearer %s"\n' "$token" > "$scratch/api.curl"
-    cat > "$scratch/owner.json" <<EOF_OWNER
-{"status":1,"username":"owner","password":"$owner_password","home_dir":"/srv/sftpgo/data/shared","permissions":{"/":["*"]},"filesystem":{"provider":0}}
-EOF_OWNER
-    cat > "$scratch/reader.json" <<EOF_READER
-{"status":1,"username":"reader","password":"$reader_password","home_dir":"/srv/sftpgo/data/shared","permissions":{"/":["list","download"]},"filesystem":{"provider":0},"filters":{"web_client":["shares-disabled"]}}
-EOF_READER
-    for username in owner reader; do
-      if ! curl --silent --fail --max-time 10 --config "$scratch/api.curl" \
-        "http://127.0.0.1:${SFTPGO_LOCAL_PORT}/api/v2/users/$username" --output /dev/null; then
-        curl --silent --show-error --fail --max-time 15 --config "$scratch/api.curl" \
-          -H 'Content-Type: application/json' --data-binary "@$scratch/$username.json" \
-          "http://127.0.0.1:${SFTPGO_LOCAL_PORT}/api/v2/users" --output /dev/null
-      fi
-    done
-    curl --silent --show-error --fail --max-time 15 --config "$scratch/api.curl" \
-      "http://127.0.0.1:${SFTPGO_LOCAL_PORT}/api/v2/users/reader" > "$scratch/reader-saved.json"
-    jq -e '.permissions["/"] == ["list","download"] and (.filters.web_client | index("shares-disabled") != null)' \
-      "$scratch/reader-saved.json" >/dev/null
-    touch "$app_dir/.users-created"
-  )
-}
-
-cover_install_sftpgo(){
-  local public_domain="${1:-${SFTPGO_PUBLIC_DOMAIN:-${CDN_DOMAIN:-}}}"
-  local admin_password owner_password reader_password busy
-  valid_domain "$public_domain" || die "Для SFTPGo нужен корректный публичный домен."
-  cover_ensure_docker
-
-  if [[ -d "$SFTPGO_APP_DIR" && ! -f "$SFTPGO_APP_DIR/compose.yaml" ]]; then
-    die "$SFTPGO_APP_DIR уже существует, но не является установкой panel-script-v1. Ничего не перезаписано."
-  fi
-  if [[ -f "$SFTPGO_APP_DIR/compose.yaml" ]]; then
-    (cd "$SFTPGO_APP_DIR" && docker compose up -d sftpgo)
-    curl -fsS --max-time 10 "http://127.0.0.1:${SFTPGO_LOCAL_PORT}/web/client/" >/dev/null \
-      || die "Существующий psv1-sftpgo не отвечает на localhost:${SFTPGO_LOCAL_PORT}."
-    if [[ ! -f "$SFTPGO_APP_DIR/.users-created" ]]; then
-      # shellcheck disable=SC1091
-      source "$SFTPGO_APP_DIR/.env"
-      [[ -n "${ADMIN_PASSWORD:-}" && -n "${OWNER_PASSWORD:-}" && -n "${READER_PASSWORD:-}" ]] \
-        || die "Незавершённой установке не хватает паролей в $SFTPGO_APP_DIR/.env; nginx не изменён."
-      cover_sftpgo_bootstrap_users "$SFTPGO_APP_DIR" "$ADMIN_PASSWORD" "$OWNER_PASSWORD" "$READER_PASSWORD" \
-        || die "Не удалось завершить создание SFTPGo-пользователей; nginx не изменён."
-    fi
-    auto_done "Существующий SFTPGo backend запущен повторно; данные и учётные записи сохранены."
-    return 0
-  fi
-  if docker inspect psv1-sftpgo >/dev/null 2>&1; then
-    die "Контейнер psv1-sftpgo существует без $SFTPGO_APP_DIR/compose.yaml. Автоматически не перезаписываю его."
-  fi
-
-  busy=$(ss -H -ltn "( sport = :${SFTPGO_LOCAL_PORT} )" 2>/dev/null || true)
-  [[ -z "$busy" ]] || die "Локальный порт ${SFTPGO_LOCAL_PORT} уже занят чужим сервисом. Ничего не изменено: $busy"
-
-  admin_password=$(openssl rand -hex 20)
-  owner_password=$(openssl rand -hex 20)
-  reader_password=$(openssl rand -hex 20)
-  install -d -m 0700 "$SFTPGO_APP_DIR"
-  install -d -m 0750 -o 1000 -g 1000 \
-    "$SFTPGO_APP_DIR/storage/data/shared/Documents" \
-    "$SFTPGO_APP_DIR/storage/data/shared/PDF" \
-    "$SFTPGO_APP_DIR/storage/data/shared/Presentations" \
-    "$SFTPGO_APP_DIR/storage/data/shared/Other" \
-    "$SFTPGO_APP_DIR/state"
-  cat > "$SFTPGO_APP_DIR/.env" <<EOF_ENV
-SFTPGO_IMAGE=$SFTPGO_IMAGE
-ADMIN_PASSWORD=$admin_password
-OWNER_PASSWORD=$owner_password
-READER_PASSWORD=$reader_password
-EOF_ENV
-  cat > "$SFTPGO_APP_DIR/compose.yaml" <<'EOF_COMPOSE'
-name: psv1-sftpgo
-services:
-  sftpgo:
-    container_name: psv1-sftpgo
-    image: ${SFTPGO_IMAGE}
-    restart: unless-stopped
-    stop_grace_period: 40s
-    ports:
-      - "127.0.0.1:18080:8080"
-    environment:
-      SFTPGO_DATA_PROVIDER__CREATE_DEFAULT_ADMIN: "true"
-      SFTPGO_DEFAULT_ADMIN_USERNAME: "admin"
-      SFTPGO_DEFAULT_ADMIN_PASSWORD: ${ADMIN_PASSWORD}
-      SFTPGO_HTTPD__BINDINGS__0__PORT: "8080"
-      SFTPGO_HTTPD__BINDINGS__0__ADDRESS: "0.0.0.0"
-      SFTPGO_HTTPD__BINDINGS__0__ENABLE_WEB_ADMIN: "true"
-      SFTPGO_HTTPD__BINDINGS__0__ENABLE_WEB_CLIENT: "true"
-      SFTPGO_HTTPD__BINDINGS__0__PROXY_ALLOWED: "172.16.0.0/12,10.0.0.0/8,192.168.0.0/16"
-      SFTPGO_HTTPD__BINDINGS__0__CLIENT_IP_PROXY_HEADER: "X-Real-IP"
-      SFTPGO_SFTPD__BINDINGS__0__PORT: "0"
-      SFTPGO_GRACE_TIME: "30"
-    volumes:
-      - ./storage:/srv/sftpgo
-      - ./state:/var/lib/sftpgo
-    logging:
-      driver: json-file
-      options:
-        max-size: "10m"
-        max-file: "3"
-EOF_COMPOSE
-  cat > "$SFTPGO_APP_DIR/credentials.txt" <<EOF_CREDENTIALS
-Admin panel: https://${public_domain}/web/admin/
-Username: admin
-Password: $admin_password
-
-File manager: https://${public_domain}/web/client/
-Username: owner
-Password: $owner_password
-Permissions: upload, download, rename and delete.
-
-File manager: https://${public_domain}/web/client/
-Username: reader
-Password: $reader_password
-Permissions: list and download only; public shares disabled.
-EOF_CREDENTIALS
-  chmod 0600 "$SFTPGO_APP_DIR/.env" "$SFTPGO_APP_DIR/credentials.txt"
-  (cd "$SFTPGO_APP_DIR" && docker compose config --quiet && docker compose pull && docker compose up -d sftpgo)
-  if ! cover_sftpgo_bootstrap_users "$SFTPGO_APP_DIR" "$admin_password" "$owner_password" "$reader_password"; then
-    docker logs --tail=100 psv1-sftpgo 2>&1 || true
-    die "SFTPGo запущен, но начальные пользователи не созданы; nginx не изменён."
-  fi
-  auto_done "SFTPGo backend установлен на 127.0.0.1:${SFTPGO_LOCAL_PORT}; отдельный Caddy не запускался."
-}
-
-cover_apply_nginx(){
-  local mode="$1" conf enabled backup before_code after_code frontend_code path
-  enabled="/etc/nginx/sites-enabled/cdn-origin.conf"
-  [[ -e "$enabled" ]] || die "Активный $enabled не найден. Команда работает с CDN-origin, созданным panel-script-v1."
-  conf=$(readlink -f "$enabled" 2>/dev/null || true)
-  [[ -f "$conf" && "$conf" == /etc/nginx/* ]] || die "Небезопасная или неизвестная цель nginx-конфига: ${conf:-нет}."
-  path=$(method_server_path)
-  before_code=$(curl -sk --max-time 8 --resolve "psv1-cover.invalid:443:127.0.0.1" \
-    -o /dev/null -w '%{http_code}' "https://psv1-cover.invalid${path}" 2>/dev/null || true)
-  backup="$BACKUP_DIR/$(basename "$conf").before-cover-${mode}-$(date +%Y%m%d-%H%M%S)"
-  install -d -m 0700 "$BACKUP_DIR"
-  cp -a "$conf" "$backup"
-  if ! cover_patch_nginx_config "$conf" "$mode"; then
-    cp -a "$backup" "$conf"
-    die "Fallback nginx не распознан; восстановлен $backup"
-  fi
-  if ! nginx -t || ! systemctl reload nginx; then
-    cp -a "$backup" "$conf"
-    nginx -t >/dev/null 2>&1 && systemctl reload nginx || true
-    die "nginx не принял frontend '$mode'; восстановлен $backup"
-  fi
-  sleep 2
-  after_code=$(curl -sk --max-time 8 --resolve "psv1-cover.invalid:443:127.0.0.1" \
-    -o /dev/null -w '%{http_code}' "https://psv1-cover.invalid${path}" 2>/dev/null || true)
-  if [[ -n "$before_code" && "$before_code" != 000 && "$after_code" != "$before_code" ]]; then
-    cp -a "$backup" "$conf"
-    nginx -t >/dev/null 2>&1 && systemctl reload nginx || true
-    die "После frontend-переключения XHTTP изменился: $before_code -> $after_code. Выполнен откат: $backup"
-  fi
-  if [[ "$mode" == sftpgo ]]; then
-    frontend_code=$(curl -sk --max-time 10 --resolve "psv1-cover.invalid:443:127.0.0.1" \
-      -o /dev/null -w '%{http_code}' "https://psv1-cover.invalid/web/client/" 2>/dev/null || true)
-    if [[ ! "$frontend_code" =~ ^(2|3)[0-9][0-9]$ ]]; then
-      cp -a "$backup" "$conf"
-      nginx -t >/dev/null 2>&1 && systemctl reload nginx || true
-      die "SFTPGo через nginx ответил HTTP ${frontend_code:-000}; nginx восстановлен из $backup"
-    fi
-  fi
-  auto_done "Frontend '$mode' включён; XHTTP path сохранил HTTP ${after_code:-000}. Backup: $backup"
-}
-
-run_cover_service_manager(){
-  local requested="${1:-}" requested_domain="${2:-}" choice="" proceed=""
-  load_state || true
-  [[ "${METHOD:-none}" != none ]] || die "В состоянии не найден CDN-метод. Запусти команду на CDN/relay-нoде, установленной panel-script-v1."
-  ui_title "ОБЫЧНЫЕ URL CDN/ORIGIN"
-  if [[ -z "$requested" ]]; then
-    echo "  1 — статическая заглушка"
-    echo "  2 — SFTPGo backend (без второго Caddy, локальный :${SFTPGO_LOCAL_PORT})"
-    echo "  0 — выйти"
-    read -r -p "Выбор [1]: " choice; choice="${choice:-1}"
-    case "$choice" in 1) requested=placeholder ;; 2) requested=sftpgo ;; 0) return 0 ;; *) die "Неизвестный выбор." ;; esac
-  fi
-  case "$requested" in
-    placeholder)
-      cover_apply_nginx placeholder
-      if [[ -f "$SFTPGO_APP_DIR/compose.yaml" ]]; then
-        (cd "$SFTPGO_APP_DIR" && docker compose stop sftpgo) || true
-        info "SFTPGo остановлен; данные в $SFTPGO_APP_DIR сохранены."
-      fi
-      COVER_SERVICE=placeholder
-      SFTPGO_PUBLIC_DOMAIN=""
-      ;;
-    sftpgo)
-      SFTPGO_PUBLIC_DOMAIN="${requested_domain:-${SFTPGO_PUBLIC_DOMAIN:-${CDN_DOMAIN:-}}}"
-      valid_domain "$SFTPGO_PUBLIC_DOMAIN" || ask_domain SFTPGO_PUBLIC_DOMAIN "Публичный домен SFTPGo" "${CDN_DOMAIN:-}" "files.example.net"
-      danger "Если $SFTPGO_PUBLIC_DOMAIN работает через CDN, включи POST/PUT/PATCH/DELETE, передачу Cookie/Authorization и отключи кеш для всех URL SFTPGo."
-      ask_yes_no proceed "Продолжить установку backend без изменения XHTTP-пути?" "no"
-      [[ "$proceed" == yes ]] || return 0
-      cover_install_sftpgo "$SFTPGO_PUBLIC_DOMAIN"
-      cover_apply_nginx sftpgo
-      COVER_SERVICE=sftpgo
-      ;;
-    *) die "Режим frontend: placeholder или sftpgo." ;;
-  esac
-  save_state
-  if [[ "$COVER_SERVICE" == sftpgo ]]; then
-    ok "SFTPGo открыт через frontend: https://${SFTPGO_PUBLIC_DOMAIN}/web/client/"
-    check_do "Начальные пароли: $SFTPGO_APP_DIR/credentials.txt"
-    check_do "После проверки входа замени начальные пароли в интерфейсе."
-  else
-    ok "Статическая заглушка восстановлена."
-  fi
 }
 
 panel_cert_patch_nginx_config(){
@@ -3785,12 +3594,8 @@ if [[ "${PSV1_SOURCE_ONLY:-0}" == 1 ]]; then
 fi
 
 case "${1:-}" in
-  --cascade-relay-nginx|--relay-nginx)
-    run_cascade_relay_nginx
-    exit 0
-    ;;
-  --frontend|--cover-service)
-    run_cover_service_manager "${2:-}" "${3:-}"
+  --node-caddy-route)
+    run_node_caddy_route "${2:-}" "${3:-}" "${4:-}" "${5:-/opt/e-cloudfiles/Caddyfile}"
     exit 0
     ;;
   --panel-cert)
@@ -3855,9 +3660,8 @@ ${PROJECT_NAME} ${INSTALLER_VERSION}
 Обновить Node Port/SECRET_KEY: $INSTALL_PATH --node-credentials
 Управление существующей Remnawave: $INSTALL_PATH --manage-remna
 Сертификат панели без остановки сервисов: $INSTALL_PATH --panel-cert panel.example.com
-Обычные URL CDN: заглушка или SFTPGo: $INSTALL_PATH --frontend
 Каскад (один exit или пул exit-нод): $INSTALL_PATH --cascade
-Relay nginx -> cascade :7443: $INSTALL_PATH --cascade-relay-nginx
+Маршрут Caddy/SFTPGo: $INSTALL_PATH --node-caddy-route METHOD DOMAIN PORT [CADDYFILE]
 Проверка Remnawave: $INSTALL_PATH --check-remna
 Сброс ответов: $INSTALL_PATH --reset
 Обновление из GitHub: $INSTALL_PATH --update
@@ -3878,6 +3682,10 @@ EOF
 esac
 
 if load_state; then
+  if normalize_remna_node_install; then
+    warn "Сохранённая node-only задача переведена в безопасный режим: CDN/nginx/Host на сервере Node не настраиваются."
+    save_state
+  fi
   ensure_remna_node_port
   if marked complete && [[ "${PANEL_KIND:-}" == remna ]] && [[ "${REMNA_ROLE:-}" == panel || "${REMNA_ROLE:-}" == both ]]; then
     echo
@@ -3952,7 +3760,7 @@ if ! marked packages; then
   if is_bare_remna_node || is_side_by_side_remna_node; then
     # A node task on a VPS that already hosts the panel must never replace the
     # active reverse proxy, certificates or firewall policy.
-    apt-get install -y curl jq ca-certificates openssl uuid-runtime unzip iptables dnsutils
+    apt-get install -y curl jq ca-certificates openssl uuid-runtime unzip iptables dnsutils python3
     auto_done "Защитный node-режим: nginx/certbot/UFW и полный apt upgrade панели не трогаю."
     mark packages
   else
@@ -4784,12 +4592,6 @@ provider_steps(){
         echo "Технический xxxx.selcdn.net идёт в ключ."
         ;;
     esac
-    if [[ "${COVER_SERVICE:-placeholder}" == sftpgo ]]; then
-      echo
-      echo "SFTPGo frontend: обычные URL идут на 127.0.0.1:${SFTPGO_LOCAL_PORT}; XHTTP path остаётся отдельным."
-      echo "Для CDN: отключить кеш на ВСЕХ URL SFTPGo; передавать Cookie и Authorization."
-      echo "Разрешить клиентские методы POST/PUT/PATCH/DELETE/OPTIONS, иначе вход и файловые операции не работают."
-    fi
     echo
     echo "После активации проверка: curl к CDN path должен дать HTTP 400."
   } > "$f"
@@ -4819,10 +4621,6 @@ else
 fi
 
 write_nginx
-if [[ "${COVER_SERVICE:-placeholder}" == sftpgo && "$METHOD" != none ]]; then
-  cover_install_sftpgo "${SFTPGO_PUBLIC_DOMAIN:-$CDN_DOMAIN}"
-  cover_apply_nginx sftpgo
-fi
 [[ "$METHOD" != none ]] && provider_steps
 
 # If provider gives its tech domain only after resource creation, collect it now.
@@ -4843,7 +4641,7 @@ if [[ "$PANEL_KIND" == remna ]]; then
     echo "Открой: https://${PANEL_DOMAIN}/ и создай первого администратора."
     echo "Дальше рабочий порядок:"
     echo "  1) В панели создай Node для европейского VPS, запомни Node Port и скопируй SECRET_KEY."
-    echo "  2) На европейском VPS: этот же install.sh → Remnawave → Только нода → выбери CDN."
+    echo "  2) На нужном VPS: этот же install.sh → Remnawave → Только Node. CDN на ноде не выбирается."
     echo "  3) После запуска ноды вернись на этот сервер и выполни: $INSTALL_PATH --manage-remna"
     echo "     Менеджер выберет эту ноду, спросит CDN/домены и попробует сам создать Profile, Active inbound, Squad и Host через API."
   else
@@ -4903,7 +4701,6 @@ elif [[ "$REMNA_ROLE" == node || "$REMNA_ROLE" == both ]]; then XRAY_VERSION=$(d
   [[ "$PANEL_KIND" == remna ]] && echo "Remnawave role/version: $REMNA_ROLE / $REMNA_VERSION"
   [[ "$PANEL_KIND" == 3xui ]] && echo "3x-ui version: $XUI_VERSION"
   echo "Method: $(method_title "$METHOD")"
-  echo "Frontend: ${COVER_SERVICE:-placeholder}${SFTPGO_PUBLIC_DOMAIN:+ / $SFTPGO_PUBLIC_DOMAIN}"
   echo "Public IP: $PUBLIC_IP"
   if [[ "$METHOD" != none ]]; then
     echo "Xray port/path: $XRAY_PORT $SERVER_PATH"
@@ -4941,9 +4738,9 @@ cat > "$OUT_DIR/cascade-next-steps.txt" <<EOF
   $INSTALL_PATH --cascade
 
 Remnawave: мастер выбирает relay и одну либо несколько exit-нод. На каждой exit готовится BRIDGE_IN :8888 и отдельный bridge-user.
-Для нескольких exit relay profile создаёт VLESS_EXIT_* + routing.balancers/EXIT_POOL (roundRobin или random). Существующие active inbound на exit сохраняются.
-Перед заменой активного profile relay всегда требуется отдельное подтверждение.
-Provider-side origin/DNS и reverse proxy relay выводятся отдельной ручной инструкцией (Caddy на отдельном relay; существующий nginx при panel+relay на одном VPS).
+Для нескольих exit маршрут получает уникальные PSV1_*_EXIT/PSV1_*_POOL (roundRobin или random). Существующие active inbound на relay и exit сохраняются.
+Перед merge в активный profile relay сохраняется backup и требуется отдельное подтверждение.
+Provider-side origin/DNS выводятся отдельно; для Caddy/SFTPGo создаётся готовый APPLY-ON-RELAY.sh, а panel+relay сохраняет существующий nginx.
 
 3x-ui: пока создаётся безопасный чек-лист; финальный catch-all только по network=tcp,udp, не по inboundTag.
 EOF
