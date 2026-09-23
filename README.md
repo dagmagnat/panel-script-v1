@@ -4,7 +4,7 @@
 
 Цель проекта — максимально автоматизировать установку, но при этом явно показывать пользователю, что скрипт сделал сам и какие действия нужно выполнить вручную в кабинете CDN/DNS.
 
-> Текущая версия README рассчитана на `panel-script-v1 1.4.0`. В архиве уже лежит полный готовый `install.sh`; применять старые hotfix-файлы поверх него не нужно.
+> Текущая версия README рассчитана на `panel-script-v1 1.4.1`. В архиве уже лежит полный готовый `install.sh`; применять старые hotfix-файлы поверх него не нужно.
 
 ## Что поддерживается
 
@@ -163,7 +163,7 @@ fingerprint именно нового сертификата. Это исклю�
 
 Для TurboFlare делегированный домен — public/CDN, а `file.example.ru` — прямой домен проверки origin. В кабинете TurboFlare оставь Address=`IP_VPS:443` и HTTPS=`ON`: если форма не принимает домен, заменять IP не нужно. Origin-vhost на `:443` должен отдавать SFTPGo/заглушку на `/` и XHTTP только на специальном path.
 
-Если SFTPGo уже работает через `/opt/e-cloudfiles/Caddyfile`, мастер создаёт готовую команду `APPLY-ON-NODE.sh` или `APPLY-ON-RELAY.sh`. Она вызывает `--node-caddy-route`, создаёт backup, вставляет только provider path перед общим `reverse_proxy sftpgo:8080`, проверяет Caddy и делает reload. Поэтому корень сайта продолжает открывать SFTPGo.
+Мастер создаёт готовую команду `APPLY-ON-NODE.sh` или `APPLY-ON-RELAY.sh`. Она вызывает `--node-proxy-route`, сама определяет Caddy либо nginx, создаёт backup, меняет только provider path, проверяет конфигурацию и делает reload с автоматическим откатом при ошибке. Поэтому корень сайта продолжает открывать SFTPGo/заглушку. Старый nginx upstream вроде `127.0.0.1:10089` автоматически переводится на фактический direct/cascade port (`7443–7448` для каскада).
 
 Для нескольких CDN на одной ноде заведи отдельный origin-vhost/домен на каждый метод. Это обязательно для Beeline + TurboFlare: у них одинаковый XHTTP path, и один Host не может одновременно направлять его на два разных порта/exit. `--node-caddy-route` поэтому меняет только vhost с точным доменом и отказывается трогать чужой/default vhost.
 
@@ -193,7 +193,9 @@ Xray JSON / шаблон подписки, если выбран
 External Squad, если он нужен выбранной схеме
 ```
 
-Существующие профили, Hosts и Squads не должны удаляться без явного подтверждения пользователя. Начиная с 1.4.0 новый CDN inbound добавляется в уже активный Config Profile ноды. Скрипт не заменяет активный профиль ради второго метода; перед merge сохраняет JSON-backup и останавливается при конфликте порта.
+Существующие профили, Hosts и Squads не удаляются. Новый CDN inbound добавляется в уже активный Config Profile ноды; перед merge сохраняется JSON-backup, а конфликт порта останавливает операцию. Начиная с 1.4.1 мастер также проверяет публичный endpoint `address:443:path`: если старый управляемый PSV1 Host мешает новому direct/cascade варианту, он отключается без удаления. Чужой Host автоматически не меняется.
+
+Для каждого созданного Host мастер создаёт или переиспользует отдельный динамический Xray JSON template `PSV1 <Provider>` с `remnawave.addVirtualHostAsOutbound=true` и назначает его именно этому Host. Это выполняется и для обычного метода, и для каскада. Отдельный External Squad не требуется для Host-привязки и по умолчанию не создаётся.
 
 Пользователи автоматически не переносятся между Internal Squads без подтверждения.
 
@@ -204,6 +206,8 @@ External Squad, если он нужен выбранной схеме
 ```bash
 /root/panel-script-v1.sh --cascade
 ```
+
+Порядок мастера фиксирован: метод CDN → relay → exit/пул → разные client/origin domains → аудит портов/Host → merge с backup → Active Inbounds/Internal Squad → Host/Xray JSON template → API post-check → публичная проверка XHTTP. Готовым ingress считается ответ HTTP `400`; `502`, `404` или отсутствие ответа не скрываются за успешным итогом.
 
 Для Remnawave мастер сначала выбирает **relay-ноду**, затем предлагает режим exit:
 
@@ -227,7 +231,7 @@ External Squad, если он нужен выбранной схеме
 
 На каждой выбранной exit-ноде мастер добавляет/reuse `BRIDGE_IN :8888` в **активном** Config Profile и Active Inbounds, не удаляя существующие inbound. Для каждого exit создаётся отдельный bridge-user/VLESS UUID. На relay маршрут также объединяется с уже активным Config Profile. Порты разделены: TurboFlare `7443`, Beeline `7444`, Yandex `7445`, VK `7446`, Timeweb `7447`, Selectel `7448`. Каждое правило routing ограничено своим `inboundTag`, а outbound/balancer имеют уникальные имена. Поэтому один RU relay может направлять, например, Yandex в Germany, а TurboFlare в Netherlands, если хватает CPU/RAM/канала.
 
-Для reverse proxy на хосте relay inbound слушает `127.0.0.1`. Если Caddy/SFTPGo запущен в Docker, контейнер не видит host-loopback; в мастере нужно ввести Docker gateway этой сети, например `172.18.0.1`. Команда `--node-caddy-route` определяет этот gateway через `docker inspect` и направляет Caddy на него.
+Для reverse proxy на хосте relay inbound слушает `127.0.0.1`. Если Caddy/SFTPGo запущен в Docker, контейнер не видит host-loopback; в мастере нужно ввести Docker gateway этой сети, например `172.18.0.1`. Команда `--node-proxy-route` при выборе Caddy определяет этот gateway через `docker inspect`; для nginx на хосте использует `127.0.0.1`.
 
 Записи через API проверяются повторным чтением. Короткий успешный ответ `POST/PATCH` сам по себе не считается доказательством: мастер перечитывает Node, Internal Squad и bridge-user, при необходимости использует squad bulk-action и только затем собирает `VLESS_EXIT`. Это важно для Remnawave 3.3.0, где ответы создания пользователя могут отличаться по набору полей.
 
@@ -246,7 +250,9 @@ VLESS UUID и членство в squad считаются достаточны�
 
 Балансируется выбор outbound для **новых соединений**. Это не bonding: один TCP-поток не складывает скорость нескольких VPS.
 
-Существующий активный Profile relay не заменяется: мастер показывает merge, сохраняет backup и требует подтверждение. Provider-side DNS/origin и firewall/SG для `8888` остаются явными шагами. Для Caddy/SFTPGo генерируется `APPLY-ON-RELAY.sh`, который не меняет `location /`. Сначала базовый CDN рекомендуется довести до `origin=400` и `CDN=400`, затем включать каскад.
+Существующий активный Profile relay не заменяется: мастер показывает merge, сохраняет backup и требует подтверждение. Provider-side DNS/origin и firewall/SG для `8888` остаются явными шагами. Для Caddy/nginx генерируется `APPLY-ON-RELAY.sh`, который не меняет `location /`. Сначала базовый CDN рекомендуется довести до `origin=400` и `CDN=400`, затем включать каскад.
+
+Beeline и TurboFlare используют одинаковый XHTTP path. Поэтому на одном и том же origin-vhost этот URL нельзя одновременно направить на два разных порта. Скрипт обнаруживает такое совпадение и останавливается; безопасные варианты — отдельные origin-домены/vhost или отдельные RU relay. Остальные методы с разными path могут сосуществовать на одном relay при разных method-specific портах.
 
 Файлы каскада сохраняются в отдельном каталоге: `relay-profile.json`, `selected-exits.json`, `exit-pool.json`, `RELAY-STEPS.txt`, `EXIT-STEPS.txt`, `VERIFY.txt`, `MANUAL-ACTIONS.txt`.
 

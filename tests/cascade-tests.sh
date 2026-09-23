@@ -277,6 +277,36 @@ test_node_only_discards_legacy_cdn_state(){
   pass "node-only: installs only remnanode and preserves ports 80/443"
 }
 
+test_host_endpoint_reconciliation(){
+  local got events="$TEST_TMP/host-events.log"
+  : > "$events"
+  rm_hosts_json(){
+    jq -nc '[{uuid:"old-direct",remark:"PSV1 TurboFlare - old",address:"cdn.example.net",port:443,path:"/static/getFile/video/segment.ts",isDisabled:false,inbound:{configProfileUuid:"old-profile",configProfileInboundUuid:"old-inbound"}}]'
+  }
+  rm_api(){
+    local method="$1" path="$2" token="${3:-}" body="${4:-}"
+    if [[ "$method:$path" == PATCH:/api/hosts ]]; then
+      if jq -e '.uuid=="old-direct" and .isDisabled==true' >/dev/null 2>&1 <<<"$body"; then
+        echo disable >> "$events"
+        echo '{"response":{"uuid":"old-direct"}}'
+      else
+        echo '{"response":{"uuid":"updated"}}'
+      fi
+    elif [[ "$method:$path" == POST:/api/hosts ]]; then
+      jq -e '.address=="cdn.example.net" and .sni=="cdn.example.net" and .host=="cdn.example.net" and .path=="/static/getFile/video/segment.ts"' >/dev/null <<<"$body" || return 1
+      echo create >> "$events"
+      echo '{"response":{"uuid":"new-cascade"}}'
+    else
+      echo '{}'
+    fi
+  }
+  got=$(rm_api_upsert_managed_host token new-profile new-inbound turboflare cdn.example.net "PSV1 Cascade TurboFlare" '{}' "$TEST_TMP")
+  [[ "$got" == new-cascade ]] || fail "host audit: new cascade Host was not returned cleanly"
+  grep -Fxq disable "$events" || fail "host audit: old managed direct Host was not disabled"
+  grep -Fxq create "$events" || fail "host audit: replacement cascade Host was not created"
+  pass "host audit: duplicate public endpoint is disabled and replaced without deletion"
+}
+
 test_relay_profiles
 test_profile_inbound_merge
 test_bridge_user_short_create_response
@@ -290,4 +320,5 @@ test_api_postconditions
 test_api_postcheck_repairs_membership
 test_api_postcheck_accepts_33_id_only_user
 test_node_only_discards_legacy_cdn_state
+test_host_endpoint_reconciliation
 echo "All cascade tests passed."

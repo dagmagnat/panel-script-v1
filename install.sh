@@ -11,7 +11,7 @@ IFS=$'\n\t'
 # This installer deliberately keeps each CDN preset separate. Do not mix fields
 # between providers: path/padding/uplink settings are provider-specific.
 
-INSTALLER_VERSION="1.4.0"
+INSTALLER_VERSION="1.4.1"
 STATE_SCHEMA_CURRENT="1"
 PRESET="${INSTALLER_PRESET:-}"
 
@@ -759,6 +759,9 @@ rm_manager_collect_domains(){
       ask_optional_domain CDN_DOMAIN "Технический домен xxxx.selcdn.net (если ещё нет — Enter)" "" "abcd.selcdn.net"
       ;;
   esac
+  if [[ -n "${ORIGIN_DOMAIN:-}" && -n "${CDN_DOMAIN:-}" && "${ORIGIN_DOMAIN,,}" == "${CDN_DOMAIN,,}" ]]; then
+    die "Origin-домен и клиентский CDN-домен совпадают. Это создаёт цикл/обход CDN. Укажи два разных имени."
+  fi
 }
 
 rm_profile_config_json(){
@@ -878,6 +881,85 @@ rm_api_create_host(){
   printf '%s
 ' "$resp" > "$RM_MANAGER_DIR/last-api-error-create-host.json"
   return 1
+}
+
+rm_host_desired_body(){
+  local profile_uuid="$1" inbound_uuid="$2" method="$3" address="$4" remark="$5" extra="$6" host_uuid="${7:-}"
+  local path alpn fp
+  path=$(rm_method_meta "$method" path); alpn=$(rm_method_meta "$method" alpn); fp=$(rm_method_meta "$method" fp)
+  jq -nc --arg u "$host_uuid" --arg p "$profile_uuid" --arg i "$inbound_uuid" --arg remark "$remark" --arg addr "$address" --arg path "$path" --arg alpn "$alpn" --arg fp "$fp" --argjson extra "$extra" '
+    {inbound:{configProfileUuid:$p,configProfileInboundUuid:$i},remark:$remark,address:$addr,port:443,path:$path,sni:$addr,host:$addr,alpn:$alpn,fingerprint:$fp,allowInsecure:false,isDisabled:false,securityLayer:"TLS",overrideSniFromAddress:false,xhttpExtraParams:$extra}
+    + (if $u=="" then {} else {uuid:$u} end)'
+}
+
+rm_api_patch_host_desired(){
+  local token="$1" host_uuid="$2" profile_uuid="$3" inbound_uuid="$4" method="$5" address="$6" remark="$7" extra="$8"
+  local body resp
+  body=$(rm_host_desired_body "$profile_uuid" "$inbound_uuid" "$method" "$address" "$remark" "$extra" "$host_uuid")
+  resp=$(rm_api PATCH /api/hosts "$token" "$body" 2>/dev/null || true)
+  if jq -e '.response.uuid // .uuid' >/dev/null 2>&1 <<<"$resp"; then return 0; fi
+  # Legacy spelling used by older Remnawave builds.
+  body=$(jq -c '.xHttpExtraParams=.xhttpExtraParams | del(.xhttpExtraParams)' <<<"$body")
+  resp=$(rm_api PATCH /api/hosts "$token" "$body" 2>/dev/null || true)
+  if jq -e '.response.uuid // .uuid' >/dev/null 2>&1 <<<"$resp"; then return 0; fi
+  rm_api_save_redacted_response "$RM_MANAGER_DIR/last-api-error-update-host.json" "$resp"
+  return 1
+}
+
+rm_api_disable_host(){
+  local token="$1" host_uuid="$2" resp
+  resp=$(rm_api PATCH /api/hosts "$token" "$(jq -nc --arg u "$host_uuid" '{uuid:$u,isDisabled:true}')" 2>/dev/null || true)
+  jq -e '.response.uuid // .uuid' >/dev/null 2>&1 <<<"$resp"
+}
+
+# One public address:port:path can lead to only one XHTTP inbound. Reusing it for
+# direct and cascade Hosts is a common source of duplicate client entries where
+# one entry can never work. Managed conflicts are disabled (never deleted), while
+# foreign/user-created conflicts stop the operation for an explicit decision.
+rm_api_upsert_managed_host(){
+  local token="$1" profile_uuid="$2" inbound_uuid="$3" method="$4" address="$5" remark="$6" extra="$7" run_dir="$8"
+  local hosts path exact_uuid target_uuid conflicts foreign managed item uuid
+  hosts=$(rm_hosts_json "$token") || return 1
+  path=$(rm_method_meta "$method" path)
+  printf '%s\n' "$hosts" | jq . > "$run_dir/hosts-before.json"
+  exact_uuid=$(jq -r --arg p "$profile_uuid" --arg i "$inbound_uuid" --arg a "$address" '
+    [.[]? | select((.address//"")==$a)
+      | select((.inbound.configProfileUuid // .configProfileUuid // "")==$p)
+      | select((.inbound.configProfileInboundUuid // .configProfileInboundUuid // "")==$i)
+      | .uuid][0] // empty' <<<"$hosts")
+  conflicts=$(jq -c --arg p "$profile_uuid" --arg i "$inbound_uuid" --arg a "$address" --arg path "$path" '
+    [.[]? | select((.address//"")==$a and ((.port//443)|tonumber)==443 and (.path//"")==$path)
+      | select((.isDisabled//false)==false)
+      | select(((.inbound.configProfileUuid // .configProfileUuid // "")!=$p)
+            or ((.inbound.configProfileInboundUuid // .configProfileInboundUuid // "")!=$i))]' <<<"$hosts")
+  foreign=$(jq -c '[.[] | select(((.remark//"")|startswith("PSV1 "))|not)]' <<<"$conflicts")
+  if (( $(jq 'length' <<<"$foreign") > 0 )); then
+    printf '%s\n' "$foreign" | jq . > "$run_dir/host-endpoint-foreign-conflicts.json"
+    warn "Адрес $address:443$path уже занят пользовательским Host. Автоматически его не отключаю. Диагностика: $run_dir/host-endpoint-foreign-conflicts.json" >&2
+    return 4
+  fi
+  managed=$(jq -c '[.[] | select((.remark//"")|startswith("PSV1 "))]' <<<"$conflicts")
+  # First make the desired Host usable. Only after that disable obsolete managed
+  # duplicates, so an API failure cannot take the currently working Host down.
+  if [[ -n "$exact_uuid" ]]; then
+    rm_api_patch_host_desired "$token" "$exact_uuid" "$profile_uuid" "$inbound_uuid" "$method" "$address" "$remark" "$extra" || return 1
+    target_uuid="$exact_uuid"
+    auto_done "Существующий Host приведён к ожидаемым Address/SNI/Host/Path/XHTTP параметрам." >&2
+  else
+    target_uuid=$(rm_api_create_host "$token" "$profile_uuid" "$inbound_uuid" "$method" "$address" "$remark" "$extra") || return 1
+  fi
+  if (( $(jq 'length' <<<"$managed") > 0 )); then
+    printf '%s\n' "$managed" | jq . > "$run_dir/host-endpoint-disabled-conflicts.json"
+    while IFS= read -r item; do
+      uuid=$(jq -r '.uuid' <<<"$item")
+      rm_api_disable_host "$token" "$uuid" || {
+        warn "Новый Host создан, но старый конфликтующий Host UUID=$uuid не отключён. Исправь его вручную; оба оставлены без удаления." >&2
+        return 5
+      }
+    done < <(jq -c '.[]' <<<"$managed")
+    auto_done "Старые PSV1 Host с тем же endpoint отключены без удаления; прямой и cascade больше не дублируются." >&2
+  fi
+  printf '%s' "$target_uuid"
 }
 
 rm_api_add_to_squad(){
@@ -1002,6 +1084,22 @@ print_manual_file_colored(){
       manual_do "$line"
     fi
   done < "$f"
+}
+
+rm_probe_public_xhttp(){
+  local method="$1" domain="$2" run_dir="$3" path code headers body
+  [[ -n "$domain" ]] || return 2
+  path=$(rm_method_meta "$method" path)
+  headers="$run_dir/public-xhttp-headers.txt"
+  body="$run_dir/public-xhttp-body.bin"
+  code=$(curl --noproxy '*' -ksS --max-time 15 -D "$headers" -o "$body" -w '%{http_code}' "https://${domain}${path}" 2>"$run_dir/public-xhttp-curl.err" || true)
+  printf 'url=https://%s%s\nhttp_code=%s\n' "$domain" "$path" "${code:-000}" > "$run_dir/public-xhttp-result.txt"
+  if [[ "$code" == 400 ]]; then
+    auto_done "Public endpoint проверен: https://${domain}${path} -> HTTP 400 от XHTTP."
+    return 0
+  fi
+  warn "Public endpoint пока не готов: https://${domain}${path} -> HTTP ${code:-000}. Ожидается 400; проверь CDN origin и reverse proxy."
+  return 1
 }
 
 rm_manager_provider_steps(){
@@ -1166,6 +1264,176 @@ PY
   check_do "curl --noproxy '*' --resolve ${domain}:443:127.0.0.1 -i https://${domain}${path}  # ожидается HTTP 400"
   check_do "curl --noproxy '*' --resolve ${domain}:443:127.0.0.1 -I https://${domain}/  # должен остаться SFTPGo/cover"
   echo "Backup: $backup"
+}
+
+# Repair or add one XHTTP route in the nginx origin installed by older PSV1
+# releases.  Legacy installations used one shared upstream (often :10089),
+# which became stale after a direct method was converted to a cascade (:744x).
+# We migrate that one legacy route and use per-location targets for additional
+# methods.  A same-vhost/same-path collision is rejected explicitly: Beeline
+# and TurboFlare cannot point the identical URL to two different inbounds.
+run_node_nginx_route(){
+  local method="${1:-}" domain="${2:-}" target_port="${3:-}" conf="${4:-/etc/nginx/sites-available/cdn-origin.conf}"
+  local path backup python_bin
+  case "$method" in vk|yandex|beeline|timeweb|selectel|turboflare) ;; *) die "Метод для --node-nginx-route: vk|yandex|beeline|timeweb|selectel|turboflare" ;; esac
+  valid_domain "$domain" || die "Некорректный домен origin/cover: $domain"
+  [[ "$target_port" =~ ^[0-9]+$ ]] && (( target_port >= 1 && target_port <= 65535 )) || die "Некорректный локальный порт XHTTP."
+  [[ -f "$conf" ]] || die "nginx-конфигурация не найдена: $conf"
+  command -v nginx >/dev/null 2>&1 || die "nginx не найден."
+  python_bin="${PSV1_PYTHON:-$(command -v python3 2>/dev/null || command -v python 2>/dev/null || true)}"
+  [[ -n "$python_bin" ]] || die "Python 3 не найден."
+  path=$(rm_method_meta "$method" path)
+  backup="${conf}.before-psv1-$(date +%Y%m%d-%H%M%S)"
+  cp -p "$conf" "$backup"
+
+  if ! "$python_bin" - "$conf" "$method" "$path" "$target_port" <<'PY'
+import pathlib
+import re
+import sys
+
+filename, method, route_path, port = sys.argv[1:]
+p = pathlib.Path(filename)
+text = p.read_text(encoding="utf-8")
+begin = f"# PSV1-{method.upper()}-ROUTE BEGIN"
+end = f"# PSV1-{method.upper()}-ROUTE END"
+
+def balanced_blocks(source, keyword):
+    result = []
+    for m in re.finditer(rf"(?m)^[ \t]*{re.escape(keyword)}\b[^\n]*\{{\s*$", source):
+        brace = source.find("{", m.start())
+        depth = 0
+        quote = None
+        escaped = False
+        for pos in range(brace, len(source)):
+            ch = source[pos]
+            if quote:
+                if escaped:
+                    escaped = False
+                elif ch == "\\":
+                    escaped = True
+                elif ch == quote:
+                    quote = None
+                continue
+            if ch in ('"', "'"):
+                quote = ch
+            elif ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    result.append((m.start(), pos + 1, source[m.start():pos + 1]))
+                    break
+    return result
+
+route_block = (
+    f"    {begin}\n"
+    f"    location ^~ {route_path} {{\n"
+    f"        proxy_pass http://127.0.0.1:{port};\n"
+    f"        proxy_http_version 1.1;\n"
+    f"        proxy_set_header Connection \"\";\n"
+    f"        proxy_set_header Host $host;\n"
+    f"        proxy_set_header X-Real-IP $remote_addr;\n"
+    f"        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;\n"
+    f"        proxy_set_header X-Forwarded-Proto $scheme;\n"
+    f"        proxy_pass_request_headers on;\n"
+    f"        proxy_buffering off;\n"
+    f"        proxy_request_buffering off;\n"
+    f"        proxy_cache off;\n"
+    f"        proxy_read_timeout 1h;\n"
+    f"        proxy_send_timeout 1h;\n"
+    f"        client_max_body_size 0;\n"
+    f"        add_header X-Accel-Buffering no always;\n"
+    f"        add_header Cache-Control \"no-store, no-cache\" always;\n"
+    f"    }}\n"
+    f"    {end}\n"
+)
+
+# Updating our own marked route is idempotent (normally two copies: HTTP/HTTPS).
+if begin in text:
+    pattern = re.compile(r"(?ms)^[ \t]*" + re.escape(begin) + r"\n.*?^[ \t]*" + re.escape(end) + r"\n?")
+    text, count = pattern.subn(route_block, text)
+    if count < 1:
+        raise SystemExit("existing PSV1 nginx route marker is malformed")
+    p.write_text(text, encoding="utf-8")
+    raise SystemExit(0)
+
+# Do not allow two methods to claim the same path in the same nginx vhost.
+for other in re.finditer(r"(?ms)# PSV1-([A-Z0-9_-]+)-ROUTE BEGIN\n(.*?)# PSV1-\1-ROUTE END", text):
+    if re.search(r"location\s+[^\n{]*" + re.escape(route_path) + r"(?:\s|\{)", other.group(2)):
+        raise SystemExit(f"path {route_path} is already owned by PSV1-{other.group(1)}; use another origin vhost/server or another RU relay")
+
+# Migrate a single old generated config: its path already exists and all such
+# locations use the named xray_xhttp upstream.  This is the exact :10089 ->
+# :7443 repair required by old TurboFlare cascade installations.
+legacy_locations = [b for b in balanced_blocks(text, "location") if route_path in b[2] and "proxy_pass http://xray_xhttp;" in b[2]]
+if legacy_locations:
+    upstream = re.compile(r"(?m)^(\s*)upstream\s+xray_xhttp\s*\{\s*server\s+[^;]+;([^}]*)\}")
+    if not upstream.search(text):
+        raise SystemExit("legacy locations found, but upstream xray_xhttp is missing")
+    marker = f"# PSV1-{method.upper()}-LEGACY-UPSTREAM"
+    owner = re.search(r"(?m)^# PSV1-([A-Z0-9_-]+)-LEGACY-UPSTREAM$", text)
+    if owner and owner.group(1) != method.upper():
+        raise SystemExit(f"legacy upstream is already owned by PSV1-{owner.group(1)}")
+    text = upstream.sub(lambda m: f"{marker}\n{m.group(1)}upstream xray_xhttp {{ server 127.0.0.1:{port};{m.group(2)}}}", text, count=1)
+    p.write_text(text, encoding="utf-8")
+    raise SystemExit(0)
+
+# Additional method: insert an independent location into every generated
+# origin server (HTTP and HTTPS), immediately before its generic location /.
+servers = balanced_blocks(text, "server")
+selected = []
+for start, stop, block in servers:
+    if not re.search(r"(?m)^\s*listen\s+(?:\[::\]:)?(?:80|443)\b", block):
+        continue
+    if not re.search(r"(?m)^\s*server_name\s+[^;]+;", block):
+        continue
+    generic = re.search(r"(?m)^\s*location\s+/\s*\{", block)
+    if generic:
+        selected.append(start + generic.start())
+if not selected:
+    raise SystemExit("no safe HTTP/HTTPS origin server with a generic location / was found")
+for pos in reversed(selected):
+    text = text[:pos] + route_block + text[pos:]
+p.write_text(text, encoding="utf-8")
+PY
+  then
+    cp -p "$backup" "$conf"
+    die "nginx-маршрут не изменён: обнаружен конфликт или неоднозначный vhost. Исходный файл: $backup"
+  fi
+
+  if ! nginx -t; then
+    cp -p "$backup" "$conf"
+    nginx -t >/dev/null 2>&1 || true
+    die "nginx отклонил новый маршрут; исходный файл восстановлен: $backup"
+  fi
+  if ! systemctl reload nginx; then
+    cp -p "$backup" "$conf"
+    nginx -t >/dev/null 2>&1 && systemctl reload nginx >/dev/null 2>&1 || true
+    die "nginx reload не удался; исходный файл восстановлен: $backup"
+  fi
+  auto_done "nginx: $domain$path -> 127.0.0.1:${target_port}; остальные маршруты сохранены."
+  check_do "ss -ltnp | grep ':${target_port}'"
+  check_do "curl --noproxy '*' --resolve ${domain}:443:127.0.0.1 -ki https://${domain}${path}  # ожидается HTTP 400"
+  echo "Backup: $backup"
+}
+
+run_node_proxy_route(){
+  local method="${1:-}" domain="${2:-}" target_port="${3:-}" explicit="${4:-}"
+  local caddyfile="${PSV1_CADDYFILE:-/opt/e-cloudfiles/Caddyfile}" nginx_conf="${PSV1_NGINX_CONF:-/etc/nginx/sites-available/cdn-origin.conf}"
+  case "${PSV1_PROXY_KIND:-auto}" in
+    caddy) run_node_caddy_route "$method" "$domain" "$target_port" "${explicit:-$caddyfile}" ;;
+    nginx) run_node_nginx_route "$method" "$domain" "$target_port" "${explicit:-$nginx_conf}" ;;
+    auto)
+      if [[ -f "$caddyfile" ]] && command -v docker >/dev/null 2>&1 && docker inspect "${PSV1_CADDY_CONTAINER:-e-cloudfiles-caddy-1}" >/dev/null 2>&1; then
+        run_node_caddy_route "$method" "$domain" "$target_port" "${explicit:-$caddyfile}"
+      elif [[ -f "$nginx_conf" ]] && command -v nginx >/dev/null 2>&1; then
+        run_node_nginx_route "$method" "$domain" "$target_port" "${explicit:-$nginx_conf}"
+      else
+        die "Не найден поддерживаемый reverse proxy. Укажи PSV1_PROXY_KIND=caddy или nginx и путь четвёртым аргументом."
+      fi
+      ;;
+    *) die "PSV1_PROXY_KIND должен быть auto, caddy или nginx." ;;
+  esac
 }
 
 
@@ -1388,7 +1656,7 @@ rm_manage_xray_subscription_layer(){
     warn "API reorder шаблонов не сработал. Это косметика: в конце будет ручной пункт перетащить Default вниз."
   fi
 
-  ask_yes_no RM_CREATE_EXTERNAL_SQUAD "Создать отдельный External Squad и привязать к нему этот Xray JSON шаблон?" "yes"
+  ask_yes_no RM_CREATE_EXTERNAL_SQUAD "Создать отдельный External Squad и привязать к нему этот Xray JSON шаблон? (для Host-привязки обычно не требуется)" "no"
   if [[ "$RM_CREATE_EXTERNAL_SQUAD" == yes ]]; then
     squad_name="PSV1 $(method_title "$method")"
     squad_name=$(printf '%s' "$squad_name" | sed 's/[^A-Za-z0-9 _-]/-/g')
@@ -2173,7 +2441,7 @@ run_remna_cascade_manager(){
   local token nodes count relay relay_uuid relay_name relay_ip method pool_suffix relay_tag relay_config relay_profile_name relay_ids relay_profile_uuid relay_inbound_uuid relay_active squad_uuid host_uuid="" extra run_dir profile_doc existing_cfg merged_cfg desired_hash current_hash update_profile=no relay_port
   local exit_mode exit_mode_choice exits exit_count strategy_choice strategy first_exit first_exit_uuid first_exit_ip exit_keys exit_records='[]'
   local panel_public_ip="" relay_addr_ip="" relay_on_panel=no relay_proxy_note="" relay_listen_ip="127.0.0.1"
-  local i e e_uuid e_name e_ip e_suffix bridge_tag bridge_uuid bridge_info exit_profile_uuid bridge_inbound_uuid exit_profile_name exit_dir record user_name b inbs
+  local i e e_uuid e_name e_ip e_suffix bridge_tag bridge_uuid bridge_info exit_profile_uuid bridge_inbound_uuid exit_profile_name exit_dir record user_name b inbs RM_CASCADE_ASSIGN_RELAY=no
 
   echo
   ui_title "КАСКАД REMNAWAVE"
@@ -2190,6 +2458,9 @@ run_remna_cascade_manager(){
     warn "Для автоматического каскада нужен API token; без него изменения панели не выполняю."
     return 0
   fi
+  echo
+  ui_title "ШАГ 1/5 — МЕТОД CDN"
+  method=$(rm_manager_choose_method) || return 0
   nodes=$(rm_nodes_json "$token") || true
   count=$(jq 'length' <<<"$nodes")
   if (( count < 2 )); then
@@ -2198,6 +2469,7 @@ run_remna_cascade_manager(){
     return 0
   fi
 
+  ui_title "ШАГ 2/5 — RELAY И EXIT"
   local _cascade_selection_done=no
   while true; do
     echo
@@ -2286,7 +2558,7 @@ run_remna_cascade_manager(){
   first_exit_ip=$(jq -r '.address' <<<"$first_exit")
   exit_keys=$(jq -r 'map(.uuid)|join(",")' <<<"$exits")
 
-  method=$(rm_manager_choose_method) || return 0
+  ui_title "ШАГ 3/5 — DOMAINS И ENDPOINT"
   relay_port=$(rm_method_relay_port "$method") || die "Неизвестный relay-порт для $method"
   if [[ "$relay_on_panel" == yes ]]; then
     relay_listen_ip="127.0.0.1"
@@ -2319,7 +2591,7 @@ run_remna_cascade_manager(){
   save_state
 
   echo
-  ui_title "ПОДГОТОВКА К ПЕРЕКЛЮЧЕНИЮ"
+  ui_title "ШАГ 4/5 — БЕЗОПАСНЫЙ MERGE И ПЕРЕКЛЮЧЕНИЕ"
   user_prepare "Relay: $relay_name ($relay_ip)"
   i=0
   while (( i < exit_count )); do
@@ -2516,14 +2788,17 @@ run_remna_cascade_manager(){
       return 0
     fi
   fi
+  RM_CASCADE_ASSIGN_RELAY=yes
 
   if [[ -n "$CDN_DOMAIN" ]]; then
     extra=$(rm_method_host_extra_json "$method" "$(jq -c '.inbounds[0]' <<<"$relay_config")")
-    host_uuid=$(rm_api_existing_host "$token" "$relay_profile_uuid" "$relay_inbound_uuid" "$CDN_DOMAIN" || true)
-    if [[ -z "$host_uuid" ]]; then
-      host_uuid=$(rm_api_create_host "$token" "$relay_profile_uuid" "$relay_inbound_uuid" "$method" "$CDN_DOMAIN" "PSV1 Cascade $(method_title "$method") - $relay_name" "$extra" || true)
-    fi
+    host_uuid=$(rm_api_upsert_managed_host "$token" "$relay_profile_uuid" "$relay_inbound_uuid" "$method" "$CDN_DOMAIN" "PSV1 Cascade $(method_title "$method") - $relay_name" "$extra" "$run_dir" || true)
     [[ -n "$host_uuid" ]] && auto_done "Cascade Host создан/найден: $CDN_DOMAIN -> relay inbound." || warn "Cascade Host не создан автоматически."
+  fi
+  if [[ -n "$host_uuid" ]]; then
+    rm_manage_xray_subscription_layer "$token" "$method" "$relay_name" "$run_dir" "$host_uuid"
+  else
+    warn "Xray JSON шаблон не создаю, пока Host не прошёл endpoint-аудит."
   fi
 
   if [[ "$relay_on_panel" == yes ]]; then
@@ -2538,10 +2813,10 @@ RELAY ($relay_name / $relay_ip)
 $relay_proxy_note
 4. Node management port разрешай только от IP панели.
 5. Режим exit: $exit_mode; strategy=$strategy; exits=$exit_count.
-6. Для уже работающего Caddy/SFTPGo на relay:
-   $INSTALL_PATH --node-caddy-route '$method' '${ORIGIN_DOMAIN:-$CDN_DOMAIN}' '${relay_port}'
+6. На relay запусти автонастройку существующего Caddy или nginx:
+   $INSTALL_PATH --node-proxy-route '$method' '${ORIGIN_DOMAIN:-$CDN_DOMAIN}' '${relay_port}'
 EOF
-  printf '%s\n' "$INSTALL_PATH --node-caddy-route '$method' '${ORIGIN_DOMAIN:-$CDN_DOMAIN}' '${relay_port}'" > "$run_dir/APPLY-ON-RELAY.sh"
+  printf '%s\n' "$INSTALL_PATH --node-proxy-route '$method' '${ORIGIN_DOMAIN:-$CDN_DOMAIN}' '${relay_port}'" > "$run_dir/APPLY-ON-RELAY.sh"
   chmod 700 "$run_dir/APPLY-ON-RELAY.sh"
 
   : > "$run_dir/EXIT-STEPS.txt"
@@ -2591,6 +2866,7 @@ $relay_proxy_note
 5. Для пула: strategy=$strategy. Это балансировка соединений, а не суммирование пропускной способности одного потока.
 EOF
   chmod 600 "$run_dir"/*.txt "$run_dir"/*.json "$run_dir"/exit-*/*.json 2>/dev/null || true
+  ui_title "ШАГ 5/5 — ОБЯЗАТЕЛЬНАЯ ПРОВЕРКА"
   if [[ "$RM_CASCADE_ASSIGN_RELAY" == yes ]]; then
     if rm_verify_cascade_api_postconditions "$token" "$relay_uuid" "$relay_profile_uuid" "$relay_inbound_uuid" "$squad_uuid" "$exit_records" "$relay_tag"; then
       CASCADE_STATUS=api-verified
@@ -2603,6 +2879,14 @@ EOF
     fi
   else
     CASCADE_STATUS=prepared-not-assigned
+  fi
+  if [[ "$CASCADE_STATUS" == api-verified && -n "$host_uuid" ]]; then
+    if rm_probe_public_xhttp "$method" "$CDN_DOMAIN" "$run_dir"; then
+      CASCADE_STATUS=ready
+    else
+      CASCADE_STATUS=api-verified-endpoint-pending
+      manual_do "API настроен, но CDN/reverse proxy ещё не ведёт на ${relay_listen_ip}:${relay_port}. Выполни APPLY-ON-RELAY.sh на relay и повтори проверку."
+    fi
   fi
   save_state
 
@@ -2821,7 +3105,7 @@ Security: TLS
 Inbound tag: $tag
 EOF
   rm_manager_provider_steps "$method" "$node_ip" "$run_dir/provider-steps.txt"
-  printf '%s\n' "$INSTALL_PATH --node-caddy-route '$method' '${ORIGIN_DOMAIN:-$CDN_DOMAIN}' '$(rm_method_meta "$method" port)'" > "$run_dir/APPLY-ON-NODE.sh"
+  printf '%s\n' "$INSTALL_PATH --node-proxy-route '$method' '${ORIGIN_DOMAIN:-$CDN_DOMAIN}' '$(rm_method_meta "$method" port)'" > "$run_dir/APPLY-ON-NODE.sh"
   chmod 700 "$run_dir/APPLY-ON-NODE.sh"
 
   cat > "$run_dir/NEXT-STEPS.txt" <<EOF
@@ -2860,7 +3144,7 @@ EOF
    Выполнить: $run_dir/provider-steps.txt
 
 9. Caddy/SFTPGo на Node (только если origin уже работает через e-cloudfiles Caddy)
-   Запустить на выбранной Node: $INSTALL_PATH --node-caddy-route '$method' '${ORIGIN_DOMAIN:-$CDN_DOMAIN}' '$(rm_method_meta "$method" port)'
+   Запустить на выбранной Node: $INSTALL_PATH --node-proxy-route '$method' '${ORIGIN_DOMAIN:-$CDN_DOMAIN}' '$(rm_method_meta "$method" port)'
    Команда добавит только XHTTP path; корень / останется SFTPGo.
 
 Проверка цепочки после активации:
@@ -2937,13 +3221,10 @@ EOF
   fi
 
   if [[ -n "$CDN_DOMAIN" ]]; then
-    host_uuid=$(rm_api_existing_host "$token" "$profile_uuid" "$inbound_uuid" "$CDN_DOMAIN" || true)
-    if [[ -n "$host_uuid" ]]; then
-      ok "Host для $CDN_DOMAIN уже существует — дубликат не создаю."
-    elif host_uuid=$(rm_api_create_host "$token" "$profile_uuid" "$inbound_uuid" "$method" "$CDN_DOMAIN" "PSV1 $(method_title "$method") - $node_name" "$extra"); then
-      ok "Host создан в панели: $CDN_DOMAIN"
+    if host_uuid=$(rm_api_upsert_managed_host "$token" "$profile_uuid" "$inbound_uuid" "$method" "$CDN_DOMAIN" "PSV1 $(method_title "$method") - $node_name" "$extra" "$run_dir"); then
+      ok "Host создан или исправлен в панели: $CDN_DOMAIN"
     else
-      warn "Host через API не создался. Профиль/нода не удалены; создай Host по файлам $run_dir/host.txt и xhttpExtraParams.json."
+      warn "Host не прошёл endpoint-аудит/обновление. Профиль и нода сохранены; смотри диагностику в $run_dir."
     fi
   else
     warn "Технический CDN-домен ещё неизвестен — Host пока не создаю. После выдачи домена снова запусти менеджер; существующий профиль будет использован повторно."
@@ -2951,6 +3232,7 @@ EOF
 
   if [[ -n "${host_uuid:-}" ]]; then
     rm_manage_xray_subscription_layer "$token" "$method" "$node_name" "$run_dir" "$host_uuid"
+    rm_probe_public_xhttp "$method" "$CDN_DOMAIN" "$run_dir" || manual_do "Remnawave готов, но reverse proxy/CDN ещё не подтверждён. Выполни APPLY-ON-NODE.sh на выбранной Node и повтори URL-проверку."
   else
     warn "Xray JSON/External Squad отложены до создания Host."
   fi
@@ -3594,8 +3876,16 @@ if [[ "${PSV1_SOURCE_ONLY:-0}" == 1 ]]; then
 fi
 
 case "${1:-}" in
+  --node-proxy-route)
+    run_node_proxy_route "${2:-}" "${3:-}" "${4:-}" "${5:-}"
+    exit 0
+    ;;
   --node-caddy-route)
     run_node_caddy_route "${2:-}" "${3:-}" "${4:-}" "${5:-/opt/e-cloudfiles/Caddyfile}"
+    exit 0
+    ;;
+  --node-nginx-route)
+    run_node_nginx_route "${2:-}" "${3:-}" "${4:-}" "${5:-/etc/nginx/sites-available/cdn-origin.conf}"
     exit 0
     ;;
   --panel-cert)
@@ -3661,7 +3951,9 @@ ${PROJECT_NAME} ${INSTALLER_VERSION}
 Управление существующей Remnawave: $INSTALL_PATH --manage-remna
 Сертификат панели без остановки сервисов: $INSTALL_PATH --panel-cert panel.example.com
 Каскад (один exit или пул exit-нод): $INSTALL_PATH --cascade
+Маршрут reverse proxy (автовыбор): $INSTALL_PATH --node-proxy-route METHOD DOMAIN PORT [CONFIG]
 Маршрут Caddy/SFTPGo: $INSTALL_PATH --node-caddy-route METHOD DOMAIN PORT [CADDYFILE]
+Маршрут nginx: $INSTALL_PATH --node-nginx-route METHOD DOMAIN PORT [NGINX_CONFIG]
 Проверка Remnawave: $INSTALL_PATH --check-remna
 Сброс ответов: $INSTALL_PATH --reset
 Обновление из GitHub: $INSTALL_PATH --update
