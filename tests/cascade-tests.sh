@@ -26,6 +26,10 @@ test_relay_profiles(){
   single='[{"uuid":"exit-1","name":"NL","ip":"203.0.113.10","suffix":"aaa111","bridgeTag":"BRIDGE_IN-aaa111","bridgeInboundUuid":"in-1","bridgeProfileUuid":"profile-1","bridgeUuid":"11111111-1111-4111-8111-111111111111","userName":"bridge_aaa111"}]'
   cfg=$(rm_cascade_relay_config_json turboflare relay-tag "$single" roundRobin)
   assert_jq "$cfg" '.inbounds[0].port==7443 and .inbounds[0].listen=="127.0.0.1"' "single: TurboFlare relay inbound is local :7443"
+  cfg=$(rm_cascade_relay_config_json yandex yandex-cascade "$single" roundRobin)
+  assert_jq "$cfg" '.inbounds[0].port==7445 and .inbounds[0].streamSettings.xhttpSettings.path=="/uploadfiles-cascade/"' "Yandex cascade: dedicated path and relay port"
+  [[ "$(rm_method_meta yandex path)" == /uploadfiles/ ]] || fail "Yandex direct path changed unexpectedly"
+  pass "Yandex direct path stays separate from cascade path"
   assert_jq "$cfg" '[.outbounds[] | select(.protocol=="vless")] | length==1' "single: exactly one namespaced VLESS exit"
   assert_jq "$cfg" 'any(.routing.rules[]; .network=="tcp,udp" and (.inboundTag|index("relay-tag"))!=null and (.outboundTag|startswith("PSV1_")))' "single: catch-all is constrained by inboundTag"
   assert_jq "$cfg" '(.routing.balancers // []) | length==0' "single: no balancer"
@@ -305,6 +309,22 @@ test_host_endpoint_reconciliation(){
   grep -Fxq disable "$events" || fail "host audit: old managed direct Host was not disabled"
   grep -Fxq create "$events" || fail "host audit: replacement cascade Host was not created"
   pass "host audit: duplicate public endpoint is disabled and replaced without deletion"
+
+  rm_hosts_json(){
+    jq -nc '[{uuid:"old-yandex-cascade",remark:"PSV1 Cascade Yandex Cloud - relay",address:"file.aer01.ru",port:443,path:"/uploadfiles/",isDisabled:false,inbound:{configProfileUuid:"old-profile",configProfileInboundUuid:"old-inbound"}}]'
+  }
+  rm_api(){
+    local method="$1" path="$2" token="${3:-}" body="${4:-}"
+    if [[ "$method:$path" == PATCH:/api/hosts ]]; then
+      jq -e '.uuid=="old-yandex-cascade" and .address=="cloud.aer01.ru" and .path=="/uploadfiles-cascade/"' >/dev/null <<<"$body" || return 1
+      echo '{"response":{"uuid":"old-yandex-cascade"}}'
+    else
+      echo '{}'
+    fi
+  }
+  got=$(rm_api_upsert_managed_host token old-profile old-inbound yandex cloud.aer01.ru "PSV1 Cascade Yandex Cloud - relay" '{}' "$TEST_TMP" '/uploadfiles-cascade/')
+  [[ "$got" == old-yandex-cascade ]] || fail "Yandex cascade Host was not reconciled by managed identity"
+  pass "Yandex cascade: existing managed Host adopts CDN address and unique path"
 }
 
 test_relay_profiles

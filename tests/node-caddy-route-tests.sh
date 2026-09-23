@@ -44,17 +44,17 @@ exit 0
 EOF
 chmod +x "$TEST_TMP/nginx" "$TEST_TMP/systemctl"
 PATH="$TEST_TMP:$PATH"
-export MSYS2_ARG_CONV_EXCL='/static/getFile/video/segment.ts'
+export MSYS2_ARG_CONV_EXCL='/static/getFile/video/segment.ts;/uploadfiles/;/uploadfiles-cascade/'
 
 run_node_caddy_route turboflare file.example.ru 7443 "$TEST_TMP/Caddyfile" >/dev/null
-grep -Fq '@psv1_turboflare path /static/getFile/video/segment.ts' "$TEST_TMP/Caddyfile" || { cat "$TEST_TMP/Caddyfile"; exit 1; }
-grep -Fq 'reverse_proxy @psv1_turboflare 172.18.0.1:7443' "$TEST_TMP/Caddyfile"
+grep -Eq '@psv1_turboflare_[a-f0-9]{6} path /static/getFile/video/segment.ts' "$TEST_TMP/Caddyfile" || { cat "$TEST_TMP/Caddyfile"; exit 1; }
+grep -Eq 'reverse_proxy @psv1_turboflare_[a-f0-9]{6} 172.18.0.1:7443' "$TEST_TMP/Caddyfile"
 grep -Fq 'reverse_proxy sftpgo:8080' "$TEST_TMP/Caddyfile"
 
 # Re-running updates the managed block instead of duplicating it.
 run_node_caddy_route turboflare file.example.ru 7555 "$TEST_TMP/Caddyfile" >/dev/null
-[[ $(grep -Fc 'PSV1-TURBOFLARE-ROUTE BEGIN' "$TEST_TMP/Caddyfile") -eq 1 ]]
-grep -Fq 'reverse_proxy @psv1_turboflare 172.18.0.1:7555' "$TEST_TMP/Caddyfile"
+[[ $(grep -Ec 'PSV1-TURBOFLARE-[A-F0-9]{6}-ROUTE BEGIN' "$TEST_TMP/Caddyfile") -eq 1 ]]
+grep -Eq 'reverse_proxy @psv1_turboflare_[a-f0-9]{6} 172.18.0.1:7555' "$TEST_TMP/Caddyfile"
 ! grep -Fq '172.18.0.1:7443' "$TEST_TMP/Caddyfile"
 
 before=$(sha256sum "$TEST_TMP/Caddyfile" | awk '{print $1}')
@@ -64,6 +64,19 @@ if (run_node_caddy_route beeline other.example.ru 7444 "$TEST_TMP/Caddyfile" >/d
 fi
 after=$(sha256sum "$TEST_TMP/Caddyfile" | awk '{print $1}')
 [[ "$before" == "$after" ]]
+
+# Yandex direct and cascade can coexist in one Caddy vhost on distinct paths.
+run_node_caddy_route yandex file.example.ru 4443 "$TEST_TMP/Caddyfile" >/dev/null
+PSV1_ROUTE_PATH='/uploadfiles-cascade/' run_node_caddy_route yandex file.example.ru 7445 "$TEST_TMP/Caddyfile" >/dev/null
+grep -Fq 'path /uploadfiles/' "$TEST_TMP/Caddyfile"
+grep -Fq 'reverse_proxy @psv1_yandex_' "$TEST_TMP/Caddyfile"
+grep -Fq 'path /uploadfiles-cascade/' "$TEST_TMP/Caddyfile"
+grep -Fq '172.18.0.1:7445' "$TEST_TMP/Caddyfile"
+grep -Fq 'reverse_proxy sftpgo:8080' "$TEST_TMP/Caddyfile"
+PSV1_ROUTE_PATH='/uploadfiles-cascade/' run_node_caddy_route yandex file.example.ru 7555 "$TEST_TMP/Caddyfile" >/dev/null
+[[ $(grep -Ec 'PSV1-YANDEX-[A-F0-9]{6}-ROUTE BEGIN' "$TEST_TMP/Caddyfile") -eq 2 ]]
+grep -Fq '172.18.0.1:7555' "$TEST_TMP/Caddyfile"
+grep -Fq '172.18.0.1:4443' "$TEST_TMP/Caddyfile"
 
 echo '[ OK ] Caddy route is idempotent, preserves SFTPGo and rejects unrelated vhosts'
 
@@ -93,15 +106,24 @@ grep -Fq 'server 127.0.0.1:7443;' "$TEST_TMP/cdn-origin.conf"
 grep -Fq '# PSV1-TURBOFLARE-LEGACY-UPSTREAM' "$TEST_TMP/cdn-origin.conf"
 ! grep -Fq 'server 127.0.0.1:10089;' "$TEST_TMP/cdn-origin.conf"
 
-# A different path gets independent HTTP and HTTPS locations.
-run_node_nginx_route yandex file.example.ru 7445 "$TEST_TMP/cdn-origin.conf" >/dev/null
-[[ $(grep -Fc 'PSV1-YANDEX-ROUTE BEGIN' "$TEST_TMP/cdn-origin.conf") -eq 2 ]]
+# Yandex direct keeps its regular path and points to 4443.
+run_node_nginx_route yandex file.example.ru 4443 "$TEST_TMP/cdn-origin.conf" >/dev/null
+[[ $(grep -Ec 'PSV1-YANDEX-[A-F0-9]{6}-ROUTE BEGIN' "$TEST_TMP/cdn-origin.conf") -eq 2 ]]
+[[ $(grep -Fc 'location ^~ /uploadfiles/ {' "$TEST_TMP/cdn-origin.conf") -eq 2 ]]
+[[ $(grep -Fc 'proxy_pass http://127.0.0.1:4443;' "$TEST_TMP/cdn-origin.conf") -eq 2 ]]
+
+# Cascade uses a distinct path to the same public domain and its own port.
+PSV1_ROUTE_PATH='/uploadfiles-cascade/' run_node_nginx_route yandex file.example.ru 7445 "$TEST_TMP/cdn-origin.conf" >/dev/null
+[[ $(grep -Ec 'PSV1-YANDEX-[A-F0-9]{6}-ROUTE BEGIN' "$TEST_TMP/cdn-origin.conf") -eq 4 ]]
+[[ $(grep -Fc 'location ^~ /uploadfiles-cascade/ {' "$TEST_TMP/cdn-origin.conf") -eq 2 ]]
 [[ $(grep -Fc 'proxy_pass http://127.0.0.1:7445;' "$TEST_TMP/cdn-origin.conf") -eq 2 ]]
+[[ $(grep -Fc 'proxy_pass http://127.0.0.1:4443;' "$TEST_TMP/cdn-origin.conf") -eq 2 ]]
 
 # Re-running is idempotent and changes only the managed route target.
-run_node_nginx_route yandex file.example.ru 7555 "$TEST_TMP/cdn-origin.conf" >/dev/null
-[[ $(grep -Fc 'PSV1-YANDEX-ROUTE BEGIN' "$TEST_TMP/cdn-origin.conf") -eq 2 ]]
+PSV1_ROUTE_PATH='/uploadfiles-cascade/' run_node_nginx_route yandex file.example.ru 7555 "$TEST_TMP/cdn-origin.conf" >/dev/null
+[[ $(grep -Ec 'PSV1-YANDEX-[A-F0-9]{6}-ROUTE BEGIN' "$TEST_TMP/cdn-origin.conf") -eq 4 ]]
 [[ $(grep -Fc 'proxy_pass http://127.0.0.1:7555;' "$TEST_TMP/cdn-origin.conf") -eq 2 ]]
+[[ $(grep -Fc 'proxy_pass http://127.0.0.1:4443;' "$TEST_TMP/cdn-origin.conf") -eq 2 ]]
 
 # Beeline shares TurboFlare's path and must be rejected on this vhost.
 before=$(sha256sum "$TEST_TMP/cdn-origin.conf" | awk '{print $1}')

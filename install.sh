@@ -11,7 +11,7 @@ IFS=$'\n\t'
 # This installer deliberately keeps each CDN preset separate. Do not mix fields
 # between providers: path/padding/uplink settings are provider-specific.
 
-INSTALLER_VERSION="1.4.1"
+INSTALLER_VERSION="1.4.3"
 STATE_SCHEMA_CURRENT="1"
 PRESET="${INSTALLER_PRESET:-}"
 
@@ -683,6 +683,18 @@ rm_method_meta(){
   esac
 }
 
+# Yandex direct and cascade can share one public CDN hostname only when their
+# client paths are distinct.  Keep the direct endpoint at /uploadfiles/ and
+# reserve a separate stable URL path for the cascade inbound.
+rm_method_cascade_path(){
+  local method="$1"
+  if [[ "$method" == yandex ]]; then
+    echo '/uploadfiles-cascade/'
+  else
+    rm_method_meta "$method" path
+  fi
+}
+
 rm_manager_choose_method(){
   local a
   echo >&2
@@ -862,9 +874,9 @@ rm_api_existing_host(){
 }
 
 rm_api_create_host(){
-  local token="$1" profile_uuid="$2" inbound_uuid="$3" method="$4" address="$5" remark="$6" extra="$7"
+  local token="$1" profile_uuid="$2" inbound_uuid="$3" method="$4" address="$5" remark="$6" extra="$7" path_override="${8:-}"
   local path alpn fp body resp
-  path=$(rm_method_meta "$method" path); alpn=$(rm_method_meta "$method" alpn); fp=$(rm_method_meta "$method" fp)
+  path="${path_override:-$(rm_method_meta "$method" path)}"; alpn=$(rm_method_meta "$method" alpn); fp=$(rm_method_meta "$method" fp)
 
   # Newer Remnawave uses xhttpExtraParams (lowercase h). Older builds used
   # xHttpExtraParams. Try the current spelling first, then the legacy one.
@@ -884,18 +896,18 @@ rm_api_create_host(){
 }
 
 rm_host_desired_body(){
-  local profile_uuid="$1" inbound_uuid="$2" method="$3" address="$4" remark="$5" extra="$6" host_uuid="${7:-}"
+  local profile_uuid="$1" inbound_uuid="$2" method="$3" address="$4" remark="$5" extra="$6" host_uuid="${7:-}" path_override="${8:-}"
   local path alpn fp
-  path=$(rm_method_meta "$method" path); alpn=$(rm_method_meta "$method" alpn); fp=$(rm_method_meta "$method" fp)
+  path="${path_override:-$(rm_method_meta "$method" path)}"; alpn=$(rm_method_meta "$method" alpn); fp=$(rm_method_meta "$method" fp)
   jq -nc --arg u "$host_uuid" --arg p "$profile_uuid" --arg i "$inbound_uuid" --arg remark "$remark" --arg addr "$address" --arg path "$path" --arg alpn "$alpn" --arg fp "$fp" --argjson extra "$extra" '
     {inbound:{configProfileUuid:$p,configProfileInboundUuid:$i},remark:$remark,address:$addr,port:443,path:$path,sni:$addr,host:$addr,alpn:$alpn,fingerprint:$fp,allowInsecure:false,isDisabled:false,securityLayer:"TLS",overrideSniFromAddress:false,xhttpExtraParams:$extra}
     + (if $u=="" then {} else {uuid:$u} end)'
 }
 
 rm_api_patch_host_desired(){
-  local token="$1" host_uuid="$2" profile_uuid="$3" inbound_uuid="$4" method="$5" address="$6" remark="$7" extra="$8"
+  local token="$1" host_uuid="$2" profile_uuid="$3" inbound_uuid="$4" method="$5" address="$6" remark="$7" extra="$8" path_override="${9:-}"
   local body resp
-  body=$(rm_host_desired_body "$profile_uuid" "$inbound_uuid" "$method" "$address" "$remark" "$extra" "$host_uuid")
+  body=$(rm_host_desired_body "$profile_uuid" "$inbound_uuid" "$method" "$address" "$remark" "$extra" "$host_uuid" "$path_override")
   resp=$(rm_api PATCH /api/hosts "$token" "$body" 2>/dev/null || true)
   if jq -e '.response.uuid // .uuid' >/dev/null 2>&1 <<<"$resp"; then return 0; fi
   # Legacy spelling used by older Remnawave builds.
@@ -917,16 +929,27 @@ rm_api_disable_host(){
 # one entry can never work. Managed conflicts are disabled (never deleted), while
 # foreign/user-created conflicts stop the operation for an explicit decision.
 rm_api_upsert_managed_host(){
-  local token="$1" profile_uuid="$2" inbound_uuid="$3" method="$4" address="$5" remark="$6" extra="$7" run_dir="$8"
+  local token="$1" profile_uuid="$2" inbound_uuid="$3" method="$4" address="$5" remark="$6" extra="$7" run_dir="$8" path_override="${9:-}"
   local hosts path exact_uuid target_uuid conflicts foreign managed item uuid
   hosts=$(rm_hosts_json "$token") || return 1
-  path=$(rm_method_meta "$method" path)
+  path="${path_override:-$(rm_method_meta "$method" path)}"
   printf '%s\n' "$hosts" | jq . > "$run_dir/hosts-before.json"
   exact_uuid=$(jq -r --arg p "$profile_uuid" --arg i "$inbound_uuid" --arg a "$address" '
     [.[]? | select((.address//"")==$a)
       | select((.inbound.configProfileUuid // .configProfileUuid // "")==$p)
       | select((.inbound.configProfileInboundUuid // .configProfileInboundUuid // "")==$i)
       | .uuid][0] // empty' <<<"$hosts")
+  # When a managed Host's public CDN address changes (for example from the
+  # old origin hostname to its proper client-facing CDN hostname), reconcile
+  # only the exact PSV1 remark attached to the same inbound. User-created or
+  # differently named Hosts are never adopted implicitly.
+  if [[ -z "$exact_uuid" ]]; then
+    exact_uuid=$(jq -r --arg p "$profile_uuid" --arg i "$inbound_uuid" --arg r "$remark" '
+      [.[]? | select((.remark//"")==$r)
+        | select((.inbound.configProfileUuid // .configProfileUuid // "")==$p)
+        | select((.inbound.configProfileInboundUuid // .configProfileInboundUuid // "")==$i)
+        | .uuid][0] // empty' <<<"$hosts")
+  fi
   conflicts=$(jq -c --arg p "$profile_uuid" --arg i "$inbound_uuid" --arg a "$address" --arg path "$path" '
     [.[]? | select((.address//"")==$a and ((.port//443)|tonumber)==443 and (.path//"")==$path)
       | select((.isDisabled//false)==false)
@@ -942,11 +965,11 @@ rm_api_upsert_managed_host(){
   # First make the desired Host usable. Only after that disable obsolete managed
   # duplicates, so an API failure cannot take the currently working Host down.
   if [[ -n "$exact_uuid" ]]; then
-    rm_api_patch_host_desired "$token" "$exact_uuid" "$profile_uuid" "$inbound_uuid" "$method" "$address" "$remark" "$extra" || return 1
+    rm_api_patch_host_desired "$token" "$exact_uuid" "$profile_uuid" "$inbound_uuid" "$method" "$address" "$remark" "$extra" "$path" || return 1
     target_uuid="$exact_uuid"
     auto_done "Существующий Host приведён к ожидаемым Address/SNI/Host/Path/XHTTP параметрам." >&2
   else
-    target_uuid=$(rm_api_create_host "$token" "$profile_uuid" "$inbound_uuid" "$method" "$address" "$remark" "$extra") || return 1
+    target_uuid=$(rm_api_create_host "$token" "$profile_uuid" "$inbound_uuid" "$method" "$address" "$remark" "$extra" "$path") || return 1
   fi
   if (( $(jq 'length' <<<"$managed") > 0 )); then
     printf '%s\n' "$managed" | jq . > "$run_dir/host-endpoint-disabled-conflicts.json"
@@ -1087,9 +1110,9 @@ print_manual_file_colored(){
 }
 
 rm_probe_public_xhttp(){
-  local method="$1" domain="$2" run_dir="$3" path code headers body
+  local method="$1" domain="$2" run_dir="$3" path_override="${4:-}" path code headers body
   [[ -n "$domain" ]] || return 2
-  path=$(rm_method_meta "$method" path)
+  path="${path_override:-$(rm_method_meta "$method" path)}"
   headers="$run_dir/public-xhttp-headers.txt"
   body="$run_dir/public-xhttp-body.bin"
   code=$(curl --noproxy '*' -ksS --max-time 15 -D "$headers" -o "$body" -w '%{http_code}' "https://${domain}${path}" 2>"$run_dir/public-xhttp-curl.err" || true)
@@ -1160,7 +1183,7 @@ rm_manager_provider_steps(){
 # domain and a CDN domain keep opening the same SFTPGo cover page.
 run_node_caddy_route(){
   local method="${1:-}" domain="${2:-}" target_port="${3:-}" caddyfile="${4:-/opt/e-cloudfiles/Caddyfile}"
-  local container="${PSV1_CADDY_CONTAINER:-e-cloudfiles-caddy-1}" path gateway backup safe python_bin
+  local container="${PSV1_CADDY_CONTAINER:-e-cloudfiles-caddy-1}" path gateway backup safe python_bin route_key
   case "$method" in vk|yandex|beeline|timeweb|selectel|turboflare) ;; *) die "Метод для --node-caddy-route: vk|yandex|beeline|timeweb|selectel|turboflare" ;; esac
   valid_domain "$domain" || die "Некорректный домен origin/cover: $domain"
   [[ "$target_port" =~ ^[0-9]+$ ]] && (( target_port >= 1 && target_port <= 65535 )) || die "Некорректный локальный порт XHTTP."
@@ -1169,23 +1192,24 @@ run_node_caddy_route(){
   python_bin="${PSV1_PYTHON:-$(command -v python3 2>/dev/null || command -v python 2>/dev/null || true)}"
   [[ -n "$python_bin" ]] || die "Python 3 не найден."
   docker inspect "$container" >/dev/null 2>&1 || die "Контейнер Caddy не найден: $container"
-  path=$(rm_method_meta "$method" path)
+  path="${PSV1_ROUTE_PATH:-$(rm_method_meta "$method" path)}"
+  route_key=$(printf '%s' "$path" | sha256sum | cut -c1-6 | tr '[:lower:]' '[:upper:]')
   gateway=$(docker inspect "$container" --format '{{range .NetworkSettings.Networks}}{{println .Gateway}}{{end}}' 2>/dev/null | awk 'NF{print;exit}')
   valid_ipv4 "$gateway" || die "Не удалось определить Docker gateway контейнера $container."
-  safe=$(tr -cd 'a-z0-9-' <<<"${method,,}")
+  safe="$(tr -cd 'a-z0-9-' <<<"${method,,}")_${route_key,,}"
   backup="${caddyfile}.before-psv1-$(date +%Y%m%d-%H%M%S)"
   cp -p "$caddyfile" "$backup"
 
-  if ! "$python_bin" - "$caddyfile" "$domain" "$method" "$safe" "$path" "$gateway" "$target_port" <<'PY'
+  if ! "$python_bin" - "$caddyfile" "$domain" "$method" "$safe" "$path" "$gateway" "$target_port" "$route_key" <<'PY'
 import pathlib
 import re
 import sys
 
-filename, domain, method, safe, route_path, gateway, port = sys.argv[1:]
+filename, domain, method, safe, route_path, gateway, port, route_key = sys.argv[1:]
 p = pathlib.Path(filename)
 text = p.read_text(encoding="utf-8")
-begin = f"# PSV1-{method.upper()}-ROUTE BEGIN"
-end = f"# PSV1-{method.upper()}-ROUTE END"
+begin = f"# PSV1-{method.upper()}-{route_key}-ROUTE BEGIN"
+end = f"# PSV1-{method.upper()}-{route_key}-ROUTE END"
 matcher = f"psv1_{safe.replace('-', '_')}"
 block = (
     f"    {begin}\n"
@@ -1199,7 +1223,25 @@ if begin in text:
     updated, count = pattern.subn(block, text, count=1)
     if count != 1:
         raise SystemExit("existing PSV1 route marker is malformed")
+elif f"# PSV1-{method.upper()}-ROUTE BEGIN" in text:
+    # Upgrade one v1.4.1 method marker in place when the stored path matches.
+    legacy_begin = f"# PSV1-{method.upper()}-ROUTE BEGIN"
+    legacy_end = f"# PSV1-{method.upper()}-ROUTE END"
+    pattern = re.compile(r"(?ms)^[ \t]*" + re.escape(legacy_begin) + r"\n.*?^[ \t]*" + re.escape(legacy_end) + r"\n?")
+    match = pattern.search(text)
+    if match and f"path {route_path}" in match.group(0):
+        updated = text[:match.start()] + block + text[match.end():]
+    else:
+        updated = None
 else:
+    updated = None
+
+if updated is None:
+    # A public URL path can target only one inbound in a vhost.
+    route_pattern = re.compile(r"(?ms)# PSV1-[A-Z0-9_-]+(?:-[A-F0-9]{6})?-ROUTE BEGIN\n(.*?)# PSV1-[A-Z0-9_-]+(?:-[A-F0-9]{6})?-ROUTE END")
+    for match in route_pattern.finditer(text):
+        if re.search(r"(?m)^\s*@\w+\s+path\s+" + re.escape(route_path) + r"\s*$", match.group(1)):
+            raise SystemExit(f"path {route_path} is already owned by another PSV1 Caddy route")
     # Edit only the site block that explicitly serves this origin domain. A
     # fallback to another SFTPGo vhost is unsafe when several providers share a
     # node (Beeline and TurboFlare even use the same path).
@@ -1274,7 +1316,7 @@ PY
 # and TurboFlare cannot point the identical URL to two different inbounds.
 run_node_nginx_route(){
   local method="${1:-}" domain="${2:-}" target_port="${3:-}" conf="${4:-/etc/nginx/sites-available/cdn-origin.conf}"
-  local path backup python_bin
+  local path backup python_bin route_key
   case "$method" in vk|yandex|beeline|timeweb|selectel|turboflare) ;; *) die "Метод для --node-nginx-route: vk|yandex|beeline|timeweb|selectel|turboflare" ;; esac
   valid_domain "$domain" || die "Некорректный домен origin/cover: $domain"
   [[ "$target_port" =~ ^[0-9]+$ ]] && (( target_port >= 1 && target_port <= 65535 )) || die "Некорректный локальный порт XHTTP."
@@ -1282,20 +1324,21 @@ run_node_nginx_route(){
   command -v nginx >/dev/null 2>&1 || die "nginx не найден."
   python_bin="${PSV1_PYTHON:-$(command -v python3 2>/dev/null || command -v python 2>/dev/null || true)}"
   [[ -n "$python_bin" ]] || die "Python 3 не найден."
-  path=$(rm_method_meta "$method" path)
+  path="${PSV1_ROUTE_PATH:-$(rm_method_meta "$method" path)}"
+  route_key=$(printf '%s' "$path" | sha256sum | cut -c1-6 | tr '[:lower:]' '[:upper:]')
   backup="${conf}.before-psv1-$(date +%Y%m%d-%H%M%S)"
   cp -p "$conf" "$backup"
 
-  if ! "$python_bin" - "$conf" "$method" "$path" "$target_port" <<'PY'
+  if ! "$python_bin" - "$conf" "$method" "$path" "$target_port" "$route_key" <<'PY'
 import pathlib
 import re
 import sys
 
-filename, method, route_path, port = sys.argv[1:]
+filename, method, route_path, port, route_key = sys.argv[1:]
 p = pathlib.Path(filename)
 text = p.read_text(encoding="utf-8")
-begin = f"# PSV1-{method.upper()}-ROUTE BEGIN"
-end = f"# PSV1-{method.upper()}-ROUTE END"
+begin = f"# PSV1-{method.upper()}-{route_key}-ROUTE BEGIN"
+end = f"# PSV1-{method.upper()}-{route_key}-ROUTE END"
 
 def balanced_blocks(source, keyword):
     result = []
@@ -1358,7 +1401,7 @@ if begin in text:
     raise SystemExit(0)
 
 # Do not allow two methods to claim the same path in the same nginx vhost.
-for other in re.finditer(r"(?ms)# PSV1-([A-Z0-9_-]+)-ROUTE BEGIN\n(.*?)# PSV1-\1-ROUTE END", text):
+for other in re.finditer(r"(?ms)# PSV1-([A-Z0-9_-]+)(?:-[A-F0-9]{6})?-ROUTE BEGIN\n(.*?)# PSV1-[A-Z0-9_-]+(?:-[A-F0-9]{6})?-ROUTE END", text):
     if re.search(r"location\s+[^\n{]*" + re.escape(route_path) + r"(?:\s|\{)", other.group(2)):
         raise SystemExit(f"path {route_path} is already owned by PSV1-{other.group(1)}; use another origin vhost/server or another RU relay")
 
@@ -1850,7 +1893,7 @@ rm_cascade_relay_config_json(){
   out_prefix="PSV1_${route_key}_EXIT"
   pool_tag="PSV1_${route_key}_POOL"
   inbound=$(rm_method_inbound_json "$method" "$tag")
-  inbound=$(jq -c --arg t "$tag" --argjson p "$relay_port" --arg l "$listen_ip" '.tag=$t | .port=$p | .listen=$l' <<<"$inbound")
+  inbound=$(jq -c --arg t "$tag" --argjson p "$relay_port" --arg l "$listen_ip" --arg path "$(rm_method_cascade_path "$method")" '.tag=$t | .port=$p | .listen=$l | .streamSettings.xhttpSettings.path=$path' <<<"$inbound")
   jq -nc --argjson inb "$inbound" --argjson exits "$exits_json" --arg strategy "$strategy" --arg routeTag "$tag" --arg outPrefix "$out_prefix" --arg poolTag "$pool_tag" '
     ($exits|length) as $n
     | ($n == 1) as $single
@@ -2438,7 +2481,7 @@ PYNG
   return 0
 }
 run_remna_cascade_manager(){
-  local token nodes count relay relay_uuid relay_name relay_ip method pool_suffix relay_tag relay_config relay_profile_name relay_ids relay_profile_uuid relay_inbound_uuid relay_active squad_uuid host_uuid="" extra run_dir profile_doc existing_cfg merged_cfg desired_hash current_hash update_profile=no relay_port
+  local token nodes count relay relay_uuid relay_name relay_ip method cascade_path pool_suffix relay_tag relay_config relay_profile_name relay_ids relay_profile_uuid relay_inbound_uuid relay_active squad_uuid host_uuid="" extra run_dir profile_doc existing_cfg merged_cfg desired_hash current_hash update_profile=no relay_port
   local exit_mode exit_mode_choice exits exit_count strategy_choice strategy first_exit first_exit_uuid first_exit_ip exit_keys exit_records='[]'
   local panel_public_ip="" relay_addr_ip="" relay_on_panel=no relay_proxy_note="" relay_listen_ip="127.0.0.1"
   local i e e_uuid e_name e_ip e_suffix bridge_tag bridge_uuid bridge_info exit_profile_uuid bridge_inbound_uuid exit_profile_name exit_dir record user_name b inbs RM_CASCADE_ASSIGN_RELAY=no
@@ -2461,6 +2504,7 @@ run_remna_cascade_manager(){
   echo
   ui_title "ШАГ 1/5 — МЕТОД CDN"
   method=$(rm_manager_choose_method) || return 0
+  cascade_path=$(rm_method_cascade_path "$method")
   nodes=$(rm_nodes_json "$token") || true
   count=$(jq 'length' <<<"$nodes")
   if (( count < 2 )); then
@@ -2601,7 +2645,7 @@ run_remna_cascade_manager(){
   done
   [[ "$exit_mode" == pool ]] && user_prepare "EXIT_POOL: $exit_count нод, strategy=$strategy. Балансируются НОВЫЕ соединения; один TCP-поток не суммирует скорость нескольких VPS."
   manual_do "DNS/origin CDN должен в итоге указывать на RELAY $relay_ip. Пока не меняй, если текущий direct-метод нужен рабочим."
-  manual_do "На relay inbound $(method_title "$method") будет слушать 127.0.0.1:${relay_port}. На каждой exit BRIDGE_IN будет слушать TCP 8888."
+  manual_do "На relay inbound $(method_title "$method") будет слушать 127.0.0.1:${relay_port} по path ${cascade_path}. На каждой exit BRIDGE_IN будет слушать TCP 8888."
   if [[ "$relay_on_panel" == yes ]]; then
     manual_do "Relay совмещён с панелью: существующий nginx панели сохраняется; нужен отдельный origin-vhost/server_name, проксирующий CDN path на 127.0.0.1:${relay_port}."
   fi
@@ -2636,7 +2680,10 @@ run_remna_cascade_manager(){
     e=$(jq -c ".[$i]" <<<"$exits")
     e_uuid=$(jq -r '.uuid' <<<"$e"); e_name=$(jq -r '.name' <<<"$e"); e_ip=$(jq -r '.address' <<<"$e")
     e_suffix=$(printf '%s%s' "$relay_uuid" "$e_uuid" | sha256sum | cut -c1-6)
-    bridge_tag="BRIDGE_IN-${e_suffix}"
+    # Make the CDN association visible in Remnawave. A compatible existing
+    # BRIDGE_IN on :8888 is still reused, because one listener can serve
+    # multiple cascade methods and duplicate listeners would conflict.
+    bridge_tag="BRIDGE_IN-${method}-${e_suffix}"
     bridge_uuid=$(cat /proc/sys/kernel/random/uuid 2>/dev/null || uuidgen 2>/dev/null || openssl rand -hex 16)
     exit_dir="$run_dir/exit-$((i+1))-${e_suffix}"
     mkdir -p "$exit_dir"; chmod 700 "$exit_dir"
@@ -2646,11 +2693,11 @@ run_remna_cascade_manager(){
     bridge_inbound_uuid=""
     if [[ -z "$exit_profile_uuid" || "$exit_profile_uuid" == "00000000-0000-0000-0000-000000000000" ]]; then
       danger "Exit '$e_name' не имеет активного Config Profile. Создам отдельный bridge-only profile и назначу его."
-      exit_profile_name="psv1-exit-bridge-${e_suffix}"
+      exit_profile_name="psv1-exit-bridge-${method}-${e_suffix}"
       if bridge_info=$(rm_api_create_bridge_only_profile "$token" "$e_uuid" "$bridge_tag" "$exit_profile_name"); then
         exit_profile_uuid=$(jq -r '.profileUuid' <<<"$bridge_info"); bridge_inbound_uuid=$(jq -r '.inboundUuid' <<<"$bridge_info")
         if rm_api_assign_node "$token" "$e_uuid" "$exit_profile_uuid" "$bridge_inbound_uuid"; then
-          auto_done "Exit '$e_name': создан/назначен bridge-only profile, BRIDGE_IN активирован."
+          auto_done "Exit '$e_name': создан/назначен bridge-only profile для $(method_title "$method"), BRIDGE_IN активирован."
         else
           warn "Exit '$e_name': bridge profile создан, но API не подтвердил его назначение/Active Inbound. Relay не переключаю."
           return 0
@@ -2792,7 +2839,7 @@ run_remna_cascade_manager(){
 
   if [[ -n "$CDN_DOMAIN" ]]; then
     extra=$(rm_method_host_extra_json "$method" "$(jq -c '.inbounds[0]' <<<"$relay_config")")
-    host_uuid=$(rm_api_upsert_managed_host "$token" "$relay_profile_uuid" "$relay_inbound_uuid" "$method" "$CDN_DOMAIN" "PSV1 Cascade $(method_title "$method") - $relay_name" "$extra" "$run_dir" || true)
+    host_uuid=$(rm_api_upsert_managed_host "$token" "$relay_profile_uuid" "$relay_inbound_uuid" "$method" "$CDN_DOMAIN" "PSV1 Cascade $(method_title "$method") - $relay_name" "$extra" "$run_dir" "$cascade_path" || true)
     [[ -n "$host_uuid" ]] && auto_done "Cascade Host создан/найден: $CDN_DOMAIN -> relay inbound." || warn "Cascade Host не создан автоматически."
   fi
   if [[ -n "$host_uuid" ]]; then
@@ -2814,9 +2861,9 @@ $relay_proxy_note
 4. Node management port разрешай только от IP панели.
 5. Режим exit: $exit_mode; strategy=$strategy; exits=$exit_count.
 6. На relay запусти автонастройку существующего Caddy или nginx:
-   $INSTALL_PATH --node-proxy-route '$method' '${ORIGIN_DOMAIN:-$CDN_DOMAIN}' '${relay_port}'
+   PSV1_ROUTE_PATH='$cascade_path' $INSTALL_PATH --node-proxy-route '$method' '${ORIGIN_DOMAIN:-$CDN_DOMAIN}' '${relay_port}'
 EOF
-  printf '%s\n' "$INSTALL_PATH --node-proxy-route '$method' '${ORIGIN_DOMAIN:-$CDN_DOMAIN}' '${relay_port}'" > "$run_dir/APPLY-ON-RELAY.sh"
+  printf '%s\n' "PSV1_ROUTE_PATH='$cascade_path' $INSTALL_PATH --node-proxy-route '$method' '${ORIGIN_DOMAIN:-$CDN_DOMAIN}' '${relay_port}'" > "$run_dir/APPLY-ON-RELAY.sh"
   chmod 700 "$run_dir/APPLY-ON-RELAY.sh"
 
   : > "$run_dir/EXIT-STEPS.txt"
@@ -2845,7 +2892,7 @@ EOF
   done
   cat >> "$run_dir/VERIFY.txt" <<EOF
 # После CDN/origin переключения
-curl -sk https://${CDN_DOMAIN:-CDN_DOMAIN}$(rm_method_meta "$method" path) -o /dev/null -w '%{http_code}\\n'
+curl -sk https://${CDN_DOMAIN:-CDN_DOMAIN}${cascade_path} -o /dev/null -w '%{http_code}\\n'
 # ожидается 400 после рабочей цепочки
 
 # Гео-проверка с клиента через VPN
@@ -2881,7 +2928,7 @@ EOF
     CASCADE_STATUS=prepared-not-assigned
   fi
   if [[ "$CASCADE_STATUS" == api-verified && -n "$host_uuid" ]]; then
-    if rm_probe_public_xhttp "$method" "$CDN_DOMAIN" "$run_dir"; then
+    if rm_probe_public_xhttp "$method" "$CDN_DOMAIN" "$run_dir" "$cascade_path"; then
       CASCADE_STATUS=ready
     else
       CASCADE_STATUS=api-verified-endpoint-pending

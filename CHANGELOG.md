@@ -1,5 +1,18 @@
 # Changelog
 
+## 1.4.3
+
+- В именах новых bridge-only Config Profile и BRIDGE_IN добавляется выбранный CDN-метод (`yandex`, `turboflare` и т. п.), чтобы назначение было видно в панели.
+- Совместимый существующий BRIDGE_IN на TCP/8888 по-прежнему переиспользуется для других каскадов: отдельный listener на том же порту не создаётся.
+
+## 1.4.2
+
+- Yandex direct и Yandex cascade теперь получают разные пути на одном клиентском CDN-домене: direct `/uploadfiles/`, cascade `/uploadfiles-cascade/`. Конфликтующие методы больше не требуют отдельного CDN-имени.
+- Cascade inbound JSON, созданный/обновлённый Host, публичный probe и VERIFY используют отдельный Yandex cascade path.
+- `APPLY-ON-RELAY.sh` передаёт `PSV1_ROUTE_PATH`; reverse-proxy helper добавляет отдельный nginx/Caddy path на method-specific cascade port, сохраняя direct route.
+- При повторном запуске менеджер обновляет тот же Host по точному managed remark и inbound, в том числе корректирует origin Address обратно на заданный клиентский CDN-домен; чужие Hosts не присваиваются скрипту.
+- Повторный каскадный запуск Yandex заменяет старый managed path Host для того же inbound, не создавая параллельный устаревший endpoint.
+
 ## 1.4.1
 
 - Исправлен аварийный выход `RM_CASCADE_ASSIGN_RELAY: unbound variable`: после успешного назначения relay финальный API post-check всегда выполняется и состояние каскада сохраняется.

@@ -4,7 +4,7 @@
 
 Цель проекта — максимально автоматизировать установку, но при этом явно показывать пользователю, что скрипт сделал сам и какие действия нужно выполнить вручную в кабинете CDN/DNS.
 
-> Текущая версия README рассчитана на `panel-script-v1 1.4.1`. В архиве уже лежит полный готовый `install.sh`; применять старые hotfix-файлы поверх него не нужно.
+> Текущая версия README рассчитана на `panel-script-v1 1.4.2`. В архиве уже лежит полный готовый `install.sh`; применять старые hotfix-файлы поверх него не нужно.
 
 ## Что поддерживается
 
@@ -231,6 +231,8 @@ External Squad, если он нужен выбранной схеме
 
 На каждой выбранной exit-ноде мастер добавляет/reuse `BRIDGE_IN :8888` в **активном** Config Profile и Active Inbounds, не удаляя существующие inbound. Для каждого exit создаётся отдельный bridge-user/VLESS UUID. На relay маршрут также объединяется с уже активным Config Profile. Порты разделены: TurboFlare `7443`, Beeline `7444`, Yandex `7445`, VK `7446`, Timeweb `7447`, Selectel `7448`. Каждое правило routing ограничено своим `inboundTag`, а outbound/balancer имеют уникальные имена. Поэтому один RU relay может направлять, например, Yandex в Germany, а TurboFlare в Netherlands, если хватает CPU/RAM/канала.
 
+Если exit-нода не имеет активного Config Profile, создаваемый bridge-only профиль и inbound получают имя с методом, например `psv1-exit-bridge-yandex-…` и `BRIDGE_IN-yandex-…`. При повторном использовании совместимого `BRIDGE_IN :8888` для другого каскада отдельный listener не создаётся: один bridge может обслуживать несколько CDN-методов, и его исходное имя отражает метод, с которым он был создан.
+
 Для reverse proxy на хосте relay inbound слушает `127.0.0.1`. Если Caddy/SFTPGo запущен в Docker, контейнер не видит host-loopback; в мастере нужно ввести Docker gateway этой сети, например `172.18.0.1`. Команда `--node-proxy-route` при выборе Caddy определяет этот gateway через `docker inspect`; для nginx на хосте использует `127.0.0.1`.
 
 Записи через API проверяются повторным чтением. Короткий успешный ответ `POST/PATCH` сам по себе не считается доказательством: мастер перечитывает Node, Internal Squad и bridge-user, при необходимости использует squad bulk-action и только затем собирает `VLESS_EXIT`. Это важно для Remnawave 3.3.0, где ответы создания пользователя могут отличаться по набору полей.
@@ -253,6 +255,8 @@ VLESS UUID и членство в squad считаются достаточны�
 Существующий активный Profile relay не заменяется: мастер показывает merge, сохраняет backup и требует подтверждение. Provider-side DNS/origin и firewall/SG для `8888` остаются явными шагами. Для Caddy/nginx генерируется `APPLY-ON-RELAY.sh`, который не меняет `location /`. Сначала базовый CDN рекомендуется довести до `origin=400` и `CDN=400`, затем включать каскад.
 
 Beeline и TurboFlare используют одинаковый XHTTP path. Поэтому на одном и том же origin-vhost этот URL нельзя одновременно направить на два разных порта. Скрипт обнаруживает такое совпадение и останавливается; безопасные варианты — отдельные origin-домены/vhost или отдельные RU relay. Остальные методы с разными path могут сосуществовать на одном relay при разных method-specific портах.
+
+Yandex direct и Yandex cascade автоматически разделяются путями `/uploadfiles/` и `/uploadfiles-cascade/`. Их можно обслуживать одним клиентским CDN-доменом при условии, что CDN пропускает оба пути без rewrite/cache и origin reverse proxy маршрутизирует их соответственно на direct port и cascade port. APPLY-ON-RELAY.sh добавляет второй маршрут независимо и сохраняет существующий direct route.
 
 Файлы каскада сохраняются в отдельном каталоге: `relay-profile.json`, `selected-exits.json`, `exit-pool.json`, `RELAY-STEPS.txt`, `EXIT-STEPS.txt`, `VERIFY.txt`, `MANUAL-ACTIONS.txt`.
 
