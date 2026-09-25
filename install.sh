@@ -11,7 +11,7 @@ IFS=$'\n\t'
 # This installer deliberately keeps each CDN preset separate. Do not mix fields
 # between providers: path/padding/uplink settings are provider-specific.
 
-INSTALLER_VERSION="1.4.3"
+INSTALLER_VERSION="1.4.5"
 STATE_SCHEMA_CURRENT="1"
 PRESET="${INSTALLER_PRESET:-}"
 
@@ -695,6 +695,41 @@ rm_method_cascade_path(){
   fi
 }
 
+# Yandex direct and cascade are advertised on the same public endpoint. The
+# direct path is therefore reserved for its direct inbound; reusing it for the
+# relay would silently redirect both Hosts to whichever inbound Nginx last
+# configured. Cascade must use rm_method_cascade_path (currently
+# /uploadfiles-cascade/).
+rm_validate_method_route(){
+  local method="$1" route_path="$2" target_port="$3" direct_path direct_port
+  [[ "$method" == yandex ]] || return 0
+  direct_path=$(rm_method_meta yandex path)
+  direct_port=$(rm_method_meta yandex port)
+  if [[ "$route_path" == "$direct_path" && "$target_port" != "$direct_port" ]]; then
+    die "Неоднозначный Yandex-маршрут: $route_path зарезервирован для прямого inbound :$direct_port. Для каскада используй отдельный path $(rm_method_cascade_path yandex) и его relay-порт :7445. Файл не изменён."
+  fi
+}
+
+rm_probe_tcp_listener(){
+  local host="$1" port="$2" python_bin
+  [[ "${PSV1_SKIP_TCP_PROBE:-0}" == 1 ]] && return 0
+  python_bin="${PSV1_PYTHON:-$(command -v python3 2>/dev/null || command -v python 2>/dev/null || true)}"
+  [[ -n "$python_bin" ]] || die "Python 3 нужен для безопасной TCP-проверки ${host}:${port}; конфигурация не изменена."
+  if ! "$python_bin" - "$host" "$port" <<'PY'
+import socket, sys
+host, port = sys.argv[1], int(sys.argv[2])
+try:
+    with socket.create_connection((host, port), timeout=2):
+        pass
+except OSError as exc:
+    print(f"TCP probe failed for {host}:{port}: {exc}", file=sys.stderr)
+    raise SystemExit(1)
+PY
+  then
+    die "На целевом адресе ${host}:${port} нет доступного TCP listener. Nginx/Caddy не менял; сначала проверь активный inbound и его bind address."
+  fi
+}
+
 rm_manager_choose_method(){
   local a
   echo >&2
@@ -1193,9 +1228,11 @@ run_node_caddy_route(){
   [[ -n "$python_bin" ]] || die "Python 3 не найден."
   docker inspect "$container" >/dev/null 2>&1 || die "Контейнер Caddy не найден: $container"
   path="${PSV1_ROUTE_PATH:-$(rm_method_meta "$method" path)}"
+  rm_validate_method_route "$method" "$path" "$target_port"
   route_key=$(printf '%s' "$path" | sha256sum | cut -c1-6 | tr '[:lower:]' '[:upper:]')
   gateway=$(docker inspect "$container" --format '{{range .NetworkSettings.Networks}}{{println .Gateway}}{{end}}' 2>/dev/null | awk 'NF{print;exit}')
   valid_ipv4 "$gateway" || die "Не удалось определить Docker gateway контейнера $container."
+  rm_probe_tcp_listener "$gateway" "$target_port"
   safe="$(tr -cd 'a-z0-9-' <<<"${method,,}")_${route_key,,}"
   backup="${caddyfile}.before-psv1-$(date +%Y%m%d-%H%M%S)"
   cp -p "$caddyfile" "$backup"
@@ -1325,6 +1362,8 @@ run_node_nginx_route(){
   python_bin="${PSV1_PYTHON:-$(command -v python3 2>/dev/null || command -v python 2>/dev/null || true)}"
   [[ -n "$python_bin" ]] || die "Python 3 не найден."
   path="${PSV1_ROUTE_PATH:-$(rm_method_meta "$method" path)}"
+  rm_validate_method_route "$method" "$path" "$target_port"
+  rm_probe_tcp_listener 127.0.0.1 "$target_port"
   route_key=$(printf '%s' "$path" | sha256sum | cut -c1-6 | tr '[:lower:]' '[:upper:]')
   backup="${conf}.before-psv1-$(date +%Y%m%d-%H%M%S)"
   cp -p "$conf" "$backup"

@@ -44,6 +44,7 @@ exit 0
 EOF
 chmod +x "$TEST_TMP/nginx" "$TEST_TMP/systemctl"
 PATH="$TEST_TMP:$PATH"
+export PSV1_SKIP_TCP_PROBE=1
 export MSYS2_ARG_CONV_EXCL='/static/getFile/video/segment.ts;/uploadfiles/;/uploadfiles-cascade/'
 
 run_node_caddy_route turboflare file.example.ru 7443 "$TEST_TMP/Caddyfile" >/dev/null
@@ -111,6 +112,16 @@ run_node_nginx_route yandex file.example.ru 4443 "$TEST_TMP/cdn-origin.conf" >/d
 [[ $(grep -Ec 'PSV1-YANDEX-[A-F0-9]{6}-ROUTE BEGIN' "$TEST_TMP/cdn-origin.conf") -eq 2 ]]
 [[ $(grep -Fc 'location ^~ /uploadfiles/ {' "$TEST_TMP/cdn-origin.conf") -eq 2 ]]
 [[ $(grep -Fc 'proxy_pass http://127.0.0.1:4443;' "$TEST_TMP/cdn-origin.conf") -eq 2 ]]
+
+# A cascade must never reuse Yandex direct's URL path with a different inbound
+# port: that would make both client Hosts hit the same upstream.
+before=$(sha256sum "$TEST_TMP/cdn-origin.conf" | awk '{print $1}')
+if (PSV1_ROUTE_PATH='/uploadfiles/' run_node_nginx_route yandex file.example.ru 7445 "$TEST_TMP/cdn-origin.conf" >/dev/null 2>&1); then
+  echo '[FAIL] Yandex cascade accepted the direct path' >&2
+  exit 1
+fi
+after=$(sha256sum "$TEST_TMP/cdn-origin.conf" | awk '{print $1}')
+[[ "$before" == "$after" ]]
 
 # Cascade uses a distinct path to the same public domain and its own port.
 PSV1_ROUTE_PATH='/uploadfiles-cascade/' run_node_nginx_route yandex file.example.ru 7445 "$TEST_TMP/cdn-origin.conf" >/dev/null

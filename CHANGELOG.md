@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.4.5
+
+- Yandex direct path `/uploadfiles/` is now protected: the route helper refuses to send it to a non-direct port, preventing direct and cascade Hosts from silently landing on the same inbound.
+- Before changing Nginx/Caddy, the route helper now checks TCP reachability of the exact upstream address and port (loopback for Nginx, Docker gateway for Caddy). On failure it leaves configuration untouched and reports the listener/bind-address issue.
+- Added regression coverage for the Yandex direct/cascade path collision; existing provider-specific paths and routes remain unchanged.
+
 ## 1.4.3
 
 - В именах новых bridge-only Config Profile и BRIDGE_IN добавляется выбранный CDN-метод (`yandex`, `turboflare` и т. п.), чтобы назначение было видно в панели.
