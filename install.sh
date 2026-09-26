@@ -218,6 +218,17 @@ method_client_path(){
 }
 method_nginx_style(){ case "$METHOD" in beeline|turboflare) echo rewrite ;; *) echo prefix ;; esac; }
 
+method_title(){
+  case "${1,,}" in
+    vk) echo "VK Cloud" ;;
+    yandex) echo "Yandex Cloud" ;;
+    beeline) echo "Beeline / CDNvideo" ;;
+    timeweb) echo "Timeweb" ;;
+    selectel) echo "Selectel" ;;
+    turboflare) echo "TurboFlare" ;;
+    *) echo "${1}" ;;
+  esac
+}
 
 # -----------------------------------------------------------------------------
 # Remnawave panel manager
@@ -778,9 +789,86 @@ rm_turboflare_domain_conflicts(){
 rm_turboflare_parent_zone_allowed(){
   [[ "${PSV1_ALLOW_PARENT_CDN:-0}" == "1" ]]
 }
+
+# Choose origin type: placeholder website or SFTP Go file storage
+rm_manager_choose_origin_type(){
+  local choice
+  echo >&2
+  echo "Тип origin (что будет доступно по CDN):" >&2
+  echo "  1 — Заглушка (placeholder website)" >&2
+  echo "  2 — SFTP Go (web-интерфейс хранилища файлов)" >&2
+  echo "  0 — Назад" >&2
+  while true; do
+    read -r -p "Выбор [1]: " choice; choice="${choice:-1}"
+    case "$choice" in
+      1) echo placeholder; return ;;
+      2) echo sftpgo; return ;;
+      0) return 1 ;;
+      *) warn "Выбери 1, 2 или 0" >&2 ;;
+    esac
+  done
+}
+
+# Get origin port and URL based on origin type
+rm_manager_get_origin_port(){
+  local origin_type="$1" method="$2"
+  case "$origin_type" in
+    placeholder)
+      # Placeholder uses standard ports for each method
+      case "$method" in
+        vk) echo 80 ;;
+        yandex) echo 443 ;;
+        beeline) echo 443 ;;
+        timeweb) echo 80 ;;
+        selectel) echo 443 ;;
+        turboflare) echo 443 ;;
+        *) echo 80 ;;
+      esac
+      ;;
+    sftpgo)
+      # SFTP Go web interface (can be shared or per-method)
+      # For simplicity, use one common port or per-method ports
+      case "$method" in
+        vk) echo 8080 ;;        # or shared 9999
+        yandex) echo 8080 ;;    # or shared 9999
+        beeline) echo 8080 ;;   # or shared 9999
+        timeweb) echo 8080 ;;   # or shared 9999
+        selectel) echo 8080 ;;  # or shared 9999
+        turboflare) echo 8080 ;;# or shared 9999
+        *) echo 8080 ;;
+      esac
+      ;;
+  esac
+}
+
+# Get origin scheme (http/https) based on type
+rm_manager_get_origin_scheme(){
+  local origin_type="$1"
+  case "$origin_type" in
+    placeholder) echo "http" ;;
+    sftpgo) echo "http" ;;
+    *) echo "http" ;;
+  esac
+}
+
 rm_manager_collect_domains(){
   local method="$1"
-  ORIGIN_DOMAIN=""; CDN_DOMAIN=""
+  ORIGIN_DOMAIN=""; CDN_DOMAIN=""; ORIGIN_TYPE=""; ORIGIN_PORT=""; ORIGIN_SCHEME=""
+  
+  # Step 1: Choose origin type (placeholder or SFTP Go)
+  echo >&2
+  info "Шаг 1: Выбор типа origin для $(method_title "$method")"
+  if ORIGIN_TYPE=$(rm_manager_choose_origin_type); then
+    ORIGIN_PORT=$(rm_manager_get_origin_port "$ORIGIN_TYPE" "$method")
+    ORIGIN_SCHEME=$(rm_manager_get_origin_scheme "$ORIGIN_TYPE")
+    ok "Выбран origin: $ORIGIN_TYPE (порт: $ORIGIN_PORT, схема: $ORIGIN_SCHEME)"
+  else
+    return 1
+  fi
+  
+  # Step 2: Collect domain names based on method
+  echo >&2
+  info "Шаг 2: Настройка доменов для $(method_title "$method")"
   case "$method" in
     turboflare)
       ask_domain CDN_DOMAIN "Домен TurboFlare, который будет в клиентском ключе" "" "media-example.org"
@@ -809,6 +897,15 @@ rm_manager_collect_domains(){
   if [[ -n "${ORIGIN_DOMAIN:-}" && -n "${CDN_DOMAIN:-}" && "${ORIGIN_DOMAIN,,}" == "${CDN_DOMAIN,,}" ]]; then
     die "Origin-домен и клиентский CDN-домен совпадают. Это создаёт цикл/обход CDN. Укажи два разных имени."
   fi
+  
+  # Step 3: Info about selected origin
+  echo >&2
+  info "Сводка выбранной конфигурации:"
+  info "  Метод: $(method_title "$method")"
+  info "  Origin тип: $ORIGIN_TYPE"
+  info "  Origin адрес: 127.0.0.1:$ORIGIN_PORT (на целевой ноде)"
+  [[ -n "${ORIGIN_DOMAIN:-}" ]] && info "  Origin домен: $ORIGIN_DOMAIN"
+  [[ -n "${CDN_DOMAIN:-}" ]] && info "  CDN домен: $CDN_DOMAIN"
 }
 
 rm_profile_config_json(){
@@ -1169,6 +1266,15 @@ rm_manager_provider_steps(){
       echo "DNS: используется Cloudflare. A/CNAME из этой инструкции создавай как DNS only."
     else
       echo "DNS: Cloudflare отключён. Те же A/CNAME создай у текущего DNS-провайдера без его proxy/CDN-ускорения."
+    fi
+    echo
+    echo "Origin конфигурация:"
+    echo "  Тип: ${ORIGIN_TYPE:-placeholder}"
+    echo "  Адрес: 127.0.0.1:${ORIGIN_PORT:-80}"
+    if [[ "${ORIGIN_TYPE:-placeholder}" == "sftpgo" ]]; then
+      echo "  Примечание: На целевой ноде должен быть установлен SFTP Go web-интерфейс"
+    else
+      echo "  Примечание: На целевой ноде работает веб-заглушка (/var/www/cdn-placeholder)"
     fi
     echo
     case "$method" in
