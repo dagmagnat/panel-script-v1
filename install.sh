@@ -11,7 +11,7 @@ IFS=$'\n\t'
 # This installer deliberately keeps each CDN preset separate. Do not mix fields
 # between providers: path/padding/uplink settings are provider-specific.
 
-INSTALLER_VERSION="1.4.5"
+INSTALLER_VERSION="1.4.6"
 STATE_SCHEMA_CURRENT="1"
 PRESET="${INSTALLER_PRESET:-}"
 
@@ -790,13 +790,14 @@ rm_turboflare_parent_zone_allowed(){
   [[ "${PSV1_ALLOW_PARENT_CDN:-0}" == "1" ]]
 }
 
-# Choose origin type: placeholder website or SFTP Go file storage
+# Choose what must remain at / on an already configured origin site.
 rm_manager_choose_origin_type(){
   local choice
   echo >&2
-  echo "Тип origin (что будет доступно по CDN):" >&2
-  echo "  1 — Заглушка (placeholder website)" >&2
-  echo "  2 — SFTP Go (web-интерфейс хранилища файлов)" >&2
+  echo "Что должно открываться на корне origin-сайта (/):" >&2
+  echo "  Выбор не устанавливает сервис и не задаёт адрес источника CDN." >&2
+  echo "  1 — Уже настроенная веб-заглушка" >&2
+  echo "  2 — Уже работающий SFTPGo (сохранить его на /)" >&2
   echo "  0 — Назад" >&2
   while true; do
     read -r -p "Выбор [1]: " choice; choice="${choice:-1}"
@@ -809,48 +810,6 @@ rm_manager_choose_origin_type(){
   done
 }
 
-# Get origin port and URL based on origin type
-rm_manager_get_origin_port(){
-  local origin_type="$1" method="$2"
-  case "$origin_type" in
-    placeholder)
-      # Placeholder uses standard ports for each method
-      case "$method" in
-        vk) echo 80 ;;
-        yandex) echo 443 ;;
-        beeline) echo 443 ;;
-        timeweb) echo 80 ;;
-        selectel) echo 443 ;;
-        turboflare) echo 443 ;;
-        *) echo 80 ;;
-      esac
-      ;;
-    sftpgo)
-      # SFTP Go web interface (can be shared or per-method)
-      # For simplicity, use one common port or per-method ports
-      case "$method" in
-        vk) echo 8080 ;;        # or shared 9999
-        yandex) echo 8080 ;;    # or shared 9999
-        beeline) echo 8080 ;;   # or shared 9999
-        timeweb) echo 8080 ;;   # or shared 9999
-        selectel) echo 8080 ;;  # or shared 9999
-        turboflare) echo 8080 ;;# or shared 9999
-        *) echo 8080 ;;
-      esac
-      ;;
-  esac
-}
-
-# Get origin scheme (http/https) based on type
-rm_manager_get_origin_scheme(){
-  local origin_type="$1"
-  case "$origin_type" in
-    placeholder) echo "http" ;;
-    sftpgo) echo "http" ;;
-    *) echo "http" ;;
-  esac
-}
-
 rm_manager_collect_domains(){
   local method="$1"
   ORIGIN_DOMAIN=""; CDN_DOMAIN=""; ORIGIN_TYPE=""; ORIGIN_PORT=""; ORIGIN_SCHEME=""
@@ -859,9 +818,13 @@ rm_manager_collect_domains(){
   echo >&2
   info "Шаг 1: Выбор типа origin для $(method_title "$method")"
   if ORIGIN_TYPE=$(rm_manager_choose_origin_type); then
-    ORIGIN_PORT=$(rm_manager_get_origin_port "$ORIGIN_TYPE" "$method")
-    ORIGIN_SCHEME=$(rm_manager_get_origin_scheme "$ORIGIN_TYPE")
-    ok "Выбран origin: $ORIGIN_TYPE (порт: $ORIGIN_PORT, схема: $ORIGIN_SCHEME)"
+    ORIGIN_PORT=""
+    ORIGIN_SCHEME=""
+    if [[ "$ORIGIN_TYPE" == sftpgo ]]; then
+      ok "Выбран существующий SFTPGo для корня /; скрипт его не устанавливает и не меняет его backend-порт."
+    else
+      ok "Выбрана существующая веб-заглушка для корня /; скрипт не заменяет веб-сервер ноды."
+    fi
   else
     return 1
   fi
@@ -902,8 +865,8 @@ rm_manager_collect_domains(){
   echo >&2
   info "Сводка выбранной конфигурации:"
   info "  Метод: $(method_title "$method")"
-  info "  Origin тип: $ORIGIN_TYPE"
-  info "  Origin адрес: 127.0.0.1:$ORIGIN_PORT (на целевой ноде)"
+  info "  Содержимое корня origin-сайта (/): $([[ "$ORIGIN_TYPE" == sftpgo ]] && echo 'существующий SFTPGo' || echo 'существующая веб-заглушка')"
+  info "  Этот выбор не меняет публичный источник CDN и не устанавливает/перенастраивает сервис на ноде."
   [[ -n "${ORIGIN_DOMAIN:-}" ]] && info "  Origin домен: $ORIGIN_DOMAIN"
   [[ -n "${CDN_DOMAIN:-}" ]] && info "  CDN домен: $CDN_DOMAIN"
 }
@@ -1268,14 +1231,14 @@ rm_manager_provider_steps(){
       echo "DNS: Cloudflare отключён. Те же A/CNAME создай у текущего DNS-провайдера без его proxy/CDN-ускорения."
     fi
     echo
-    echo "Origin конфигурация:"
-    echo "  Тип: ${ORIGIN_TYPE:-placeholder}"
-    echo "  Адрес: 127.0.0.1:${ORIGIN_PORT:-80}"
+    echo "Корень origin-сайта (/): ${ORIGIN_TYPE:-placeholder}"
     if [[ "${ORIGIN_TYPE:-placeholder}" == "sftpgo" ]]; then
-      echo "  Примечание: На целевой ноде должен быть установлен SFTP Go web-интерфейс"
+      echo "  SFTPGo должен уже работать на целевой ноде и открываться в корне / через существующий Caddy/Nginx."
+      echo "  Этот выбор не устанавливает SFTPGo и не меняет его локальный порт."
     else
-      echo "  Примечание: На целевой ноде работает веб-заглушка (/var/www/cdn-placeholder)"
+      echo "  Веб-заглушка должна уже обслуживаться в корне /; node-only установка сама её не создаёт."
     fi
+    echo "  CDN обращается к публичному listener origin-сервера; Xray-порт и путь настраиваются отдельным маршрутом."
     echo
     case "$method" in
       turboflare)
@@ -1304,8 +1267,15 @@ rm_manager_provider_steps(){
         echo "После активации получишь xxx.a.trbcdn.net; если сейчас домен был пустой — снова запусти менеджер и создай host."
         ;;
       timeweb)
-        echo "Источник строго ${node_ip}:80; HTTPS к источнику ВЫКЛ; query не игнорировать; cache OFF."
+        echo "Стандарт мастера: источник ${node_ip}:80 (IP-адрес), HTTPS к источнику ВЫКЛ — обычный HTTP на порт 80."
+        echo "Если используешь существующий TLS-vhost на :443 (как в отдельном nginx-шаблоне), укажи ${node_ip}:443 и включи HTTPS к источнику; сертификат/vhost должны подходить к Host/SNI, который отправляет CDN."
+        echo "Не сочетай :443 с выключенным HTTPS. Xray :10087 — внутренний upstream за reverse proxy, не публичный источник CDN."
+        echo "Порт 10443 и путь /content/ova.txt из стороннего шаблона подходят только если именно такие порт и path заданы в активном Xray inbound."
+        echo "Кэш OFF; 'Игнорировать параметры запроса' ВЫКЛ. Путь $(rm_method_meta "$method" path) передавать без rewrite."
         echo "Клиентский домен: ${CDN_DOMAIN}."
+        if [[ "${ORIGIN_TYPE:-placeholder}" == "sftpgo" ]]; then
+          echo "Корень / остаётся существующим SFTPGo; APPLY-ON-NODE.sh добавляет только XHTTP-маршрут на выбранной ноде."
+        fi
         ;;
       selectel)
         echo "Источник: ${ORIGIN_DOMAIN:-$node_ip}; cache/gzip OFF; query не игнорировать; verify origin OFF; разрешить POST."
@@ -1317,6 +1287,16 @@ rm_manager_provider_steps(){
     echo "Ожидаемый код после активного inbound: 400."
   } > "$f"
   chmod 600 "$f"
+}
+
+write_apply_proxy_route_script(){
+  local file="$1" method="$2" domain="$3" port="$4" route_path="${5:-}"
+  {
+    printf '%s\n' '#!/usr/bin/env bash' 'set -Eeuo pipefail'
+    [[ -z "$route_path" ]] || printf 'export PSV1_ROUTE_PATH=%q\n' "$route_path"
+    printf 'exec %q --node-proxy-route %q %q %q\n' "$INSTALL_PATH" "$method" "$domain" "$port"
+  } > "$file"
+  chmod 700 "$file"
 }
 
 # Add or update one managed XHTTP route in an existing Caddy/SFTPGo origin.
@@ -1474,12 +1454,12 @@ run_node_nginx_route(){
   backup="${conf}.before-psv1-$(date +%Y%m%d-%H%M%S)"
   cp -p "$conf" "$backup"
 
-  if ! "$python_bin" - "$conf" "$method" "$path" "$target_port" "$route_key" <<'PY'
+  if ! "$python_bin" - "$conf" "$method" "$path" "$target_port" "$route_key" "$domain" <<'PY'
 import pathlib
 import re
 import sys
 
-filename, method, route_path, port, route_key = sys.argv[1:]
+filename, method, route_path, port, route_key, domain = sys.argv[1:]
 p = pathlib.Path(filename)
 text = p.read_text(encoding="utf-8")
 begin = f"# PSV1-{method.upper()}-{route_key}-ROUTE BEGIN"
@@ -1566,20 +1546,29 @@ if legacy_locations:
     p.write_text(text, encoding="utf-8")
     raise SystemExit(0)
 
-# Additional method: insert an independent location into every generated
-# origin server (HTTP and HTTPS), immediately before its generic location /.
+# Add routes only to the exact origin vhost. When the hostname is intentionally
+# served by a catch-all, use an explicit default_server named `_`; never edit
+# unrelated named panel/site vhosts in the same nginx file.
 servers = balanced_blocks(text, "server")
-selected = []
+eligible = []
 for start, stop, block in servers:
-    if not re.search(r"(?m)^\s*listen\s+(?:\[::\]:)?(?:80|443)\b", block):
+    listen = re.findall(r"(?m)^\s*listen\s+([^;]+);", block)
+    if not any(re.match(r"(?:\[::\]:)?(?:80|443)\b", value.strip()) for value in listen):
         continue
-    if not re.search(r"(?m)^\s*server_name\s+[^;]+;", block):
+    names_match = re.search(r"(?m)^\s*server_name\s+([^;]+);", block)
+    if not names_match:
         continue
     generic = re.search(r"(?m)^\s*location\s+/\s*\{", block)
-    if generic:
-        selected.append(start + generic.start())
+    if not generic:
+        continue
+    names = names_match.group(1).split()
+    is_default = any("default_server" in value.split() for value in listen)
+    eligible.append((start + generic.start(), domain in names, is_default, "_" in names))
+
+exact = [item[0] for item in eligible if item[1]]
+selected = exact or [item[0] for item in eligible if item[2] and item[3]]
 if not selected:
-    raise SystemExit("no safe HTTP/HTTPS origin server with a generic location / was found")
+    raise SystemExit(f"no exact vhost for {domain} or explicit catch-all default_server with location / was found")
 for pos in reversed(selected):
     text = text[:pos] + route_block + text[pos:]
 p.write_text(text, encoding="utf-8")
@@ -3008,8 +2997,7 @@ $relay_proxy_note
 6. На relay запусти автонастройку существующего Caddy или nginx:
    PSV1_ROUTE_PATH='$cascade_path' $INSTALL_PATH --node-proxy-route '$method' '${ORIGIN_DOMAIN:-$CDN_DOMAIN}' '${relay_port}'
 EOF
-  printf '%s\n' "PSV1_ROUTE_PATH='$cascade_path' $INSTALL_PATH --node-proxy-route '$method' '${ORIGIN_DOMAIN:-$CDN_DOMAIN}' '${relay_port}'" > "$run_dir/APPLY-ON-RELAY.sh"
-  chmod 700 "$run_dir/APPLY-ON-RELAY.sh"
+  write_apply_proxy_route_script "$run_dir/APPLY-ON-RELAY.sh" "$method" "${ORIGIN_DOMAIN:-$CDN_DOMAIN}" "$relay_port" "$cascade_path"
 
   : > "$run_dir/EXIT-STEPS.txt"
   : > "$run_dir/VERIFY.txt"
@@ -3297,8 +3285,7 @@ Security: TLS
 Inbound tag: $tag
 EOF
   rm_manager_provider_steps "$method" "$node_ip" "$run_dir/provider-steps.txt"
-  printf '%s\n' "$INSTALL_PATH --node-proxy-route '$method' '${ORIGIN_DOMAIN:-$CDN_DOMAIN}' '$(rm_method_meta "$method" port)'" > "$run_dir/APPLY-ON-NODE.sh"
-  chmod 700 "$run_dir/APPLY-ON-NODE.sh"
+  write_apply_proxy_route_script "$run_dir/APPLY-ON-NODE.sh" "$method" "${ORIGIN_DOMAIN:-$CDN_DOMAIN}" "$(rm_method_meta "$method" port)"
 
   cat > "$run_dir/NEXT-STEPS.txt" <<EOF
 ПАНЕЛЬ REMNAWAVE — обязательная цепочка для $(method_title "$method")
@@ -3335,9 +3322,11 @@ EOF
 8. CDN-провайдер
    Выполнить: $run_dir/provider-steps.txt
 
-9. Caddy/SFTPGo на Node (только если origin уже работает через e-cloudfiles Caddy)
-   Запустить на выбранной Node: $INSTALL_PATH --node-proxy-route '$method' '${ORIGIN_DOMAIN:-$CDN_DOMAIN}' '$(rm_method_meta "$method" port)'
-   Команда добавит только XHTTP path; корень / останется SFTPGo.
+9. Reverse proxy на выбранной Node — обязательно до проверки CDN
+   Передай APPLY-ON-NODE.sh на выбранную Node и запусти: bash APPLY-ON-NODE.sh
+   Файл добавляет только XHTTP-маршрут на порт $(rm_method_meta "$method" port) по пути $(rm_method_meta "$method" path); корень / не меняется.
+   Если выбран SFTPGo, он должен уже открываться на / через найденный Caddy/Nginx. Установщик не ставит SFTPGo и не угадывает его backend-порт.
+   Для Timeweb CDN обращается к публичному IP ноды:80 по HTTP; reverse proxy передаёт XHTTP-путь на локальный порт 10087.
 
 Проверка цепочки после активации:
   профиль содержит inbound → профиль назначен ноде → inbound Active → inbound в Internal Squad → пользователь в этом Squad → Host привязан к inbound.
@@ -5065,7 +5054,10 @@ provider_steps(){
         echo "После создания скопировать технический домен xxx.a.trbcdn.net — он идёт в ключ."
         ;;
       timeweb)
-        echo "Источник строго: ${PUBLIC_IP}:80 (вкладка IP-адрес); HTTPS ВЫКЛ."
+        echo "По умолчанию мастера: источник ${PUBLIC_IP}:80 (вкладка IP-адрес), HTTPS ВЫКЛ — обычный HTTP на порт 80."
+        echo "Если origin уже настроен на TLS :443, выбери ${PUBLIC_IP}:443 и включи HTTPS к источнику; проверь сертификат и Host/SNI. Никогда не сочетай :443 с HTTPS ВЫКЛ."
+        echo "Порт Xray :10087 — только внутренний upstream за Nginx/Caddy; CDN не подключается к нему напрямую. Сторонние :10443 и /content/ova.txt требуют совпадения с активным inbound."
+        echo "Путь $(rm_method_meta "$METHOD" path) не переписывать; query-параметры передавать."
         echo "Кэш ВЫКЛ; 'Игнорировать параметры запроса' строго ВЫКЛ."
         echo "Добавить домен ${CDN_DOMAIN}; CNAME на xxx.cdn.twcstorage.ru; затем выпустить LE после статуса Активен."
         ;;

@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.4.6
+
+- Clarified that the manager's SFTPGo choice preserves an already-running root site; it does not install SFTPGo or select the CDN source address/backend port.
+- Timeweb instructions now distinguish the public origin listener (`IP:80`, HTTP) from the local Xray upstream (`:10087`) and warn against `:443` with HTTPS disabled.
+- Generated APPLY-ON-NODE/APPLY-ON-RELAY scripts now include a Bash shebang and safely quote arguments, so they can be run directly or through `bash`.
+- The Remnawave manager's generated next steps explicitly require applying the reverse-proxy route on the selected node before testing CDN traffic.
+
 ## 1.4.5
 
 - Yandex direct path `/uploadfiles/` is now protected: the route helper refuses to send it to a non-direct port, preventing direct and cascade Hosts from silently landing on the same inbound.

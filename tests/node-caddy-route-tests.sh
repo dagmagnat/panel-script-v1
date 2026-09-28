@@ -99,6 +99,11 @@ server {
     }
     location / { return 200; }
 }
+server {
+    listen 443 ssl;
+    server_name panel.example.ru;
+    location / { return 200; }
+}
 EOF
 
 # Old TurboFlare direct upstream is migrated to the cascade port.
@@ -112,6 +117,7 @@ run_node_nginx_route yandex file.example.ru 4443 "$TEST_TMP/cdn-origin.conf" >/d
 [[ $(grep -Ec 'PSV1-YANDEX-[A-F0-9]{6}-ROUTE BEGIN' "$TEST_TMP/cdn-origin.conf") -eq 2 ]]
 [[ $(grep -Fc 'location ^~ /uploadfiles/ {' "$TEST_TMP/cdn-origin.conf") -eq 2 ]]
 [[ $(grep -Fc 'proxy_pass http://127.0.0.1:4443;' "$TEST_TMP/cdn-origin.conf") -eq 2 ]]
+awk '/server_name panel\.example\.ru;/{in_panel=1} in_panel && /server[[:space:]]+127\.0\.0\.1:/{bad=1} in_panel && /^}/{in_panel=0} END{exit bad}' "$TEST_TMP/cdn-origin.conf"
 
 # A cascade must never reuse Yandex direct's URL path with a different inbound
 # port: that would make both client Hosts hit the same upstream.
