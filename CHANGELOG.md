@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.4.7
+
+- Fixed installer exit code 141 during UFW setup: SSH port detection no longer closes the `sshd -T` pipe early under `pipefail`.
+- Removed early-exit `awk` consumers from other command pipelines to avoid the same SIGPIPE failure mode.
+
 ## 1.4.6
 
 - Clarified that the manager's SFTPGo choice preserves an already-running root site; it does not install SFTPGo or select the CDN source address/backend port.

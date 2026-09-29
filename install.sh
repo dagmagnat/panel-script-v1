@@ -11,7 +11,7 @@ IFS=$'\n\t'
 # This installer deliberately keeps each CDN preset separate. Do not mix fields
 # between providers: path/padding/uplink settings are provider-specific.
 
-INSTALLER_VERSION="1.4.6"
+INSTALLER_VERSION="1.4.7"
 STATE_SCHEMA_CURRENT="1"
 PRESET="${INSTALLER_PRESET:-}"
 
@@ -83,6 +83,15 @@ fi
 
 valid_domain(){ [[ "$1" =~ ^([A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z]{2,63}$ ]]; }
 valid_ipv4(){ [[ "$1" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; }
+detect_ssh_port(){
+  local sshd_config=""
+  if command -v sshd >/dev/null 2>&1; then
+    # Capture sshd output before parsing it. Piping sshd -T into an awk that
+    # exits on the first match can SIGPIPE sshd; with pipefail this aborts setup.
+    sshd_config=$(sshd -T 2>/dev/null || true)
+  fi
+  awk '/^port[[:space:]]+/ && !found { port=$2; found=1 } END { print found ? port : 22 }' <<<"$sshd_config"
+}
 ask_yes_no(){
   local __var="$1" label="$2" default="${3:-yes}" ans=""
   if [[ "$default" == yes ]]; then read -r -p "$label [Y/n]: " ans; ans="${ans:-y}"; else read -r -p "$label [y/N]: " ans; ans="${ans:-n}"; fi
@@ -1316,7 +1325,7 @@ run_node_caddy_route(){
   path="${PSV1_ROUTE_PATH:-$(rm_method_meta "$method" path)}"
   rm_validate_method_route "$method" "$path" "$target_port"
   route_key=$(printf '%s' "$path" | sha256sum | cut -c1-6 | tr '[:lower:]' '[:upper:]')
-  gateway=$(docker inspect "$container" --format '{{range .NetworkSettings.Networks}}{{println .Gateway}}{{end}}' 2>/dev/null | awk 'NF{print;exit}')
+  gateway=$(docker inspect "$container" --format '{{range .NetworkSettings.Networks}}{{println .Gateway}}{{end}}' 2>/dev/null | awk 'NF && !found { value=$0; found=1 } END { if (found) print value }')
   valid_ipv4 "$gateway" || die "Не удалось определить Docker gateway контейнера $container."
   rm_probe_tcp_listener "$gateway" "$target_port"
   safe="$(tr -cd 'a-z0-9-' <<<"${method,,}")_${route_key,,}"
@@ -4202,7 +4211,7 @@ fi
 PUBLIC_IP=""
 detect_public_ip(){
   PUBLIC_IP=$(curl -4 -fsS --max-time 6 https://api.ipify.org 2>/dev/null || true)
-  valid_ipv4 "$PUBLIC_IP" || PUBLIC_IP=$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1);exit}}')
+  valid_ipv4 "$PUBLIC_IP" || PUBLIC_IP=$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src" && !found){address=$(i+1);found=1}} END {if(found) print address}')
   valid_ipv4 "$PUBLIC_IP" || read -r -p "Публичный IPv4 VPS: " PUBLIC_IP
   info "Публичный IPv4 VPS: $PUBLIC_IP"
 }
@@ -4288,7 +4297,7 @@ fi
 
 if [[ "${ENABLE_UFW:-yes}" == yes ]] && ! marked firewall; then
   info "Настраиваю UFW (только входящие правила; исходящие остаются разрешены)."
-  SSH_PORT=$(sshd -T 2>/dev/null | awk '/^port /{print $2;exit}'); SSH_PORT="${SSH_PORT:-22}"
+  SSH_PORT=$(detect_ssh_port)
   ufw default deny incoming
   ufw default allow outgoing
   ufw allow "$SSH_PORT/tcp" comment 'SSH'
