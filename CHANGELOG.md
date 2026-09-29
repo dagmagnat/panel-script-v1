@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.4.8
+
+- Fixed Nginx route detection on stock Ubuntu/Debian vhosts: the block scanner now ignores apostrophes and braces inside comments instead of misreading them as quoted syntax.
+- Added a regression test using the default catch-all vhost shape and its `Don't` comment.
+
 ## 1.4.7
 
 - Fixed installer exit code 141 during UFW setup: SSH port detection no longer closes the `sshd -T` pipe early under `pipefail`.

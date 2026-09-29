@@ -45,7 +45,7 @@ EOF
 chmod +x "$TEST_TMP/nginx" "$TEST_TMP/systemctl"
 PATH="$TEST_TMP:$PATH"
 export PSV1_SKIP_TCP_PROBE=1
-export MSYS2_ARG_CONV_EXCL='/static/getFile/video/segment.ts;/uploadfiles/;/uploadfiles-cascade/'
+export MSYS2_ARG_CONV_EXCL='/static/getFile/video/segment.ts;/uploadfiles/;/uploadfiles-cascade/;/content/media/stream.m3u8'
 
 run_node_caddy_route turboflare file.example.ru 7443 "$TEST_TMP/Caddyfile" >/dev/null
 grep -Eq '@psv1_turboflare_[a-f0-9]{6} path /static/getFile/video/segment.ts' "$TEST_TMP/Caddyfile" || { cat "$TEST_TMP/Caddyfile"; exit 1; }
@@ -141,6 +141,25 @@ PSV1_ROUTE_PATH='/uploadfiles-cascade/' run_node_nginx_route yandex file.example
 [[ $(grep -Ec 'PSV1-YANDEX-[A-F0-9]{6}-ROUTE BEGIN' "$TEST_TMP/cdn-origin.conf") -eq 4 ]]
 [[ $(grep -Fc 'proxy_pass http://127.0.0.1:7555;' "$TEST_TMP/cdn-origin.conf") -eq 2 ]]
 [[ $(grep -Fc 'proxy_pass http://127.0.0.1:4443;' "$TEST_TMP/cdn-origin.conf") -eq 2 ]]
+
+# Ubuntu's stock default vhost has comments such as "Don't use them". The
+# brace scanner must ignore quotes/braces inside comments when finding its
+# catch-all server block.
+cat > "$TEST_TMP/default.conf" <<'EOF'
+# Default server configuration
+server {
+    listen 80 default_server;
+    server_name _;
+    # Don't uncomment this example { unless you know what you're doing.
+    location / {
+        try_files $uri $uri/ =404;
+    }
+}
+EOF
+run_node_nginx_route timeweb file.example.ru 10087 "$TEST_TMP/default.conf" >/dev/null
+grep -Fq 'location ^~ /content/media/stream.m3u8 {' "$TEST_TMP/default.conf"
+grep -Fq 'proxy_pass http://127.0.0.1:10087;' "$TEST_TMP/default.conf"
+grep -Fq "# Don't uncomment this example { unless you know what you're doing." "$TEST_TMP/default.conf"
 
 # Beeline shares TurboFlare's path and must be rejected on this vhost.
 before=$(sha256sum "$TEST_TMP/cdn-origin.conf" | awk '{print $1}')

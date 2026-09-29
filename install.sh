@@ -11,7 +11,7 @@ IFS=$'\n\t'
 # This installer deliberately keeps each CDN preset separate. Do not mix fields
 # between providers: path/padding/uplink settings are provider-specific.
 
-INSTALLER_VERSION="1.4.7"
+INSTALLER_VERSION="1.4.8"
 STATE_SCHEMA_CURRENT="1"
 PRESET="${INSTALLER_PRESET:-}"
 
@@ -1481,8 +1481,13 @@ def balanced_blocks(source, keyword):
         depth = 0
         quote = None
         escaped = False
+        comment = False
         for pos in range(brace, len(source)):
             ch = source[pos]
+            if comment:
+                if ch == "\n":
+                    comment = False
+                continue
             if quote:
                 if escaped:
                     escaped = False
@@ -1490,6 +1495,9 @@ def balanced_blocks(source, keyword):
                     escaped = True
                 elif ch == quote:
                     quote = None
+                continue
+            if ch == "#":
+                comment = True
                 continue
             if ch in ('"', "'"):
                 quote = ch
