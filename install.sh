@@ -11,7 +11,7 @@ IFS=$'\n\t'
 # This installer deliberately keeps each CDN preset separate. Do not mix fields
 # between providers: path/padding/uplink settings are provider-specific.
 
-INSTALLER_VERSION="1.4.9"
+INSTALLER_VERSION="1.4.11"
 STATE_SCHEMA_CURRENT="1"
 PRESET="${INSTALLER_PRESET:-}"
 
@@ -817,23 +817,29 @@ rm_manager_choose_origin_type(){
   local choice
   echo >&2
   echo "Что должно открываться на корне origin-сайта (/):" >&2
-  echo "  Выбор не устанавливает сервис и не задаёт адрес источника CDN." >&2
+  echo "  Этот выбор не задаёт адрес источника CDN." >&2
   echo "  1 — Уже настроенная веб-заглушка" >&2
   echo "  2 — Уже работающий SFTPGo (сохранить его на /)" >&2
+  echo "  3 — Установить SFTPGo на выбранную ноду и открыть его на / (Docker + Nginx)" >&2
   echo "  0 — Назад" >&2
   while true; do
     read -r -p "Выбор [1]: " choice; choice="${choice:-1}"
     case "$choice" in
       1) echo placeholder; return ;;
       2) echo sftpgo; return ;;
+      3) echo sftpgo_install; return ;;
       0) return 1 ;;
-      *) warn "Выбери 1, 2 или 0" >&2 ;;
+      *) warn "Выбери 1, 2, 3 или 0" >&2 ;;
     esac
   done
 }
 
 rm_manager_collect_domains(){
   local method="$1"
+  # The central-panel manager does not pass through collect_config(), so set
+  # the method-derived values here before provider guidance uses them.
+  CLIENT_PATH=$(rm_method_meta "$method" path)
+  XRAY_PORT=$(rm_method_meta "$method" port)
   ORIGIN_DOMAIN=""; CDN_DOMAIN=""; ORIGIN_TYPE=""; ORIGIN_PORT=""; ORIGIN_SCHEME=""
   
   # Step 1: Choose origin type (placeholder or SFTP Go)
@@ -844,6 +850,8 @@ rm_manager_collect_domains(){
     ORIGIN_SCHEME=""
     if [[ "$ORIGIN_TYPE" == sftpgo ]]; then
       ok "Выбран существующий SFTPGo для корня /; скрипт его не устанавливает и не меняет его backend-порт."
+    elif [[ "$ORIGIN_TYPE" == sftpgo_install ]]; then
+      ok "Для выбранной ноды будет подготовлен отдельный установщик SFTPGo; существующие контейнеры и данные он не перезаписывает."
     else
       ok "Выбрана существующая веб-заглушка для корня /; скрипт не заменяет веб-сервер ноды."
     fi
@@ -891,8 +899,12 @@ rm_manager_collect_domains(){
   echo >&2
   info "Сводка выбранной конфигурации:"
   info "  Метод: $(method_title "$method")"
-  info "  Содержимое корня origin-сайта (/): $([[ "$ORIGIN_TYPE" == sftpgo ]] && echo 'существующий SFTPGo' || echo 'существующая веб-заглушка')"
-  info "  Этот выбор не меняет публичный источник CDN и не устанавливает/перенастраивает сервис на ноде."
+  case "$ORIGIN_TYPE" in
+    sftpgo) info "  Содержимое корня origin-сайта (/): существующий SFTPGo" ;;
+    sftpgo_install) info "  Содержимое корня origin-сайта (/): SFTPGo будет установлен на выбранной ноде" ;;
+    *) info "  Содержимое корня origin-сайта (/): существующая веб-заглушка" ;;
+  esac
+  info "  Публичный источник CDN этим выбором не меняется."
   [[ -n "${ORIGIN_DOMAIN:-}" ]] && info "  Origin домен: $ORIGIN_DOMAIN"
   [[ -n "${CDN_DOMAIN:-}" ]] && info "  CDN домен: $CDN_DOMAIN"
 }
@@ -1162,9 +1174,13 @@ show_provider_preflight(){
   local method="$1" node_ip="${2:-IP_НОДЫ}"
   [[ "$method" == none || -z "$method" ]] && return 0
   ui_title "ЧТО НУЖНО ПОДГОТОВИТЬ ПОЛЬЗОВАТЕЛЮ — $(method_title "$method")"
-  echo -e "${C_MAGENTA}Скрипт автоматизирует сервер и Remnawave. Кабинет CDN/регистратора без API-токена провайдера он не может нажимать за тебя.${C_RESET}"
+  if [[ "$method" == yandex_music ]]; then
+    echo -e "${C_MAGENTA}Для нового XHTTP Music метода кабинет Yandex Cloud не меняется: используется уже настроенное CDN-соединение.${C_RESET}"
+  else
+    echo -e "${C_MAGENTA}Скрипт автоматизирует сервер и Remnawave. Кабинет CDN/регистратора без API-токена провайдера он не может нажимать за тебя.${C_RESET}"
+  fi
   echo
-  if [[ -n "${ORIGIN_DOMAIN:-}" ]]; then
+  if [[ "$method" != yandex_music && -n "${ORIGIN_DOMAIN:-}" ]]; then
     provider_dns_hint "A ${ORIGIN_DOMAIN} -> ${node_ip}"
   fi
   case "$method" in
@@ -1180,9 +1196,9 @@ show_provider_preflight(){
       user_prepare "Cache CDN/browser OFF; query НЕ игнорировать; compression OFF; verify origin certificate OFF."
       ;;
     yandex_music)
-      user_prepare "Yandex Certificate Manager: выпустить сертификат для ${CDN_DOMAIN}; origin HTTPS, Host/SNI=${ORIGIN_DOMAIN}."
-      user_prepare "Кэш и сжатие выключить; query-параметры и заголовки X-Cache, X-Session-Token, X-Data передавать; GET разрешить."
-      user_prepare "Путь ${CLIENT_PATH} передавать без rewrite; новый inbound слушает локальный порт 11443."
+      user_prepare "Ничего не менять в кабинете/соединении Yandex Cloud: не создавать ресурс, не менять сертификаты, кэш, заголовки или DNS."
+      user_prepare "Используется уже существующее CDN-соединение; новый метод задаётся XHTTP-конфигурацией Remnawave/Xray и маршрутом на origin-ноде."
+      user_prepare "Новый inbound слушает локальный порт 11443; путь ${CLIENT_PATH} и заголовки из xhttpExtraParams.json формируются скриптом."
       ;;
     beeline)
       user_prepare "CDNvideo/Beeline: создать ресурс 'Статика' с origin ${ORIGIN_DOMAIN}:443, HTTPS ON, verify certificate OFF, SNI=${ORIGIN_DOMAIN}."
@@ -1254,9 +1270,15 @@ rm_probe_public_xhttp(){
 rm_manager_provider_steps(){
   local method="$1" node_ip="$2" f="$3"
   {
-    echo "$(method_title "$method") — что осталось сделать у CDN-провайдера"
+    if [[ "$method" == yandex_music ]]; then
+      echo "$(method_title "$method") — настройки нового метода на сервере"
+    else
+      echo "$(method_title "$method") — что осталось сделать у CDN-провайдера"
+    fi
     echo "=============================================================="
-    if [[ "${USE_CLOUDFLARE:-yes}" == yes ]]; then
+    if [[ "$method" == yandex_music ]]; then
+      echo "Yandex Cloud: существующее CDN-соединение остаётся без изменений; действий в кабинете нет."
+    elif [[ "${USE_CLOUDFLARE:-yes}" == yes ]]; then
       echo "DNS: используется Cloudflare. A/CNAME из этой инструкции создавай как DNS only."
     else
       echo "DNS: Cloudflare отключён. Те же A/CNAME создай у текущего DNS-провайдера без его proxy/CDN-ускорения."
@@ -1266,6 +1288,9 @@ rm_manager_provider_steps(){
     if [[ "${ORIGIN_TYPE:-placeholder}" == "sftpgo" ]]; then
       echo "  SFTPGo должен уже работать на целевой ноде и открываться в корне / через существующий Caddy/Nginx."
       echo "  Этот выбор не устанавливает SFTPGo и не меняет его локальный порт."
+    elif [[ "${ORIGIN_TYPE:-placeholder}" == "sftpgo_install" ]]; then
+      echo "  Будет создан INSTALL-SFTPGO-ON-NODE.sh: он ставит SFTPGo Community через Docker и настраивает корень / в Nginx выбранной ноды."
+      echo "  Установщик отказывается перезаписывать уже существующий контейнер sftpgo и сохраняет данные в /opt/sftpgo."
     else
       echo "  Веб-заглушка должна уже обслуживаться в корне /; node-only установка сама её не создаёт."
     fi
@@ -1293,9 +1318,9 @@ rm_manager_provider_steps(){
         echo "Кэш CDN/браузера выключить, query не игнорировать, compression выключить, verify origin выключить."
         ;;
       yandex_music)
-        echo "Yandex CDN: origin ${ORIGIN_DOMAIN}:443 по HTTPS; SNI и Host origin=${ORIGIN_DOMAIN}; клиентский CDN-домен=${CDN_DOMAIN}."
-        echo "Кэш/сжатие выключить, query и X-Cache/X-Session-Token/X-Data передавать, GET разрешить; path ${CLIENT_PATH} не переписывать."
-        echo "Локальный Xray inbound слушает :11443; CDN должен ходить на публичный TLS origin :443, не на :11443."
+        echo "Кабинет Yandex Cloud не трогать: оставить существующие CDN-ресурс, источник, сертификаты и параметры без изменений."
+        echo "Новый метод добавляется только в XHTTP-конфигурацию Remnawave/Xray; скрипт готовит маршрут ${CLIENT_PATH} на локальный inbound :11443."
+        echo "Никаких новых ресурсов, DNS-записей или изменений соединения Yandex Cloud этот метод не требует."
         ;;
       beeline)
         echo "Источник: ${ORIGIN_DOMAIN}:443, HTTPS ВКЛ, SNI=${ORIGIN_DOMAIN}, cache OFF, query учитывать."
@@ -1330,7 +1355,159 @@ write_apply_proxy_route_script(){
   {
     printf '%s\n' '#!/usr/bin/env bash' 'set -Eeuo pipefail'
     [[ -z "$route_path" ]] || printf 'export PSV1_ROUTE_PATH=%q\n' "$route_path"
-    printf 'exec %q --node-proxy-route %q %q %q\n' "$INSTALL_PATH" "$method" "$domain" "$port"
+    printf '%s\n' 'SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"'
+    printf 'exec "$SCRIPT_DIR/PANEL-SCRIPT-ON-NODE.sh" --node-proxy-route %q %q %q\n' "$method" "$domain" "$port"
+  } > "$file"
+  chmod 700 "$file"
+}
+
+write_sftpgo_node_installer(){
+  local file="$1" method="$2" domain="$3" port="$4"
+  {
+    printf '%s\n' '#!/usr/bin/env bash' 'set -Eeuo pipefail'
+    printf 'METHOD=%q\nORIGIN_DOMAIN=%q\nXHTTP_PORT=%q\n' "$method" "$domain" "$port"
+    cat <<'NODE_INSTALLER'
+[[ $EUID -eq 0 ]] || { echo "Запусти от root: sudo bash $0" >&2; exit 1; }
+command -v nginx >/dev/null 2>&1 || { echo "На этой ноде Nginx не найден; этот установщик рассчитан на существующий Nginx-vhost." >&2; exit 1; }
+command -v python3 >/dev/null 2>&1 || { echo "Нужен python3 для безопасного редактирования Nginx-конфигурации." >&2; exit 1; }
+command -v docker >/dev/null 2>&1 || {
+  if command -v apt-get >/dev/null 2>&1; then
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update
+    apt-get install -y docker.io
+    systemctl enable --now docker
+  else
+    echo "Docker отсутствует; установи Docker Engine на Ubuntu/Debian и запусти этот файл повторно." >&2
+    exit 1
+  fi
+}
+systemctl is-active --quiet docker || systemctl start docker
+REUSE_SFTPGO=no
+if docker inspect sftpgo >/dev/null 2>&1; then
+  EXISTING_IMAGE="$(docker inspect -f '{{.Config.Image}}' sftpgo 2>/dev/null || true)"
+  if [[ "$EXISTING_IMAGE" == *sftpgo* ]] && docker port sftpgo 8080/tcp 2>/dev/null | grep -Fxq '127.0.0.1:8080'; then
+    REUSE_SFTPGO=yes
+    docker start sftpgo >/dev/null
+    echo "Найден существующий SFTPGo с безопасной привязкой Web UI к localhost:8080; переиспользую его без замены контейнера/данных."
+  else
+    echo "Контейнер sftpgo уже существует, но это не подтверждённый SFTPGo с Web UI на 127.0.0.1:8080. Отказ от изменений." >&2
+    exit 1
+  fi
+fi
+if [[ "$REUSE_SFTPGO" != yes && -d /opt/sftpgo ]] && find /opt/sftpgo -type f -print -quit | grep -q .; then
+  echo "/opt/sftpgo уже содержит файлы. Отказ от перезаписи существующих данных." >&2
+  exit 1
+fi
+NGINX_CONF="${PSV1_NGINX_CONF:-}"
+if [[ -z "$NGINX_CONF" ]]; then
+  read -r -p "Nginx vhost-файл [ /etc/nginx/sites-available/default ]: " NGINX_CONF
+  NGINX_CONF="${NGINX_CONF:-/etc/nginx/sites-available/default}"
+fi
+[[ -f "$NGINX_CONF" ]] || { echo "Файл Nginx не найден: $NGINX_CONF" >&2; exit 1; }
+nginx -t >/dev/null || { echo "Текущая конфигурация Nginx уже ошибочна; сначала исправь её." >&2; exit 1; }
+if [[ "$REUSE_SFTPGO" != yes ]]; then
+  mkdir -p /opt/sftpgo/data /opt/sftpgo/config
+  IMAGE="${PSV1_SFTPGO_IMAGE:-drakkan/sftpgo:latest}"
+  docker pull "$IMAGE"
+  docker run -d --name sftpgo --restart unless-stopped \
+    -p 127.0.0.1:8080:8080 -p 0.0.0.0:2022:2022 \
+    -v /opt/sftpgo/data:/srv/sftpgo \
+    -v /opt/sftpgo/config:/var/lib/sftpgo \
+    "$IMAGE"
+fi
+
+BACKUP="${NGINX_CONF}.before-sftpgo-$(date +%Y%m%d-%H%M%S)"
+cp -p "$NGINX_CONF" "$BACKUP"
+if ! python3 - "$NGINX_CONF" "$ORIGIN_DOMAIN" <<'PY'
+import pathlib, re, sys
+filename, domain = sys.argv[1:]
+p = pathlib.Path(filename)
+text = p.read_text(encoding="utf-8")
+
+def blocks(source, keyword):
+    found=[]
+    for m in re.finditer(r"(?m)^[ \t]*"+re.escape(keyword)+r"\b[^\n]*\{\s*$", source):
+        start=source.find("{", m.start()); depth=0; quote=None; escaped=False; comment=False
+        for i in range(start, len(source)):
+            c=source[i]
+            if comment:
+                if c=="\n": comment=False
+                continue
+            if quote:
+                if escaped: escaped=False
+                elif c=="\\": escaped=True
+                elif c==quote: quote=None
+                continue
+            if c=="#": comment=True
+            elif c in ("'", '"'): quote=c
+            elif c=="{": depth+=1
+            elif c=="}":
+                depth-=1
+                if depth==0:
+                    found.append((m.start(), i+1, source[m.start():i+1])); break
+    return found
+
+servers=[]
+for start, stop, block in blocks(text, "server"):
+    listen=re.findall(r"(?m)^\s*listen\s+([^;]+);", block)
+    if not any(re.match(r"(?:\[::\]:)?(?:80|443)\b", v.strip()) for v in listen): continue
+    names=re.search(r"(?m)^\s*server_name\s+([^;]+);", block)
+    if not names: continue
+    candidates=[b for b in blocks(block, "location") if re.match(r"location\s+/\s*\{", b[2].strip())]
+    if not candidates: continue
+    name_list=names.group(1).split()
+    default=any("default_server" in v.split() for v in listen) and "_" in name_list
+    loc=candidates[0]
+    global_loc=(start+loc[0], start+loc[1], loc[2])
+    if domain in name_list: servers.append((start, stop, block, global_loc, True))
+    elif default: servers.append((start, stop, block, global_loc, False))
+exact=[x for x in servers if x[4]]
+chosen=exact or [x for x in servers if not x[4]]
+if not chosen: raise SystemExit(f"no exact server_name {domain} or default_server vhost with location / in {filename}")
+replacement='''    location / {
+        proxy_pass http://127.0.0.1:8080;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header Connection "";
+        proxy_read_timeout 1h;
+        proxy_send_timeout 1h;
+    }'''
+for _,_,_,loc,_ in sorted(chosen, key=lambda x:x[3][0], reverse=True):
+    a,b,_=loc; text=text[:a]+replacement+text[b:]
+p.write_text(text, encoding="utf-8")
+PY
+then
+  cp -p "$BACKUP" "$NGINX_CONF"
+  echo "Не найден безопасный Nginx server/location /. Конфигурация восстановлена; установленный SFTPGo-контейнер оставлен без изменений." >&2
+  exit 1
+fi
+if ! nginx -t; then
+  cp -p "$BACKUP" "$NGINX_CONF"
+  nginx -t >/dev/null 2>&1 && systemctl reload nginx >/dev/null 2>&1 || true
+  echo "Nginx отклонил изменение; конфигурация восстановлена из $BACKUP. SFTPGo оставлен установленным." >&2
+  exit 1
+fi
+systemctl reload nginx
+if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q '^Status: active'; then
+  ufw allow 2022/tcp comment 'SFTPGo SFTP' >/dev/null
+fi
+APPLY_FILE="$(dirname "$(readlink -f "$0")")/APPLY-ON-NODE.sh"
+if [[ -f "$APPLY_FILE" ]]; then
+  if ! PSV1_PROXY_KIND=nginx PSV1_NGINX_CONF="$NGINX_CONF" bash "$APPLY_FILE"; then
+    echo "SFTPGo установлен и корневой сайт направлен на него, но XHTTP-маршрут не применён." >&2
+    echo "После появления inbound на порту $XHTTP_PORT запусти отдельно: PSV1_PROXY_KIND=nginx PSV1_NGINX_CONF='$NGINX_CONF' bash APPLY-ON-NODE.sh" >&2
+  fi
+else
+  echo "SFTPGo установлен. APPLY-ON-NODE.sh не найден рядом — запусти его отдельно, чтобы добавить XHTTP-маршрут." >&2
+fi
+echo
+echo "SFTPGo установлен; данные: /opt/sftpgo; Web UI доступен только локально на 127.0.0.1:8080; SFTP: порт 2022."
+echo "Первичная настройка администратора: https://${ORIGIN_DOMAIN}/web/admin/setup"
+echo "Резервная копия Nginx: $BACKUP"
+NODE_INSTALLER
   } > "$file"
   chmod 700 "$file"
 }
@@ -3042,6 +3219,8 @@ $relay_proxy_note
 6. На relay запусти автонастройку существующего Caddy или nginx:
    PSV1_ROUTE_PATH='$cascade_path' $INSTALL_PATH --node-proxy-route '$method' '${ORIGIN_DOMAIN:-$CDN_DOMAIN}' '${relay_port}'
 EOF
+  cp -p "$INSTALL_PATH" "$run_dir/PANEL-SCRIPT-ON-NODE.sh"
+  chmod 700 "$run_dir/PANEL-SCRIPT-ON-NODE.sh"
   write_apply_proxy_route_script "$run_dir/APPLY-ON-RELAY.sh" "$method" "${ORIGIN_DOMAIN:-$CDN_DOMAIN}" "$relay_port" "$cascade_path"
 
   : > "$run_dir/EXIT-STEPS.txt"
@@ -3296,7 +3475,9 @@ run_remna_panel_manager(){
   method=$(rm_manager_choose_method) || exit 0
   node_listen_ip=$(rm_manager_choose_proxy_listen_ip) || return 0
   rm_manager_collect_domains "$method"
-  ask_yes_no USE_CLOUDFLARE "Использовать Cloudflare для DNS-записей там, где это применимо?" "${USE_CLOUDFLARE:-yes}"
+  if [[ "$method" != yandex_music ]]; then
+    ask_yes_no USE_CLOUDFLARE "Использовать Cloudflare для DNS-записей там, где это применимо?" "${USE_CLOUDFLARE:-yes}"
+  fi
   save_state
   show_provider_preflight "$method" "$node_ip"
   ask_yes_no RM_CONTINUE_AFTER_PREP "Продолжить автоматическую настройку Remnawave?" "yes"
@@ -3330,7 +3511,12 @@ Security: TLS
 Inbound tag: $tag
 EOF
   rm_manager_provider_steps "$method" "$node_ip" "$run_dir/provider-steps.txt"
+  cp -p "$INSTALL_PATH" "$run_dir/PANEL-SCRIPT-ON-NODE.sh"
+  chmod 700 "$run_dir/PANEL-SCRIPT-ON-NODE.sh"
   write_apply_proxy_route_script "$run_dir/APPLY-ON-NODE.sh" "$method" "${ORIGIN_DOMAIN:-$CDN_DOMAIN}" "$(rm_method_meta "$method" port)"
+  if [[ "${ORIGIN_TYPE:-}" == sftpgo_install ]]; then
+    write_sftpgo_node_installer "$run_dir/INSTALL-SFTPGO-ON-NODE.sh" "$method" "${ORIGIN_DOMAIN:-$CDN_DOMAIN}" "$(rm_method_meta "$method" port)"
+  fi
 
   cat > "$run_dir/NEXT-STEPS.txt" <<EOF
 ПАНЕЛЬ REMNAWAVE — обязательная цепочка для $(method_title "$method")
@@ -3365,12 +3551,13 @@ EOF
    Пользователей массово туда НЕ переносит без отдельного подтверждения.
 
 8. CDN-провайдер
-   Выполнить: $run_dir/provider-steps.txt
+   Для Yandex Cloud XHTTP Music никаких действий в кабинете нет; для остальных методов см. $run_dir/provider-steps.txt.
 
 9. Reverse proxy на выбранной Node — обязательно до проверки CDN
-   Передай APPLY-ON-NODE.sh на выбранную Node и запусти: bash APPLY-ON-NODE.sh
-   Файл добавляет только XHTTP-маршрут на порт $(rm_method_meta "$method" port) по пути $(rm_method_meta "$method" path); корень / не меняется.
-   Если выбран SFTPGo, он должен уже открываться на / через найденный Caddy/Nginx. Установщик не ставит SFTPGo и не угадывает его backend-порт.
+   Передай файлы APPLY-ON-NODE.sh и PANEL-SCRIPT-ON-NODE.sh на выбранную Node и запусти: bash APPLY-ON-NODE.sh
+   Файл добавляет XHTTP-маршрут на порт $(rm_method_meta "$method" port) по пути $(rm_method_meta "$method" path); корень / не меняется.
+   Если выбрано "Установить SFTPGo", вместо этого передай INSTALL-SFTPGO-ON-NODE.sh, APPLY-ON-NODE.sh и PANEL-SCRIPT-ON-NODE.sh и запусти: bash INSTALL-SFTPGO-ON-NODE.sh
+   Установщик SFTPGo рассчитан на Nginx-ноду, публикует веб-порт только на 127.0.0.1:8080, сохраняет данные в /opt/sftpgo и не перезаписывает уже существующий контейнер.
    Для Timeweb CDN обращается к публичному IP ноды:80 по HTTP; reverse proxy передаёт XHTTP-путь на локальный порт 10087.
 
 Проверка цепочки после активации:
