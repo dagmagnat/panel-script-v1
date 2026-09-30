@@ -6,12 +6,12 @@ IFS=$'\n\t'
 # Supported OS: Ubuntu 22.04 / 24.04
 # Panels:
 #   - 3x-ui compatibility branch: v3.3.1 (VK / Yandex / TurboFlare)
-#   - Remnawave: 3.3.0 manual-tested by default (all 6 CDN methods)
+#   - Remnawave: 3.3.0 manual-tested by default (7 CDN presets, including Yandex Music)
 #
 # This installer deliberately keeps each CDN preset separate. Do not mix fields
 # between providers: path/padding/uplink settings are provider-specific.
 
-INSTALLER_VERSION="1.4.8"
+INSTALLER_VERSION="1.4.9"
 STATE_SCHEMA_CURRENT="1"
 PRESET="${INSTALLER_PRESET:-}"
 
@@ -160,7 +160,7 @@ load_state(){
 
 method_title(){
   case "$1" in
-    vk) echo "VK Cloud" ;; yandex) echo "Yandex Cloud" ;; beeline) echo "Beeline CDN/CDNvideo" ;;
+    vk) echo "VK Cloud" ;; yandex) echo "Yandex Cloud" ;; yandex_music) echo "Yandex Cloud (XHTTP Music)" ;; beeline) echo "Beeline CDN/CDNvideo" ;;
     timeweb) echo "Timeweb CDN" ;; selectel) echo "Selectel CDN" ;; turboflare) echo "TurboFlare" ;;
     none) echo "Без CDN / нода для каскада" ;; *) echo "$1" ;;
   esac
@@ -212,13 +212,13 @@ nginx_foreign_enabled_sites(){
 method_port(){
   case "$PANEL_KIND:$METHOD" in
     3xui:vk) echo 2053 ;; 3xui:yandex) echo 4443 ;; 3xui:turboflare) echo 10089 ;;
-    remna:vk) echo 10085 ;; remna:yandex) echo 4443 ;; remna:beeline) echo 10086 ;; remna:timeweb) echo 10087 ;; remna:selectel) echo 10088 ;; remna:turboflare) echo 10089 ;;
+    remna:vk) echo 10085 ;; remna:yandex) echo 4443 ;; remna:yandex_music) echo 11443 ;; remna:beeline) echo 10086 ;; remna:timeweb) echo 10087 ;; remna:selectel) echo 10088 ;; remna:turboflare) echo 10089 ;;
     *) die "Неизвестная комбинация панели и метода." ;;
   esac
 }
 method_server_path(){
   case "$METHOD" in
-    vk) echo "/content/media/stream/" ;; yandex) echo "/uploadfiles/" ;; beeline|turboflare) echo "/static/getFile/video/segment.ts" ;;
+    vk) echo "/content/media/stream/" ;; yandex) echo "/uploadfiles/" ;; yandex_music) echo "/streaming/content/music" ;; beeline|turboflare) echo "/static/getFile/video/segment.ts" ;;
     timeweb) echo "/content/media/" ;; selectel) echo "/api/uploadFile/" ;;
   esac
 }
@@ -231,6 +231,7 @@ method_title(){
   case "${1,,}" in
     vk) echo "VK Cloud" ;;
     yandex) echo "Yandex Cloud" ;;
+    yandex_music) echo "Yandex Cloud (XHTTP Music)" ;;
     beeline) echo "Beeline / CDNvideo" ;;
     timeweb) echo "Timeweb" ;;
     selectel) echo "Selectel" ;;
@@ -663,18 +664,23 @@ rm_choose_multiple_nodes(){
 
 rm_method_inbound_json(){
   local method="$1" tag="$2" base
-  # Эти шесть пресетов повторяют соответствующие Remnawave-мануалы буквально.
-  # VK/Yandex держат параметры прямо в xhttpSettings; остальные четыре — в extra.
+  # Provider presets are kept separate because their XHTTP paths and headers differ.
+  # Most fields for this profile are stored directly in xhttpSettings.
   case "$method" in
     vk) base='{"tag":"cdn-stream","port":10085,"listen":"127.0.0.1","protocol":"vless","settings":{"clients":[],"decryption":"none"},"sniffing":{"enabled":true,"destOverride":["http","tls"]},"streamSettings":{"network":"xhttp","security":"none","xhttpSettings":{"host":"","mode":"packet-up","path":"/content/media/stream/","noSSEHeader":false,"xPaddingKey":"_token","xPaddingBytes":"16-64","xPaddingHeader":"X-Signature","xPaddingMethod":"tokenish","xPaddingObfsMode":true,"xPaddingPlacement":"query","uplinkHTTPMethod":"GET","uplinkDataPlacement":"body","scMaxBufferedPosts":50,"scMaxEachPostBytes":"500000-1000000","scMinPostsIntervalMs":"50-150","scStreamUpServerSecs":"60-180","serverMaxHeaderBytes":0,"xmux":{"cMaxReuseTimes":"0","maxConnections":"1","hKeepAlivePeriod":0,"hMaxRequestTimes":"300-600","hMaxReusableSecs":"900-1800"}}}}' ;;
     yandex) base='{"tag":"yasha","port":4443,"listen":"127.0.0.1","protocol":"vless","settings":{"clients":[],"decryption":"none"},"sniffing":{"enabled":true,"routeOnly":false,"destOverride":["http","tls","quic"]},"streamSettings":{"network":"xhttp","security":"none","xhttpSettings":{"mode":"packet-up","path":"/uploadfiles/","xPaddingKey":"_dc","xPaddingHeader":"X-Cache","xPaddingMethod":"tokenish","xPaddingObfsMode":true,"xPaddingPlacement":"queryInHeader","uplinkHTTPMethod":"get"}}}' ;;
+    yandex_music) base='{"tag":"cdn-yandex-music","port":11443,"listen":"127.0.0.1","protocol":"vless","settings":{"clients":[],"decryption":"none"},"sniffing":{"enabled":true,"destOverride":["http","tls","quic"]},"streamSettings":{"network":"xhttp","security":"none","xhttpSettings":{"path":"/streaming/content/music","host":"","mode":"packet-up","xPaddingBytes":"550-1450","xPaddingObfsMode":true,"xPaddingKey":"rid","xPaddingHeader":"X-Cache","xPaddingPlacement":"query","xPaddingMethod":"tokenish","sessionIDPlacement":"","sessionIDKey":"","sessionIDTable":"","sessionIDLength":"","seqPlacement":"header","seqKey":"X-Session-Token","uplinkDataPlacement":"header","uplinkDataKey":"X-Data","scMaxEachPostBytes":"524288-1048576","noSSEHeader":true,"scMaxBufferedPosts":30,"scStreamUpServerSecs":"20-80","serverMaxHeaderBytes":0,"uplinkHTTPMethod":"GET","headers":{},"scMinPostsIntervalMs":"","uplinkChunkSize":0,"noGRPCHeader":false,"xmux":{"maxConcurrency":"8-16","maxConnections":0,"cMaxReuseTimes":0,"hMaxRequestTimes":"600-900","hMaxReusableSecs":"1800-3000","hKeepAlivePeriod":0},"enableXmux":true}}}' ;;
     beeline) base='{"tag":"cdn-beeline","port":10086,"listen":"127.0.0.1","protocol":"vless","settings":{"clients":[],"decryption":"none"},"sniffing":{"enabled":true,"destOverride":["http","tls","quic"]},"streamSettings":{"network":"xhttp","security":"none","xhttpSettings":{"mode":"packet-up","path":"/static/getFile/video/segment.ts","extra":{"xmux":{"maxConcurrency":"1"},"seqKey":"chunk_id","sessionKey":"auth","noSSEHeader":true,"noGRPCHeader":true,"seqPlacement":"query","sessionIDKey":"auth","sessionIDLength":"16-32","sessionPlacement":"query","sessionIDPlacement":"query","xPaddingBytes":"50-150","xPaddingMethod":"tokenish","xPaddingObfsMode":true,"xPaddingPlacement":"header","uplinkHTTPMethod":"GET","uplinkDataPlacement":"body","scMaxBufferedPosts":100,"scMaxEachPostBytes":3000000,"scMinPostsIntervalMs":"5-10","serverMaxHeaderBytes":32768}}}}' ;;
     timeweb) base='{"tag":"cdn-timeweb","port":10087,"listen":"127.0.0.1","protocol":"vless","settings":{"clients":[],"decryption":"none"},"sniffing":{"enabled":true,"destOverride":["http","tls","quic"]},"streamSettings":{"network":"xhttp","security":"none","xhttpSettings":{"mode":"packet-up","path":"/content/media/","extra":{"sessionIDPlacement":"query","sessionIDKey":"sid","seqPlacement":"query","seqKey":"offset","noSSEHeader":false,"uplinkHTTPMethod":"GET","uplinkDataPlacement":"header","uplinkDataKey":"X-Playback-Token","xPaddingKey":"q","xPaddingBytes":"48-256","xPaddingMethod":"tokenish","xPaddingObfsMode":true,"xPaddingPlacement":"query","scMaxEachPostBytes":"4096-16384","scMinPostsIntervalMs":"1-8","serverMaxHeaderBytes":32768}}}}' ;;
     selectel) base='{"tag":"cdn-selectel","port":10088,"listen":"127.0.0.1","protocol":"vless","settings":{"clients":[],"decryption":"none"},"sniffing":{"enabled":true,"destOverride":["http","tls","quic"]},"streamSettings":{"network":"xhttp","security":"none","xhttpSettings":{"mode":"packet-up","path":"/api/uploadFile/","extra":{"seqKey":"page","seqPlacement":"query","noSSEHeader":false,"sessionIDKey":"X-Request-Id","sessionIDPlacement":"header","uplinkHTTPMethod":"POST","uplinkDataKey":"X-Payload","uplinkDataPlacement":"body","xPaddingKey":"q","xPaddingBytes":"80-240","xPaddingMethod":"tokenish","xPaddingObfsMode":true,"xPaddingPlacement":"query","scMaxEachPostBytes":"65536-262144","scMinPostsIntervalMs":"20-50","serverMaxHeaderBytes":32768}}}}' ;;
     turboflare) base='{"tag":"cdn-turboflare","port":10089,"listen":"127.0.0.1","protocol":"vless","settings":{"clients":[],"decryption":"none"},"sniffing":{"enabled":true,"destOverride":["http","tls","quic"]},"streamSettings":{"network":"xhttp","security":"none","xhttpSettings":{"mode":"packet-up","path":"/static/getFile/video/segment.ts","extra":{"xmux":{"maxConcurrency":"1"},"seqKey":"chunk_id","sessionKey":"auth","noSSEHeader":true,"noGRPCHeader":true,"seqPlacement":"query","sessionIDKey":"auth","sessionPlacement":"query","sessionIDPlacement":"query","xPaddingBytes":"50-150","xPaddingMethod":"tokenish","xPaddingObfsMode":true,"xPaddingPlacement":"header","uplinkHTTPMethod":"GET","uplinkDataPlacement":"body","scMaxBufferedPosts":100,"scMaxEachPostBytes":3000000,"scMinPostsIntervalMs":"5-10","serverMaxHeaderBytes":32768}}}}' ;;
     *) return 1 ;;
   esac
-  jq -c --arg tag "$tag" '.tag=$tag' <<<"$base"
+  if [[ "$method" == yandex_music ]]; then
+    jq -c --arg tag "$tag" --arg host "${CDN_DOMAIN:-}" '.tag=$tag | .streamSettings.xhttpSettings.host=$host' <<<"$base"
+  else
+    jq -c --arg tag "$tag" '.tag=$tag' <<<"$base"
+  fi
 }
 
 rm_method_host_extra_json(){
@@ -687,6 +693,9 @@ rm_method_host_extra_json(){
       # В Yandex-мануале xhttpExtraParams — 7 полей, включая mode.
       jq -nc --argjson x "$(jq -c '.streamSettings.xhttpSettings' <<<"$inbound")" '$x | {mode,xPaddingKey,xPaddingHeader,xPaddingMethod,xPaddingObfsMode,xPaddingPlacement,uplinkHTTPMethod}'
       ;;
+    yandex_music)
+      jq -nc --argjson x "$(jq -c '.streamSettings.xhttpSettings' <<<"$inbound")" '$x | {mode,xPaddingBytes,xPaddingObfsMode,xPaddingKey,xPaddingHeader,xPaddingPlacement,xPaddingMethod,sessionIDPlacement,sessionIDKey,sessionIDTable,sessionIDLength,seqPlacement,seqKey,uplinkDataPlacement,uplinkDataKey,scMaxEachPostBytes,noSSEHeader,scMaxBufferedPosts,scStreamUpServerSecs,serverMaxHeaderBytes,uplinkHTTPMethod,headers,scMinPostsIntervalMs,uplinkChunkSize,noGRPCHeader,xmux,enableXmux}'
+      ;;
     *) jq -c '.streamSettings.xhttpSettings.extra' <<<"$inbound" ;;
   esac
 }
@@ -696,6 +705,7 @@ rm_method_meta(){
   case "$method:$key" in
     vk:path) echo '/content/media/stream/' ;; vk:port) echo 10085 ;; vk:alpn) echo 'h2' ;; vk:fp) echo 'firefox' ;;
     yandex:path) echo '/uploadfiles/' ;; yandex:port) echo 4443 ;; yandex:alpn) echo 'h3,h2,http/1.1' ;; yandex:fp) echo 'random' ;;
+    yandex_music:path) echo '/streaming/content/music' ;; yandex_music:port) echo 11443 ;; yandex_music:alpn) echo 'h2,http/1.1' ;; yandex_music:fp) echo 'random' ;;
     beeline:path) echo '/static/getFile/video/segment.ts' ;; beeline:port) echo 10086 ;; beeline:alpn) echo 'h2' ;; beeline:fp) echo 'firefox' ;;
     timeweb:path) echo '/content/media/stream.m3u8' ;; timeweb:port) echo 10087 ;; timeweb:alpn) echo 'h2,http/1.1' ;; timeweb:fp) echo 'random' ;;
     selectel:path) echo '/api/uploadFile/' ;; selectel:port) echo 10088 ;; selectel:alpn) echo 'h2' ;; selectel:fp) echo 'random' ;;
@@ -710,6 +720,8 @@ rm_method_cascade_path(){
   local method="$1"
   if [[ "$method" == yandex ]]; then
     echo '/uploadfiles-cascade/'
+  elif [[ "$method" == yandex_music ]]; then
+    echo '/streaming/content/music-cascade/'
   else
     rm_method_meta "$method" path
   fi
@@ -722,11 +734,11 @@ rm_method_cascade_path(){
 # /uploadfiles-cascade/).
 rm_validate_method_route(){
   local method="$1" route_path="$2" target_port="$3" direct_path direct_port
-  [[ "$method" == yandex ]] || return 0
-  direct_path=$(rm_method_meta yandex path)
-  direct_port=$(rm_method_meta yandex port)
+  [[ "$method" == yandex || "$method" == yandex_music ]] || return 0
+  direct_path=$(rm_method_meta "$method" path)
+  direct_port=$(rm_method_meta "$method" port)
   if [[ "$route_path" == "$direct_path" && "$target_port" != "$direct_port" ]]; then
-    die "Неоднозначный Yandex-маршрут: $route_path зарезервирован для прямого inbound :$direct_port. Для каскада используй отдельный path $(rm_method_cascade_path yandex) и его relay-порт :7445. Файл не изменён."
+    die "Неоднозначный Yandex-маршрут: $route_path зарезервирован для direct inbound :$direct_port. Для каскада используй отдельный path $(rm_method_cascade_path "$method") и его отдельный relay-порт. Файл не изменён."
   fi
 }
 
@@ -760,10 +772,11 @@ rm_manager_choose_method(){
   echo "  4 — Timeweb" >&2
   echo "  5 — Selectel" >&2
   echo "  6 — TurboFlare" >&2
+  echo "  7 — Yandex Cloud (новый XHTTP Music)" >&2
   echo "  0 — Назад" >&2
   while true; do
     read -r -p "Выбор [6]: " a; a="${a:-6}"
-    case "$a" in 1) echo vk; return ;; 2) echo yandex; return ;; 3) echo beeline; return ;; 4) echo timeweb; return ;; 5) echo selectel; return ;; 6) echo turboflare; return ;; 0) return 1 ;; esac
+    case "$a" in 1) echo vk; return ;; 2) echo yandex; return ;; 3) echo beeline; return ;; 4) echo timeweb; return ;; 5) echo selectel; return ;; 6) echo turboflare; return ;; 7) echo yandex_music; return ;; 0) return 1 ;; esac
   done
 }
 
@@ -853,6 +866,10 @@ rm_manager_collect_domains(){
     yandex)
       ask_domain ORIGIN_DOMAIN "Origin-домен ноды с HTTPS-сертификатом" "" "origin.example.net"
       ask_domain CDN_DOMAIN "Клиентский CDN-домен Yandex" "" "cdn.example.net"
+      ;;
+    yandex_music)
+      ask_domain ORIGIN_DOMAIN "Origin-домен ноды с HTTPS-сертификатом" "" "origin.example.net"
+      ask_domain CDN_DOMAIN "Клиентский CDN-домен Yandex Music" "" "cdn.example.net"
       ;;
     beeline)
       ask_domain ORIGIN_DOMAIN "Origin-домен ноды" "" "origin.example.net"
@@ -1162,6 +1179,11 @@ show_provider_preflight(){
       user_prepare "CDN resource: origin=${ORIGIN_DOMAIN}, HTTPS, ручной SNI=${ORIGIN_DOMAIN}, Host=${ORIGIN_DOMAIN}, домен раздачи=${CDN_DOMAIN}."
       user_prepare "Cache CDN/browser OFF; query НЕ игнорировать; compression OFF; verify origin certificate OFF."
       ;;
+    yandex_music)
+      user_prepare "Yandex Certificate Manager: выпустить сертификат для ${CDN_DOMAIN}; origin HTTPS, Host/SNI=${ORIGIN_DOMAIN}."
+      user_prepare "Кэш и сжатие выключить; query-параметры и заголовки X-Cache, X-Session-Token, X-Data передавать; GET разрешить."
+      user_prepare "Путь ${CLIENT_PATH} передавать без rewrite; новый inbound слушает локальный порт 11443."
+      ;;
     beeline)
       user_prepare "CDNvideo/Beeline: создать ресурс 'Статика' с origin ${ORIGIN_DOMAIN}:443, HTTPS ON, verify certificate OFF, SNI=${ORIGIN_DOMAIN}."
       user_prepare "Host пересылать; cache OFF; query учитывать; HTTP/2 ON; rewrite /static/getFile/video/segment.ts/ -> /static/getFile/video/segment.ts."
@@ -1270,6 +1292,11 @@ rm_manager_provider_steps(){
         echo "Источник: ${ORIGIN_DOMAIN} по HTTPS; ручной SNI/Host=${ORIGIN_DOMAIN}; CDN-домен=${CDN_DOMAIN}."
         echo "Кэш CDN/браузера выключить, query не игнорировать, compression выключить, verify origin выключить."
         ;;
+      yandex_music)
+        echo "Yandex CDN: origin ${ORIGIN_DOMAIN}:443 по HTTPS; SNI и Host origin=${ORIGIN_DOMAIN}; клиентский CDN-домен=${CDN_DOMAIN}."
+        echo "Кэш/сжатие выключить, query и X-Cache/X-Session-Token/X-Data передавать, GET разрешить; path ${CLIENT_PATH} не переписывать."
+        echo "Локальный Xray inbound слушает :11443; CDN должен ходить на публичный TLS origin :443, не на :11443."
+        ;;
       beeline)
         echo "Источник: ${ORIGIN_DOMAIN}:443, HTTPS ВКЛ, SNI=${ORIGIN_DOMAIN}, cache OFF, query учитывать."
         echo "Rewrite на CDN: /static/getFile/video/segment.ts/ -> /static/getFile/video/segment.ts; HTTP2 ВКЛ."
@@ -1314,7 +1341,7 @@ write_apply_proxy_route_script(){
 run_node_caddy_route(){
   local method="${1:-}" domain="${2:-}" target_port="${3:-}" caddyfile="${4:-/opt/e-cloudfiles/Caddyfile}"
   local container="${PSV1_CADDY_CONTAINER:-e-cloudfiles-caddy-1}" path gateway backup safe python_bin route_key
-  case "$method" in vk|yandex|beeline|timeweb|selectel|turboflare) ;; *) die "Метод для --node-caddy-route: vk|yandex|beeline|timeweb|selectel|turboflare" ;; esac
+  case "$method" in vk|yandex|yandex_music|beeline|timeweb|selectel|turboflare) ;; *) die "Метод для --node-caddy-route: vk|yandex|yandex_music|beeline|timeweb|selectel|turboflare" ;; esac
   valid_domain "$domain" || die "Некорректный домен origin/cover: $domain"
   [[ "$target_port" =~ ^[0-9]+$ ]] && (( target_port >= 1 && target_port <= 65535 )) || die "Некорректный локальный порт XHTTP."
   [[ -f "$caddyfile" ]] || die "Caddyfile не найден: $caddyfile"
@@ -1449,7 +1476,7 @@ PY
 run_node_nginx_route(){
   local method="${1:-}" domain="${2:-}" target_port="${3:-}" conf="${4:-/etc/nginx/sites-available/cdn-origin.conf}"
   local path backup python_bin route_key
-  case "$method" in vk|yandex|beeline|timeweb|selectel|turboflare) ;; *) die "Метод для --node-nginx-route: vk|yandex|beeline|timeweb|selectel|turboflare" ;; esac
+  case "$method" in vk|yandex|yandex_music|beeline|timeweb|selectel|turboflare) ;; *) die "Метод для --node-nginx-route: vk|yandex|yandex_music|beeline|timeweb|selectel|turboflare" ;; esac
   valid_domain "$domain" || die "Некорректный домен origin/cover: $domain"
   [[ "$target_port" =~ ^[0-9]+$ ]] && (( target_port >= 1 && target_port <= 65535 )) || die "Некорректный локальный порт XHTTP."
   [[ -f "$conf" ]] || die "nginx-конфигурация не найдена: $conf"
@@ -2030,6 +2057,7 @@ rm_method_relay_port(){
     turboflare) echo 7443 ;;
     beeline) echo 7444 ;;
     yandex) echo 7445 ;;
+    yandex_music) echo 7449 ;;
     vk) echo 7446 ;;
     timeweb) echo 7447 ;;
     selectel) echo 7448 ;;
@@ -2681,7 +2709,7 @@ run_remna_cascade_manager(){
     if local_remna_panel_present && [[ -n "$panel_public_ip" && "$relay_addr_ip" == "$panel_public_ip" ]]; then
       relay_on_panel=yes
       danger "Выбранный relay находится на ЭТОМ ЖЕ VPS, где работает Remnawave-панель."
-      manual_do "Не запускай отдельный Caddy на :80/:443 — он конфликтует с nginx панели. Для origin используй отдельный server_name в существующем nginx -> method-specific relay port 7443–7448."
+      manual_do "Не запускай отдельный Caddy на :80/:443 — он конфликтует с nginx панели. Для origin используй отдельный server_name в существующем nginx -> method-specific relay port 7443–7449."
     fi
 
     while true; do
@@ -3624,13 +3652,14 @@ choose_method(){
     echo "  4 — Timeweb"
     echo "  5 — Selectel"
     echo "  6 — TurboFlare"
-    if [[ "${REMNA_ROLE:-}" == both ]]; then
-      echo "  7 — БЕЗ CDN — только нода для каскада (relay/exit)"
+    echo "  7 — Yandex Cloud (XHTTP Music)"
+    if [[ "${REMNA_ROLE:-}" == both ]] || { [[ "${REMNA_ROLE:-}" == node ]] && local_remna_panel_present; }; then
+      echo "  8 — БЕЗ CDN — только нода для каскада (relay/exit)"
     fi
     echo "  0 — назад"
     local default_method=6
     if [[ "${REMNA_ROLE:-}" == node ]] && local_remna_panel_present; then
-      default_method=7
+      default_method=8
       user_prepare "На этом VPS уже обнаружена Remnawave-панель: безопасный выбор по умолчанию — служебная нода БЕЗ CDN."
     fi
     while true; do
@@ -3642,7 +3671,8 @@ choose_method(){
         4) METHOD=timeweb; return 0 ;;
         5) METHOD=selectel; return 0 ;;
         6) METHOD=turboflare; return 0 ;;
-        7) if [[ "${REMNA_ROLE:-}" == both ]]; then METHOD=none; return 0; fi ;;
+        7) METHOD=yandex_music; return 0 ;;
+        8) if [[ "${REMNA_ROLE:-}" == both ]] || { [[ "${REMNA_ROLE:-}" == node ]] && local_remna_panel_present; }; then METHOD=none; return 0; fi ;;
         0) return 1 ;;
       esac
     done
@@ -3737,6 +3767,10 @@ collect_config(){
     yandex)
       ask_domain ORIGIN_DOMAIN "Origin-домен с HTTPS-сертификатом" "$ORIGIN_DOMAIN" "origin.example.net"
       ask_domain CDN_DOMAIN "Клиентский CDN-домен Yandex" "$CDN_DOMAIN" "cdn.example.net"
+      ;;
+    yandex_music)
+      ask_domain ORIGIN_DOMAIN "Origin-домен с HTTPS-сертификатом" "$ORIGIN_DOMAIN" "origin.example.net"
+      ask_domain CDN_DOMAIN "Клиентский CDN-домен Yandex Music" "$CDN_DOMAIN" "cdn.example.net"
       ;;
     beeline)
       ask_domain ORIGIN_DOMAIN "Origin-домен с HTTPS-сертификатом" "$ORIGIN_DOMAIN" "origin.example.net"
@@ -4743,6 +4777,7 @@ remna_default_tag(){
   case "$METHOD" in
     vk) echo "cdn-stream" ;;
     yandex) echo "yasha" ;;
+    yandex_music) echo "cdn-yandex-music" ;;
     beeline) echo "cdn-beeline" ;;
     timeweb) echo "cdn-timeweb" ;;
     selectel) echo "cdn-selectel" ;;
@@ -4766,6 +4801,7 @@ remna_host_values(){
   case "$METHOD" in
     vk) alpn="h2"; fp="firefox" ;;
     yandex) alpn="h3,h2,http/1.1"; fp="random" ;;
+    yandex_music) alpn="h2,http/1.1"; fp="random" ;;
     beeline) alpn="h2"; fp="firefox" ;;
     timeweb) alpn="h2,http/1.1"; fp="random" ;;
     selectel) alpn="h2"; fp="random" ;;
@@ -4786,7 +4822,7 @@ EOF
 generate_remna_templates(){
   local inbound extra dns
   inbound=$(remna_inbound_json); extra=$(remna_host_extra_json)
-  if [[ "$METHOD" == yandex ]]; then dns='{"queryStrategy":"UseIPv4","servers":[{"address":"8.8.8.8","skipFallback":false}]}' ; else dns='{"queryStrategy":"UseIPv4","servers":[{"address":"1.1.1.1","skipFallback":false},{"address":"1.0.0.1","skipFallback":false}]}' ; fi
+  if [[ "$METHOD" == yandex || "$METHOD" == yandex_music ]]; then dns='{"queryStrategy":"UseIPv4","servers":[{"address":"8.8.8.8","skipFallback":false}]}' ; else dns='{"queryStrategy":"UseIPv4","servers":[{"address":"1.1.1.1","skipFallback":false},{"address":"1.0.0.1","skipFallback":false}]}' ; fi
   jq -n --argjson inbound "$inbound" --argjson dns "$dns" '{log:{loglevel:"warning"},dns:$dns,inbounds:[$inbound],outbounds:[{tag:"DIRECT",protocol:"freedom",settings:{domainStrategy:"UseIPv4"}},{tag:"BLOCK",protocol:"blackhole"}],routing:{domainStrategy:"IPIfNonMatch",rules:[{type:"field",ip:["geoip:private"],outboundTag:"BLOCK"},{type:"field",protocol:["bittorrent"],outboundTag:"BLOCK"}]}}' > "$OUT_DIR/remnawave-profile-${METHOD}.json"
   printf '%s\n' "$extra" | jq . > "$OUT_DIR/remnawave-host-extra-${METHOD}.json"
   remna_host_values > "$OUT_DIR/remnawave-host-${METHOD}.txt"
@@ -5063,6 +5099,11 @@ provider_steps(){
         echo "Источник: ${ORIGIN_DOMAIN}, HTTPS; SNI вручную=${ORIGIN_DOMAIN}; Host=${ORIGIN_DOMAIN}."
         echo "Для ${CDN_DOMAIN} выпустить сертификат в Certificate Manager (DNS validation)."
         echo "Кэш CDN и браузера ВЫКЛ; query НЕ игнорировать; compression ВЫКЛ; проверку сертификата origin ВЫКЛ."
+        ;;
+      yandex_music)
+        echo "Источник: ${ORIGIN_DOMAIN}:443 по HTTPS; SNI и Host origin=${ORIGIN_DOMAIN}; CDN-домен=${CDN_DOMAIN}."
+        echo "Отключить кэш и сжатие; передавать query и заголовки X-Cache, X-Session-Token, X-Data; разрешить GET."
+        echo "Путь ${CLIENT_PATH} не переписывать. Публичный origin — TLS :443; Xray upstream на ноде — локальный :11443."
         ;;
       beeline)
         echo "panel.cdnvideo.ru: тип Статика; origin ${ORIGIN_DOMAIN}:443; HTTPS ВКЛ; verify cert ВЫКЛ; SNI=${ORIGIN_DOMAIN}."
