@@ -11,7 +11,7 @@ IFS=$'\n\t'
 # This installer deliberately keeps each CDN preset separate. Do not mix fields
 # between providers: path/padding/uplink settings are provider-specific.
 
-INSTALLER_VERSION="1.4.12"
+INSTALLER_VERSION="1.4.13"
 STATE_SCHEMA_CURRENT="1"
 PRESET="${INSTALLER_PRESET:-}"
 
@@ -1363,11 +1363,12 @@ write_apply_proxy_route_script(){
 }
 
 write_sftpgo_node_installer(){
-  local file="$1" method="$2" domain="$3" port="$4" apply_filename="${5:-APPLY-ON-NODE.sh}"
+  local file="$1" method="$2" domain="$3" port="$4" apply_filename="${5:-APPLY-ON-NODE.sh}" delivery_domain="${6:-}"
   {
     printf '%s\n' '#!/usr/bin/env bash' 'set -Eeuo pipefail'
     printf 'METHOD=%q\nORIGIN_DOMAIN=%q\nXHTTP_PORT=%q\n' "$method" "$domain" "$port"
     printf 'APPLY_FILENAME=%q\n' "$apply_filename"
+    printf 'DELIVERY_DOMAIN=%q\n' "$delivery_domain"
     cat <<'NODE_INSTALLER'
 [[ $EUID -eq 0 ]] || { echo "Запусти от root: sudo bash $0" >&2; exit 1; }
 command -v nginx >/dev/null 2>&1 || { echo "На этой ноде Nginx не найден; этот установщик рассчитан на существующий Nginx-vhost." >&2; exit 1; }
@@ -1402,8 +1403,58 @@ if [[ "$REUSE_SFTPGO" != yes && -d /opt/sftpgo ]] && find /opt/sftpgo -type f -p
 fi
 NGINX_CONF="${PSV1_NGINX_CONF:-}"
 if [[ -z "$NGINX_CONF" ]]; then
-  read -r -p "Nginx vhost-файл [ /etc/nginx/sites-available/default ]: " NGINX_CONF
-  NGINX_CONF="${NGINX_CONF:-/etc/nginx/sites-available/default}"
+  DETECTED_NGINX_CONF="$(python3 - "$ORIGIN_DOMAIN" "$DELIVERY_DOMAIN" 2>/dev/null <<'PY'
+import pathlib, re, subprocess, sys
+origin, delivery = sys.argv[1:]
+try:
+    text = subprocess.run(["nginx", "-T"], text=True, stdout=subprocess.PIPE,
+                          stderr=subprocess.STDOUT, check=False).stdout
+except OSError:
+    text = ""
+current = None
+files = {}
+for line in text.splitlines():
+    m = re.match(r"^# configuration file (.+):$", line)
+    if m:
+        current = pathlib.Path(m.group(1))
+        files.setdefault(current, [])
+    elif current is not None:
+        files[current].append(line)
+def server_blocks(source):
+    for m in re.finditer(r"(?m)^\s*server\s*\{", source):
+        start = source.find("{", m.start())
+        depth = 0
+        for i in range(start, len(source)):
+            if source[i] == "{": depth += 1
+            elif source[i] == "}":
+                depth -= 1
+                if depth == 0:
+                    yield source[m.start():i+1]
+                    break
+candidates = {delivery: [], origin: []}
+for path, lines in files.items():
+    source = "\n".join(lines)
+    for block in server_blocks(source):
+        names = re.search(r"(?m)^\s*server_name\s+([^;]+);", block)
+        if not names or not re.search(r"(?m)^\s*location\s+(?:=\s+/|/)\s*\{", block):
+            continue
+        listen = re.findall(r"(?m)^\s*listen\s+([^;]+);", block)
+        if listen and not any(re.match(r"(?:\[::\]:)?(?:80|443)\b", x.strip()) for x in listen):
+            continue
+        for host in candidates:
+            if host in names.group(1).split():
+                try: resolved = path.resolve(strict=True)
+                except OSError: resolved = path
+                if resolved not in candidates[host]: candidates[host].append(resolved)
+for host in (delivery, origin):
+    if candidates.get(host):
+        print(candidates[host][0])
+        break
+PY
+)"
+  NGINX_CONF="${DETECTED_NGINX_CONF:-/etc/nginx/sites-available/default}"
+  read -r -p "Nginx vhost-файл [$NGINX_CONF]: " NGINX_CONF_INPUT
+  NGINX_CONF="${NGINX_CONF_INPUT:-$NGINX_CONF}"
 fi
 [[ -f "$NGINX_CONF" ]] || { echo "Файл Nginx не найден: $NGINX_CONF" >&2; exit 1; }
 nginx -t >/dev/null || { echo "Текущая конфигурация Nginx уже ошибочна; сначала исправь её." >&2; exit 1; }
@@ -1420,9 +1471,9 @@ fi
 
 BACKUP="${NGINX_CONF}.before-sftpgo-$(date +%Y%m%d-%H%M%S)"
 cp -p "$NGINX_CONF" "$BACKUP"
-if ! python3 - "$NGINX_CONF" "$ORIGIN_DOMAIN" <<'PY'
+if ! python3 - "$NGINX_CONF" "$ORIGIN_DOMAIN" "$DELIVERY_DOMAIN" <<'PY'
 import pathlib, re, sys
-filename, domain = sys.argv[1:]
+filename, domain, delivery_domain = sys.argv[1:]
 p = pathlib.Path(filename)
 text = p.read_text(encoding="utf-8")
 
@@ -1467,7 +1518,7 @@ for start, stop, block in blocks(text, "server"):
     if exact_root:
         root=exact_root[0]
         root_global=(start+root[0], start+root[1], root[2])
-    if domain in name_list: servers.append((generic_global, root_global, True))
+    if domain in name_list or delivery_domain in name_list: servers.append((generic_global, root_global, True))
     elif default: servers.append((generic_global, root_global, False))
 exact=[x for x in servers if x[2]]
 chosen=exact or [x for x in servers if not x[2]]
@@ -1669,7 +1720,7 @@ PY
 # We migrate that one legacy route and use per-location targets for additional
 # methods.  A same-vhost/same-path collision is rejected explicitly: Beeline
 # and TurboFlare cannot point the identical URL to two different inbounds.
-run_node_nginx_route(){
+run_node_nginx_route_file(){
   local method="${1:-}" domain="${2:-}" target_port="${3:-}" conf="${4:-/etc/nginx/sites-available/cdn-origin.conf}"
   local path backup python_bin route_key
   case "$method" in vk|yandex|yandex_music|beeline|timeweb|selectel|turboflare) ;; *) die "Метод для --node-nginx-route: vk|yandex|yandex_music|beeline|timeweb|selectel|turboflare" ;; esac
@@ -1834,17 +1885,73 @@ PY
   echo "Backup: $backup"
 }
 
+# A single public XHTTP path may appear in several active vhosts/files (for
+# example HTTP default + HTTPS delivery-domain vhost). When APPLY-ON-RELAY has
+# no explicit file argument, update every active nginx source file containing
+# this managed route marker, rather than silently changing only one vhost.
+run_node_nginx_route(){
+  local method="${1:-}" domain="${2:-}" target_port="${3:-}" explicit="${4:-}"
+  local path route_key python_bin conf marker
+  local -a route_files=()
+  if [[ -n "$explicit" ]]; then
+    run_node_nginx_route_file "$method" "$domain" "$target_port" "$explicit"
+    return
+  fi
+  path="${PSV1_ROUTE_PATH:-$(rm_method_meta "$method" path)}"
+  route_key=$(printf '%s' "$path" | sha256sum | cut -c1-6 | tr '[:lower:]' '[:upper:]')
+  marker="# PSV1-${method^^}-${route_key}-ROUTE BEGIN"
+  python_bin="${PSV1_PYTHON:-$(command -v python3 2>/dev/null || command -v python 2>/dev/null || true)}"
+  [[ -n "$python_bin" ]] || die "Python 3 нужен для поиска активных Nginx-файлов."
+  if command -v nginx >/dev/null 2>&1; then
+    mapfile -t route_files < <("$python_bin" - "$marker" <<'PY'
+import pathlib, re, subprocess, sys
+marker = sys.argv[1]
+try:
+    proc = subprocess.run(["nginx", "-T"], text=True, stdout=subprocess.PIPE,
+                          stderr=subprocess.STDOUT, check=False)
+except OSError:
+    raise SystemExit(0)
+current = None
+found = []
+for line in proc.stdout.splitlines():
+    m = re.match(r"^# configuration file (.+):$", line)
+    if m:
+        current = pathlib.Path(m.group(1))
+        continue
+    if current is not None and marker in line:
+        try:
+            resolved = str(current.resolve(strict=True))
+        except OSError:
+            resolved = str(current)
+        if resolved not in found:
+            found.append(resolved)
+for item in found:
+    print(item)
+PY
+    )
+  fi
+  if (( ${#route_files[@]} > 0 )); then
+    for conf in "${route_files[@]}"; do
+      run_node_nginx_route_file "$method" "$domain" "$target_port" "$conf"
+    done
+  else
+    # For first-time installation there is no managed marker yet; retain the
+    # existing explicit/default-vhost discovery path.
+    run_node_nginx_route_file "$method" "$domain" "$target_port" "${PSV1_NGINX_CONF:-/etc/nginx/sites-available/cdn-origin.conf}"
+  fi
+}
+
 run_node_proxy_route(){
   local method="${1:-}" domain="${2:-}" target_port="${3:-}" explicit="${4:-}"
   local caddyfile="${PSV1_CADDYFILE:-/opt/e-cloudfiles/Caddyfile}" nginx_conf="${PSV1_NGINX_CONF:-/etc/nginx/sites-available/cdn-origin.conf}"
   case "${PSV1_PROXY_KIND:-auto}" in
     caddy) run_node_caddy_route "$method" "$domain" "$target_port" "${explicit:-$caddyfile}" ;;
-    nginx) run_node_nginx_route "$method" "$domain" "$target_port" "${explicit:-$nginx_conf}" ;;
+    nginx) run_node_nginx_route "$method" "$domain" "$target_port" "$explicit" ;;
     auto)
       if [[ -f "$caddyfile" ]] && command -v docker >/dev/null 2>&1 && docker inspect "${PSV1_CADDY_CONTAINER:-e-cloudfiles-caddy-1}" >/dev/null 2>&1; then
         run_node_caddy_route "$method" "$domain" "$target_port" "${explicit:-$caddyfile}"
-      elif [[ -f "$nginx_conf" ]] && command -v nginx >/dev/null 2>&1; then
-        run_node_nginx_route "$method" "$domain" "$target_port" "${explicit:-$nginx_conf}"
+      elif command -v nginx >/dev/null 2>&1; then
+        run_node_nginx_route "$method" "$domain" "$target_port" "$explicit"
       else
         die "Не найден поддерживаемый reverse proxy. Укажи PSV1_PROXY_KIND=caddy или nginx и путь четвёртым аргументом."
       fi
@@ -3241,9 +3348,9 @@ EOF
   chmod 700 "$run_dir/PANEL-SCRIPT-ON-NODE.sh"
   write_apply_proxy_route_script "$run_dir/APPLY-ON-RELAY.sh" "$method" "${ORIGIN_DOMAIN:-$CDN_DOMAIN}" "$relay_port" "$cascade_path"
   if [[ "${ORIGIN_TYPE:-}" == sftpgo_install ]]; then
-    write_sftpgo_node_installer "$run_dir/INSTALL-SFTPGO-ON-RELAY.sh" "$method" "${ORIGIN_DOMAIN:-$CDN_DOMAIN}" "$relay_port" "APPLY-ON-RELAY.sh"
+    write_sftpgo_node_installer "$run_dir/INSTALL-SFTPGO-ON-RELAY.sh" "$method" "${ORIGIN_DOMAIN:-$CDN_DOMAIN}" "$relay_port" "APPLY-ON-RELAY.sh" "$CDN_DOMAIN"
   elif [[ "${ORIGIN_TYPE:-}" == sftpgo ]]; then
-    write_sftpgo_node_installer "$run_dir/CONFIGURE-SFTPGO-ON-RELAY.sh" "$method" "${ORIGIN_DOMAIN:-$CDN_DOMAIN}" "$relay_port" "APPLY-ON-RELAY.sh"
+    write_sftpgo_node_installer "$run_dir/CONFIGURE-SFTPGO-ON-RELAY.sh" "$method" "${ORIGIN_DOMAIN:-$CDN_DOMAIN}" "$relay_port" "APPLY-ON-RELAY.sh" "$CDN_DOMAIN"
   fi
 
   : > "$run_dir/EXIT-STEPS.txt"
@@ -3545,9 +3652,9 @@ EOF
   chmod 700 "$run_dir/PANEL-SCRIPT-ON-NODE.sh"
   write_apply_proxy_route_script "$run_dir/APPLY-ON-NODE.sh" "$method" "${ORIGIN_DOMAIN:-$CDN_DOMAIN}" "$(rm_method_meta "$method" port)"
   if [[ "${ORIGIN_TYPE:-}" == sftpgo_install ]]; then
-    write_sftpgo_node_installer "$run_dir/INSTALL-SFTPGO-ON-NODE.sh" "$method" "${ORIGIN_DOMAIN:-$CDN_DOMAIN}" "$(rm_method_meta "$method" port)"
+    write_sftpgo_node_installer "$run_dir/INSTALL-SFTPGO-ON-NODE.sh" "$method" "${ORIGIN_DOMAIN:-$CDN_DOMAIN}" "$(rm_method_meta "$method" port)" "APPLY-ON-NODE.sh" "$CDN_DOMAIN"
   elif [[ "${ORIGIN_TYPE:-}" == sftpgo ]]; then
-    write_sftpgo_node_installer "$run_dir/CONFIGURE-SFTPGO-ON-NODE.sh" "$method" "${ORIGIN_DOMAIN:-$CDN_DOMAIN}" "$(rm_method_meta "$method" port)"
+    write_sftpgo_node_installer "$run_dir/CONFIGURE-SFTPGO-ON-NODE.sh" "$method" "${ORIGIN_DOMAIN:-$CDN_DOMAIN}" "$(rm_method_meta "$method" port)" "APPLY-ON-NODE.sh" "$CDN_DOMAIN"
   fi
 
   cat > "$run_dir/NEXT-STEPS.txt" <<EOF
