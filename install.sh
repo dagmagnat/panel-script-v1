@@ -11,7 +11,7 @@ IFS=$'\n\t'
 # This installer deliberately keeps each CDN preset separate. Do not mix fields
 # between providers: path/padding/uplink settings are provider-specific.
 
-INSTALLER_VERSION="1.4.14"
+INSTALLER_VERSION="1.4.15"
 STATE_SCHEMA_CURRENT="1"
 PRESET="${INSTALLER_PRESET:-}"
 
@@ -1790,7 +1790,7 @@ route_block = (
     f"        proxy_pass http://127.0.0.1:{port};\n"
     f"        proxy_http_version 1.1;\n"
     f"        proxy_set_header Connection \"\";\n"
-    f"        proxy_set_header Host $host;\n"
+    f"        proxy_set_header Host {domain if method == 'yandex_music' else '$host'};\n"
     f"        proxy_set_header X-Real-IP $remote_addr;\n"
     f"        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;\n"
     f"        proxy_set_header X-Forwarded-Proto $scheme;\n"
