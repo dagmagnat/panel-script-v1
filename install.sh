@@ -11,7 +11,7 @@ IFS=$'\n\t'
 # This installer deliberately keeps each CDN preset separate. Do not mix fields
 # between providers: path/padding/uplink settings are provider-specific.
 
-INSTALLER_VERSION="1.4.13"
+INSTALLER_VERSION="1.4.14"
 STATE_SCHEMA_CURRENT="1"
 PRESET="${INSTALLER_PRESET:-}"
 
@@ -1806,6 +1806,19 @@ route_block = (
     f"    }}\n"
     f"    {end}\n"
 )
+
+# The Yandex Music inbound's HTTP handler is mounted at the slash-terminated
+# base path even when the client-facing XHTTP path is configured without the
+# trailing slash. Preserve the advertised/public path, but normalize only the
+# exact base URI before proxying it to Xray. Longer XHTTP request paths and an
+# already slash-terminated path are passed through unchanged.
+if method == "yandex_music":
+    route_block = route_block.replace(
+        f"    location ^~ {route_path} {{\n",
+        f"    location ^~ {route_path} {{\n"
+        f"        rewrite ^({route_path})$ $1/ break;\n",
+        1,
+    )
 
 # Updating our own marked route is idempotent (normally two copies: HTTP/HTTPS).
 if begin in text:
