@@ -11,7 +11,7 @@ IFS=$'\n\t'
 # This installer deliberately keeps each CDN preset separate. Do not mix fields
 # between providers: path/padding/uplink settings are provider-specific.
 
-INSTALLER_VERSION="1.4.11"
+INSTALLER_VERSION="1.4.12"
 STATE_SCHEMA_CURRENT="1"
 PRESET="${INSTALLER_PRESET:-}"
 
@@ -884,7 +884,8 @@ rm_manager_collect_domains(){
       ask_optional_domain CDN_DOMAIN "Технический домен xxx.a.trbcdn.net (если ресурс ещё не создан — Enter)" "" "abc123.a.trbcdn.net"
       ;;
     timeweb)
-      ask_domain CDN_DOMAIN "Клиентский домен Timeweb" "" "cdn.example.net"
+      ask_domain CDN_DOMAIN "Домен раздачи Timeweb для клиента (не origin-источник; например file.amoredd.ru)" "" "cdn.example.net"
+      ask_optional_domain ORIGIN_DOMAIN "Origin-домен источника Timeweb, направленный на эту ноду (например cloud.amoredd.ru; Enter — использовать IP)" "" "origin.example.net"
       ;;
     selectel)
       ask_optional_domain ORIGIN_DOMAIN "Origin-домен (Enter = IP ноды)" "" "origin.example.net"
@@ -1362,10 +1363,11 @@ write_apply_proxy_route_script(){
 }
 
 write_sftpgo_node_installer(){
-  local file="$1" method="$2" domain="$3" port="$4"
+  local file="$1" method="$2" domain="$3" port="$4" apply_filename="${5:-APPLY-ON-NODE.sh}"
   {
     printf '%s\n' '#!/usr/bin/env bash' 'set -Eeuo pipefail'
     printf 'METHOD=%q\nORIGIN_DOMAIN=%q\nXHTTP_PORT=%q\n' "$method" "$domain" "$port"
+    printf 'APPLY_FILENAME=%q\n' "$apply_filename"
     cat <<'NODE_INSTALLER'
 [[ $EUID -eq 0 ]] || { echo "Запусти от root: sudo bash $0" >&2; exit 1; }
 command -v nginx >/dev/null 2>&1 || { echo "На этой ноде Nginx не найден; этот установщик рассчитан на существующий Nginx-vhost." >&2; exit 1; }
@@ -1453,18 +1455,25 @@ for start, stop, block in blocks(text, "server"):
     if not any(re.match(r"(?:\[::\]:)?(?:80|443)\b", v.strip()) for v in listen): continue
     names=re.search(r"(?m)^\s*server_name\s+([^;]+);", block)
     if not names: continue
-    candidates=[b for b in blocks(block, "location") if re.match(r"location\s+/\s*\{", b[2].strip())]
-    if not candidates: continue
+    locations=blocks(block, "location")
+    generic=[b for b in locations if re.match(r"location\s+/\s*\{", b[2].strip())]
+    exact_root=[b for b in locations if re.match(r"location\s+=\s+/\s*\{", b[2].strip())]
+    if not generic: continue
     name_list=names.group(1).split()
     default=any("default_server" in v.split() for v in listen) and "_" in name_list
-    loc=candidates[0]
-    global_loc=(start+loc[0], start+loc[1], loc[2])
-    if domain in name_list: servers.append((start, stop, block, global_loc, True))
-    elif default: servers.append((start, stop, block, global_loc, False))
-exact=[x for x in servers if x[4]]
-chosen=exact or [x for x in servers if not x[4]]
+    gen=generic[0]
+    generic_global=(start+gen[0], start+gen[1], gen[2])
+    root_global=None
+    if exact_root:
+        root=exact_root[0]
+        root_global=(start+root[0], start+root[1], root[2])
+    if domain in name_list: servers.append((generic_global, root_global, True))
+    elif default: servers.append((generic_global, root_global, False))
+exact=[x for x in servers if x[2]]
+chosen=exact or [x for x in servers if not x[2]]
 if not chosen: raise SystemExit(f"no exact server_name {domain} or default_server vhost with location / in {filename}")
-replacement='''    location / {
+def proxy_block(location):
+    return f'''    {location} {{
         proxy_pass http://127.0.0.1:8080;
         proxy_http_version 1.1;
         proxy_set_header Host $host;
@@ -1474,14 +1483,24 @@ replacement='''    location / {
         proxy_set_header Connection "";
         proxy_read_timeout 1h;
         proxy_send_timeout 1h;
-    }'''
-for _,_,_,loc,_ in sorted(chosen, key=lambda x:x[3][0], reverse=True):
-    a,b,_=loc; text=text[:a]+replacement+text[b:]
+    }}'''
+replacements=[]
+for generic_loc, exact_loc, is_exact in chosen:
+    a,b,_=generic_loc
+    replacements.append((a,b,proxy_block("location /")))
+    if exact_loc:
+        a,b,_=exact_loc
+        replacements.append((a,b,proxy_block("location = /")))
+    else:
+        a=generic_loc[0]
+        replacements.append((a,a,proxy_block("location = /")+"\n"))
+for a,b,replacement in sorted(replacements, key=lambda x:x[0], reverse=True):
+    text=text[:a]+replacement+text[b:]
 p.write_text(text, encoding="utf-8")
 PY
 then
   cp -p "$BACKUP" "$NGINX_CONF"
-  echo "Не найден безопасный Nginx server/location /. Конфигурация восстановлена; установленный SFTPGo-контейнер оставлен без изменений." >&2
+  echo "Не найден безопасный Nginx server_name $ORIGIN_DOMAIN/default_server с location /. Конфигурация восстановлена; SFTPGo-контейнер оставлен без изменений." >&2
   exit 1
 fi
 if ! nginx -t; then
@@ -1494,14 +1513,14 @@ systemctl reload nginx
 if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q '^Status: active'; then
   ufw allow 2022/tcp comment 'SFTPGo SFTP' >/dev/null
 fi
-APPLY_FILE="$(dirname "$(readlink -f "$0")")/APPLY-ON-NODE.sh"
+APPLY_FILE="$(dirname "$(readlink -f "$0")")/$APPLY_FILENAME"
 if [[ -f "$APPLY_FILE" ]]; then
   if ! PSV1_PROXY_KIND=nginx PSV1_NGINX_CONF="$NGINX_CONF" bash "$APPLY_FILE"; then
     echo "SFTPGo установлен и корневой сайт направлен на него, но XHTTP-маршрут не применён." >&2
-    echo "После появления inbound на порту $XHTTP_PORT запусти отдельно: PSV1_PROXY_KIND=nginx PSV1_NGINX_CONF='$NGINX_CONF' bash APPLY-ON-NODE.sh" >&2
+    echo "После появления inbound на порту $XHTTP_PORT запусти отдельно: PSV1_PROXY_KIND=nginx PSV1_NGINX_CONF='$NGINX_CONF' bash $APPLY_FILENAME" >&2
   fi
 else
-  echo "SFTPGo установлен. APPLY-ON-NODE.sh не найден рядом — запусти его отдельно, чтобы добавить XHTTP-маршрут." >&2
+  echo "SFTPGo установлен. $APPLY_FILENAME не найден рядом — запусти его отдельно, чтобы добавить XHTTP-маршрут." >&2
 fi
 echo
 echo "SFTPGo установлен; данные: /opt/sftpgo; Web UI доступен только локально на 127.0.0.1:8080; SFTP: порт 2022."
@@ -3216,12 +3235,16 @@ RELAY ($relay_name / $relay_ip)
 $relay_proxy_note
 4. Node management port разрешай только от IP панели.
 5. Режим exit: $exit_mode; strategy=$strategy; exits=$exit_count.
-6. На relay запусти автонастройку существующего Caddy или nginx:
-   PSV1_ROUTE_PATH='$cascade_path' $INSTALL_PATH --node-proxy-route '$method' '${ORIGIN_DOMAIN:-$CDN_DOMAIN}' '${relay_port}'
+6. Примени reverse-proxy маршрут на relay командой из комплекта APPLY-ON-RELAY.sh.
 EOF
   cp -p "$INSTALL_PATH" "$run_dir/PANEL-SCRIPT-ON-NODE.sh"
   chmod 700 "$run_dir/PANEL-SCRIPT-ON-NODE.sh"
   write_apply_proxy_route_script "$run_dir/APPLY-ON-RELAY.sh" "$method" "${ORIGIN_DOMAIN:-$CDN_DOMAIN}" "$relay_port" "$cascade_path"
+  if [[ "${ORIGIN_TYPE:-}" == sftpgo_install ]]; then
+    write_sftpgo_node_installer "$run_dir/INSTALL-SFTPGO-ON-RELAY.sh" "$method" "${ORIGIN_DOMAIN:-$CDN_DOMAIN}" "$relay_port" "APPLY-ON-RELAY.sh"
+  elif [[ "${ORIGIN_TYPE:-}" == sftpgo ]]; then
+    write_sftpgo_node_installer "$run_dir/CONFIGURE-SFTPGO-ON-RELAY.sh" "$method" "${ORIGIN_DOMAIN:-$CDN_DOMAIN}" "$relay_port" "APPLY-ON-RELAY.sh"
+  fi
 
   : > "$run_dir/EXIT-STEPS.txt"
   : > "$run_dir/VERIFY.txt"
@@ -3308,6 +3331,13 @@ EOF
   manual_do "ВАЖНО: обычные пользователи НЕ добавляются в PSV1-CASCADE автоматически. Добавь нужных пользователей в этот Internal Squad, иначе Cascade Host не появится в их подписке."
   [[ "$relay_on_panel" == yes && "$method" == turboflare ]] && auto_done "Локальный nginx frontend каскада проверен до изменений API."
   manual_do "Provider-side origin/DNS и reverse proxy relay требуют отдельного действия (отдельный relay: Caddy; relay на VPS панели: существующий nginx)."
+  if [[ "${ORIGIN_TYPE:-}" == sftpgo_install ]]; then
+    manual_do "Выбран SFTPGo: передай на relay INSTALL-SFTPGO-ON-RELAY.sh, APPLY-ON-RELAY.sh и PANEL-SCRIPT-ON-NODE.sh; запусти там bash INSTALL-SFTPGO-ON-RELAY.sh."
+  elif [[ "${ORIGIN_TYPE:-}" == sftpgo ]]; then
+    manual_do "Для существующего SFTPGo передай на relay CONFIGURE-SFTPGO-ON-RELAY.sh, APPLY-ON-RELAY.sh и PANEL-SCRIPT-ON-NODE.sh; запусти bash CONFIGURE-SFTPGO-ON-RELAY.sh. Контейнер и данные будут переиспользованы, корень / и XHTTP-маршрут настроены."
+  else
+    manual_do "Для сохранения заглушки передай на relay APPLY-ON-RELAY.sh и PANEL-SCRIPT-ON-NODE.sh; маршрут XHTTP не должен менять обработчик корня /."
+  fi
   manual_do "Инструкция relay: $run_dir/RELAY-STEPS.txt"
   manual_do "Все exit:        $run_dir/EXIT-STEPS.txt"
   check_do "Проверки:       $run_dir/VERIFY.txt"
@@ -3516,6 +3546,8 @@ EOF
   write_apply_proxy_route_script "$run_dir/APPLY-ON-NODE.sh" "$method" "${ORIGIN_DOMAIN:-$CDN_DOMAIN}" "$(rm_method_meta "$method" port)"
   if [[ "${ORIGIN_TYPE:-}" == sftpgo_install ]]; then
     write_sftpgo_node_installer "$run_dir/INSTALL-SFTPGO-ON-NODE.sh" "$method" "${ORIGIN_DOMAIN:-$CDN_DOMAIN}" "$(rm_method_meta "$method" port)"
+  elif [[ "${ORIGIN_TYPE:-}" == sftpgo ]]; then
+    write_sftpgo_node_installer "$run_dir/CONFIGURE-SFTPGO-ON-NODE.sh" "$method" "${ORIGIN_DOMAIN:-$CDN_DOMAIN}" "$(rm_method_meta "$method" port)"
   fi
 
   cat > "$run_dir/NEXT-STEPS.txt" <<EOF
@@ -3557,6 +3589,7 @@ EOF
    Передай файлы APPLY-ON-NODE.sh и PANEL-SCRIPT-ON-NODE.sh на выбранную Node и запусти: bash APPLY-ON-NODE.sh
    Файл добавляет XHTTP-маршрут на порт $(rm_method_meta "$method" port) по пути $(rm_method_meta "$method" path); корень / не меняется.
    Если выбрано "Установить SFTPGo", вместо этого передай INSTALL-SFTPGO-ON-NODE.sh, APPLY-ON-NODE.sh и PANEL-SCRIPT-ON-NODE.sh и запусти: bash INSTALL-SFTPGO-ON-NODE.sh
+   Если SFTPGo уже установлен, передай CONFIGURE-SFTPGO-ON-NODE.sh, APPLY-ON-NODE.sh и PANEL-SCRIPT-ON-NODE.sh и запусти: bash CONFIGURE-SFTPGO-ON-NODE.sh; контейнер/данные будут переиспользованы.
    Установщик SFTPGo рассчитан на Nginx-ноду, публикует веб-порт только на 127.0.0.1:8080, сохраняет данные в /opt/sftpgo и не перезаписывает уже существующий контейнер.
    Для Timeweb CDN обращается к публичному IP ноды:80 по HTTP; reverse proxy передаёт XHTTP-путь на локальный порт 10087.
 
@@ -3965,8 +3998,8 @@ collect_config(){
       ask_optional_domain CDN_DOMAIN "Если он уже есть — введи технический домен" "$CDN_DOMAIN" "abc123.a.trbcdn.net"
       ;;
     timeweb)
-      ask_domain CDN_DOMAIN "Клиентский домен Timeweb (CNAME на техдомен)" "$CDN_DOMAIN" "cdn.example.net"
-      ORIGIN_DOMAIN=""
+      ask_domain CDN_DOMAIN "Домен раздачи Timeweb для клиента (CNAME на техдомен)" "$CDN_DOMAIN" "cdn.example.net"
+      ask_optional_domain ORIGIN_DOMAIN "Origin-домен источника Timeweb, направленный на эту ноду (например cloud.amoredd.ru; Enter — IP-источник)" "$ORIGIN_DOMAIN" "origin.example.net"
       ;;
     selectel)
       ask_optional_domain ORIGIN_DOMAIN "Origin-домен (Enter = использовать IP ноды)" "$ORIGIN_DOMAIN" "origin.example.net"
