@@ -11,7 +11,7 @@ IFS=$'\n\t'
 # This installer deliberately keeps each CDN preset separate. Do not mix fields
 # between providers: path/padding/uplink settings are provider-specific.
 
-INSTALLER_VERSION="1.4.15"
+INSTALLER_VERSION="1.4.16"
 STATE_SCHEMA_CURRENT="1"
 PRESET="${INSTALLER_PRESET:-}"
 
@@ -2976,7 +2976,7 @@ PYNG
   return 0
 }
 run_remna_cascade_manager(){
-  local token nodes count relay relay_uuid relay_name relay_ip method cascade_path pool_suffix relay_tag relay_config relay_profile_name relay_ids relay_profile_uuid relay_inbound_uuid relay_active squad_uuid host_uuid="" extra run_dir profile_doc existing_cfg merged_cfg desired_hash current_hash update_profile=no relay_port
+  local token nodes count relay relay_uuid relay_name relay_ip method cascade_path pool_suffix relay_tag relay_config relay_profile_name relay_ids relay_profile_uuid relay_inbound_uuid relay_active squad_uuid host_uuid="" extra run_dir profile_doc existing_cfg merged_cfg desired_hash current_hash update_profile=no relay_port relay_route_domain
   local exit_mode exit_mode_choice exits exit_count strategy_choice strategy first_exit first_exit_uuid first_exit_ip exit_keys exit_records='[]'
   local panel_public_ip="" relay_addr_ip="" relay_on_panel=no relay_proxy_note="" relay_listen_ip="127.0.0.1"
   local i e e_uuid e_name e_ip e_suffix bridge_tag bridge_uuid bridge_info exit_profile_uuid bridge_inbound_uuid exit_profile_name exit_dir record user_name b inbs RM_CASCADE_ASSIGN_RELAY=no
@@ -3359,7 +3359,12 @@ $relay_proxy_note
 EOF
   cp -p "$INSTALL_PATH" "$run_dir/PANEL-SCRIPT-ON-NODE.sh"
   chmod 700 "$run_dir/PANEL-SCRIPT-ON-NODE.sh"
-  write_apply_proxy_route_script "$run_dir/APPLY-ON-RELAY.sh" "$method" "${ORIGIN_DOMAIN:-$CDN_DOMAIN}" "$relay_port" "$cascade_path"
+  # Yandex Music validates the CDN Host on the XHTTP inbound. The relay-side
+  # reverse proxy must therefore preserve the same CDN host used by the direct
+  # route; forwarding the origin domain makes the cascade endpoint miss Xray.
+  relay_route_domain="${ORIGIN_DOMAIN:-$CDN_DOMAIN}"
+  [[ "$method" != yandex_music ]] || relay_route_domain="$CDN_DOMAIN"
+  write_apply_proxy_route_script "$run_dir/APPLY-ON-RELAY.sh" "$method" "$relay_route_domain" "$relay_port" "$cascade_path"
   if [[ "${ORIGIN_TYPE:-}" == sftpgo_install ]]; then
     write_sftpgo_node_installer "$run_dir/INSTALL-SFTPGO-ON-RELAY.sh" "$method" "${ORIGIN_DOMAIN:-$CDN_DOMAIN}" "$relay_port" "APPLY-ON-RELAY.sh" "$CDN_DOMAIN"
   elif [[ "${ORIGIN_TYPE:-}" == sftpgo ]]; then
